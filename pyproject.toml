@@ -15,7 +15,11 @@ keywords = ["reachy_mini", "robotics", "voice-assistant", "full-duplex", "mlx", 
 # Only the always-needed, light deps live here. Heavy ML runtimes are optional
 # extras (below) and are lazy-imported so the package imports without them.
 dependencies = [
-    "numpy>=1.24",
+    # numpy is capped <2.3 on purpose: the audio stack pulls librosa -> numba, and no
+    # numba release supports numpy >=2.3 yet. Without the cap the resolver falls back to
+    # the ancient numba 0.51/llvmlite 0.34 (no Apple-Silicon wheel -> source build fails).
+    # reachy-mini itself requires numpy>=2.2.5, so 2.2.x satisfies everything.
+    "numpy>=2.2.5,<2.3",
     "scipy>=1.10",
     "python-dotenv>=1.0",
     "openai>=1.30",           # OpenAI-compatible client (local mlx-lm server + cloud VLM)
