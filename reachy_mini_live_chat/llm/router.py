@@ -44,7 +44,9 @@ class LlmEngine:
         if self.cfg.stub:
             stream = _stub_stream(user_text, lang)
         elif keyframe_b64 is not None:
-            log.info("routing turn to VISION model")
+            # Vision turn: attach the gated keyframe. By default this is the same local
+            # MiniCPM-V server; can be pointed at a cloud VLM via VISION_* config.
+            log.info("vision turn: attaching keyframe -> %s", self.cfg.vision_model)
             stream = self._vision.stream(messages, stop_check=stop_check)
         else:
             stream = self._text.stream(messages, stop_check=stop_check)

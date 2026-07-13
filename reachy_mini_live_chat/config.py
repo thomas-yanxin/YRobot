@@ -40,15 +40,18 @@ class Config:
     # Language
     lang: str = field(default_factory=lambda: _env("LANG", "auto"))  # auto|zh|en
 
-    # Text LLM (local, OpenAI-compatible)
+    # Conversational VLM — MiniCPM-V-4.6 served by llama.cpp (OpenAI-compatible).
+    # Handles BOTH text and vision turns: SigLIP2-400M + Qwen3.5-0.8B, so text-only
+    # turns are fast and images are understood locally (no cloud, no per-token cost).
     llm_base_url: str = field(default_factory=lambda: _env("LLM_BASE_URL", "http://localhost:8080/v1"))
-    llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "mlx-community/Qwen3-4B-Instruct-2507-4bit"))
+    llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "openbmb/MiniCPM-V-4.6-gguf"))
     llm_api_key: str = field(default_factory=lambda: _env("LLM_API_KEY", "not-needed"))
 
-    # Vision LLM (cloud by default — only used on gated keyframes)
-    vision_base_url: str = field(default_factory=lambda: _env("VISION_BASE_URL", "https://api-inference.modelscope.ai/v1"))
-    vision_model: str = field(default_factory=lambda: _env("VISION_MODEL", "Qwen-Ambassador/Qwen3.7-Plus"))
-    vision_api_key: str = field(default_factory=lambda: _env("VISION_API_KEY", ""))
+    # Vision turns default to the SAME local MiniCPM-V server. Override to a cloud VLM
+    # (e.g. ModelScope Qwen3.7-Plus) only if you'd rather offload image turns.
+    vision_base_url: str = field(default_factory=lambda: _env("VISION_BASE_URL", "http://localhost:8080/v1"))
+    vision_model: str = field(default_factory=lambda: _env("VISION_MODEL", "openbmb/MiniCPM-V-4.6-gguf"))
+    vision_api_key: str = field(default_factory=lambda: _env("VISION_API_KEY", "not-needed"))
 
     # ASR
     asr_model: str = field(default_factory=lambda: _env("ASR_MODEL", "iic/SenseVoiceSmall"))

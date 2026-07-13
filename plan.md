@@ -14,8 +14,8 @@
 | 4 | Motions must **match the language/content** (user or robot) | Bilingual intent→emotion mapping + LLM inline `<emo>` tags; nod on "yes/好的", tilt on questions, etc. |
 | 5 | Motions within **safety range** — never exceed | `motion/safety.py` clamps every command to the documented joint limits (§4) |
 | 6 | zh + en support | SenseVoice ASR (zh/en/code-switch), bilingual LLM prompt, Kokoro zh + en voices, language auto-detect |
-| 7 | Pipeline = VAD-ASR-LLM-TTS, squeeze Mac compute (MLX / llama.cpp) | Local MLX for LLM/ASR/TTS; see stack (§3) |
-| 8 | Video → high image demand, but **save tokens** | Vision gating: send a frame only on visual-question intent or scene change; downscale+JPEG; keep 1 keyframe; route to cloud VLM (§6) |
+| 7 | Pipeline = VAD-ASR-LLM-TTS, squeeze Mac compute (MLX / llama.cpp) | **llama.cpp** for the MiniCPM-V-4.6 VLM; MLX for TTS; FunASR for ASR; see stack (§3) |
+| 8 | Video → high image demand, but **save cost/compute** | Vision gating: attach a frame only on visual-question intent or scene change; downscale+JPEG; keep 1 keyframe. VLM is local (MiniCPM-V), so this saves the costly image-encoder compute/latency (§6) |
 
 ## 2. Hardware / platform facts (from Reachy Mini SDK, verified)
 
@@ -41,8 +41,8 @@
 | VAD | `snakers4/silero-vad` v5 (+ optional TEN-VAD) | `silero-vad` | 32 ms frame speech/silence |
 | Turn detect | `livekit/turn-detector` (multilingual, optional) | onnxruntime | semantic endpoint to cut false cuts |
 | ASR | `FunAudioLLM/SenseVoiceSmall` | `funasr` | zh/en/code-switch, RTF≈0.007 |
-| LLM (text) | `mlx-community/Qwen3-4B-Instruct-2507-4bit` | `mlx-lm` server (OpenAI-compat) | fast streaming reply, strong zh |
-| LLM (vision) | `Qwen-Ambassador/Qwen3.7-Plus` (cloud) or `MiniCPM-o-2.6` (local) | OpenAI client / ollama | only on keyframes → token-saving |
+| LLM+Vision (VLM) | `openbmb/MiniCPM-V-4.6-gguf` (SigLIP2-400M + Qwen3.5-0.8B) | **llama.cpp** `llama-server` (OpenAI-compat, `--mmproj`) | one local model for text *and* vision; small LLM = fast TTFT |
+| LLM (vision override) | `Qwen-Ambassador/Qwen3.7-Plus` (cloud), optional | OpenAI client | offload image turns to cloud if desired |
 | TTS | `hexgrad/Kokoro-82M` (zh voice `zf_*`, en `af_*`) | `mlx-audio` | lowest time-to-first-audio, streams |
 | AEC | WebRTC APM (optional) + gating | `webrtc-audio-processing` | stop TTS self-triggering VAD |
 
@@ -72,24 +72,29 @@ the user stops talking:
 |---|---|
 | VAD endpoint + (semantic) turn confirm | 200–350 ms |
 | ASR finalize last chunk (SenseVoice) | 50–150 ms |
-| LLM time-to-first-token (Qwen3-4B 4bit, cached sys prompt) | 150–300 ms |
+| VLM time-to-first-token (MiniCPM-V-4.6, 0.8B LLM, text turn) | 100–250 ms |
 | First clause → TTS | overlaps |
 | Kokoro time-to-first-audio | 100–300 ms |
 | **Total critical path** | **~0.5–1.1 s** (headroom under 1.5 s) |
 
-Levers if over budget: shorter VAD silence window + semantic turn; 4B not 8B; prompt-cache; flush TTS
-on first clause; keep vision on cloud so local GPU stays free.
+Levers if over budget: shorter VAD silence window + semantic turn; smaller quant (Q4); flush TTS on
+first clause; gate vision so the image encoder only runs when needed. Note a *vision* turn adds the
+SigLIP2 encode + more prefill, so those turns are slower — another reason to gate frames.
 
-## 6. Token-efficient vision
+## 6. Efficient vision
 
-1. **Gate on intent first** — only consider sending a frame when the user asks something visual
+The conversational model **is** a VLM (MiniCPM-V-4.6), so vision runs locally — the cost we optimize
+is the SigLIP2 image-encoder + extra prefill compute/latency, not cloud tokens. The gating is the same:
+
+1. **Gate on intent first** — only attach a frame when the user asks something visual
    (bilingual keyword/intent check: "看/这是什么/what is this/what am I holding" …).
 2. **Scene-change filter** — 64×64 gray mean-abs-diff + `imagehash.phash` Hamming distance vs last
    kept frame; skip near-duplicates.
 3. **Compress** — resize long edge → ~768 px, JPEG q75, base64.
 4. **One keyframe in context** — keep a single "current visual" slot; drop the previous image (keep a
-   short text description for continuity). Caps vision tokens at one image per visual turn.
-5. Route vision turns to the **cloud** VLM; local box stays free for ASR/LLM/TTS latency.
+   short text description for continuity). Caps the image encoder to one frame per visual turn.
+5. Text-only turns skip the vision tower entirely, keeping TTFT low; a cloud VLM stays a config-only
+   override if you ever want to move image turns off-box.
 
 ## 7. Concurrency / architecture
 
@@ -138,7 +143,7 @@ pyproject.toml  README.md(+HF tag)  .env.example  index.html/style.css(HF landin
 
 ## 10. Open assumptions (proceeding with sensible defaults)
 
-- **Text LLM local (Qwen3-4B MLX), vision cloud (Qwen3.7-Plus)** — best latency + token saving. Both
-  swappable via `.env` (`LLM_BASE_URL`, `VISION_BASE_URL`, model ids).
+- **Single local VLM: MiniCPM-V-4.6 via llama.cpp** handles text *and* vision. A cloud VLM remains a
+  drop-in override via `.env` (`VISION_BASE_URL`/`VISION_MODEL`) if you'd rather offload image turns.
 - Reachy **Lite** (USB, full Mac compute) is the primary target; wireless works but vision→cloud.
 - Dev happens in `--sim`/FakeMini; real-robot run needs the daemon + downloaded models on a 3.12 venv.
