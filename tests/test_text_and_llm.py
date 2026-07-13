@@ -4,6 +4,32 @@ from reachy_mini_live_chat.text_utils import (
     strip_control_tags,
 )
 from reachy_mini_live_chat.llm.router import _scan_emotion
+from reachy_mini_live_chat.llm.client import strip_think
+
+
+def _joined(chunks):
+    return "".join(strip_think(iter(chunks)))
+
+
+def test_strip_think_passthrough():
+    assert _joined(["hello ", "world"]) == "hello world"
+
+
+def test_strip_think_single_chunk():
+    assert _joined(["<think>secret</think>好的"]) == "好的"
+
+
+def test_strip_think_span_across_chunks():
+    assert _joined(["ans1 <thi", "nk>reason", "ing</thi", "nk> ans2"]) == "ans1  ans2"
+
+
+def test_strip_think_keeps_surrounding_text():
+    assert _joined(["A<think>x</think>", "B"]) == "AB"
+
+
+def test_strip_think_no_close_drops_tail():
+    # unterminated think -> everything after the open tag is dropped
+    assert _joined(["keep<think>never ends"]) == "keep"
 
 
 def test_detect_lang():
