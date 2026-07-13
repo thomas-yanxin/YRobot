@@ -33,6 +33,19 @@ def strip_control_tags(text: str) -> str:
     return re.sub(r"<emo>.*?</emo>", "", text).strip()
 
 
+# order matters: match the name-carrying "<emo>yes1" before the bare "<emo>" tag
+_SPOKEN_JUNK = re.compile(r"<emo>[A-Za-z0-9_]*|</?(?:emo|think)>|[*`#]+")
+
+
+def clean_spoken(text: str) -> str:
+    """Scrub a clause before TTS: drop stray control tags and markdown the model may leak.
+
+    Small models don't always honor the "no markdown / one clean <emo> tag" instruction, so we
+    strip any residual ``<emo…>`` / ``<think>`` fragments and ``* ` #`` markdown from what we speak.
+    """
+    return _SPOKEN_JUNK.sub("", text).strip()
+
+
 class ClauseAccumulator:
     """Feed token deltas; get back speakable clauses as they complete.
 

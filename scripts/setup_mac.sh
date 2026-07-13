@@ -55,8 +55,9 @@ Next:
   reachy-mini-live-chat --sim --stub
 
   # Real local pipeline (mock robot). Start the MiniCPM-V-4.6 server — the first run
-  # auto-downloads the model + vision projector (~2-3 GB) from Hugging Face:
-  llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --host 0.0.0.0 --port 8080 -c 4096 &
+  # auto-downloads the model + vision projector (~2-3 GB) from Hugging Face.
+  # --reasoning off disables the thinking trace (needed for low latency; vision still works):
+  llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --reasoning off --host 0.0.0.0 --port 8080 -c 4096 &
   reachy-mini-live-chat --sim
 
   # (Manual weights instead of -hf:

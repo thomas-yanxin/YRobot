@@ -53,9 +53,11 @@ reachy-mini-live-chat --sim --stub
 
 # 2) real pipeline, mock robot. First start the MiniCPM-V-4.6 server (first run
 #    auto-downloads the model + vision projector, ~2-3 GB, from Hugging Face):
-llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --host 0.0.0.0 --port 8080 -c 4096 &
-# If Hugging Face is slow/blocked, use a mirror:
-#   HF_ENDPOINT=https://hf-mirror.com llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --port 8080 -c 4096 &
+llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --reasoning off --host 0.0.0.0 --port 8080 -c 4096 &
+# --reasoning off is important: MiniCPM-V-4.6 is a thinking model; leaving it on adds a
+# long reasoning trace before the answer and blows the latency budget. Vision works either way.
+# If Hugging Face is slow/blocked, prefix with a mirror:
+#   HF_ENDPOINT=https://hf-mirror.com llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --reasoning off --port 8080 -c 4096 &
 reachy-mini-live-chat --sim
 # Note: the app's first non-sim/stub run also downloads the SenseVoice ASR model
 # (~900 MB) once — let it finish; it's cached afterwards.

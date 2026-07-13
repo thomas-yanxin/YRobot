@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Iterator, List, Optional
 
 from ..config import Config
-from ..text_utils import ClauseAccumulator
+from ..text_utils import ClauseAccumulator, clean_spoken
 from .client import OpenAICompatClient
 from .prompts import ALLOWED_EMOTIONS, SYSTEM_PROMPT
 
@@ -24,8 +25,8 @@ MAX_TURNS = 6  # user+assistant messages kept (besides system)
 class LlmEngine:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self._text = OpenAICompatClient(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_model)
-        self._vision = OpenAICompatClient(cfg.vision_base_url, cfg.vision_api_key, cfg.vision_model)
+        self._text = OpenAICompatClient(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_model, cfg.no_think)
+        self._vision = OpenAICompatClient(cfg.vision_base_url, cfg.vision_api_key, cfg.vision_model, cfg.no_think)
         self._history: List[dict] = []
 
     # -- public -------------------------------------------------------------
@@ -99,15 +100,19 @@ class LlmEngine:
                 delta = remainder  # feed leftover text into the clause splitter
                 prefix = ""
             for clause in acc.push(delta):
-                spoken.append(clause)
-                yield {"type": "clause", "text": clause}
+                clause = clean_spoken(clause)
+                if clause:
+                    spoken.append(clause)
+                    yield {"type": "clause", "text": clause}
 
         if not emo_done and prefix:
             # stream ended before we decided; treat whole prefix as text
             for clause in acc.push(prefix):
-                spoken.append(clause)
-                yield {"type": "clause", "text": clause}
-        tail = acc.flush()
+                clause = clean_spoken(clause)
+                if clause:
+                    spoken.append(clause)
+                    yield {"type": "clause", "text": clause}
+        tail = clean_spoken(acc.flush() or "")
         if tail:
             spoken.append(tail)
             yield {"type": "clause", "text": tail}
@@ -117,29 +122,38 @@ class LlmEngine:
         yield {"type": "final", "text": full}
 
 
-def _scan_emotion(prefix: str):
-    """Decide whether ``prefix`` begins with a <emo>..</emo> tag.
+_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 
-    Returns (name|None, remainder_text, decided). ``decided`` is False while we still
-    need more characters to tell.
+
+def _scan_emotion(prefix: str):
+    """Decide whether ``prefix`` begins with a ``<emo>NAME`` tag (closing tag optional).
+
+    Small models often drop the ``</emo>`` and/or bolt on markdown (``<emo>yes1**...``), so we
+    accept an unterminated tag: read the NAME word after ``<emo>`` and treat the first
+    non-word char as the end. Returns (name|None, remainder_text, decided); ``decided`` is False
+    while more characters are still needed to tell.
     """
     s = prefix.lstrip()
     if not s:
         return None, "", False
     if not s.startswith("<"):
-        return None, prefix, True  # definitely no tag
+        return None, prefix, True                      # definitely no tag
     if not s.startswith("<emo>"):
-        # could still be building up "<em"...
-        if len("<emo>") <= len(s):
-            return None, prefix, True  # it's a '<' but not our tag
+        # still possibly building "<", "<e", "<em", "<emo"
+        if "<emo>".startswith(s):
+            return None, "", False
+        return None, prefix, True                      # a '<' but not our tag (e.g. "<b>")
+    rest = s[len("<emo>"):]
+    m = _NAME_RE.match(rest)
+    name = m.group(0) if m else ""
+    after = rest[len(name):]
+    if after == "":
+        # buffer ends inside/at the name — it may still grow (e.g. "ye" -> "yes1")
+        return (None, prefix, True) if len(s) > 40 else (None, "", False)
+    # a possibly-splitting closing tag: wait for the rest of "</emo>"
+    if after != "</emo>" and "</emo>".startswith(after) and len(s) <= 60:
         return None, "", False
-    end = s.find("</emo>")
-    if end == -1:
-        if len(s) > 40:  # runaway; give up
-            return None, prefix, True
-        return None, "", False
-    name = s[len("<emo>"):end].strip()
-    remainder = s[end + len("</emo>"):]
+    remainder = after[len("</emo>"):] if after.startswith("</emo>") else after
     if name not in ALLOWED_EMOTIONS:
         name = None
     return name, remainder, True

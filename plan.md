@@ -41,7 +41,7 @@
 | VAD | `snakers4/silero-vad` v5 (+ optional TEN-VAD) | `silero-vad` | 32 ms frame speech/silence |
 | Turn detect | `livekit/turn-detector` (multilingual, optional) | onnxruntime | semantic endpoint to cut false cuts |
 | ASR | `FunAudioLLM/SenseVoiceSmall` | `funasr` | zh/en/code-switch, RTF≈0.007 |
-| LLM+Vision (VLM) | `openbmb/MiniCPM-V-4.6-gguf` (SigLIP2-400M + Qwen3.5-0.8B) | **llama.cpp** `llama-server` (OpenAI-compat, `--mmproj`) | one local model for text *and* vision; small LLM = fast TTFT |
+| LLM+Vision (VLM) | `openbmb/MiniCPM-V-4.6-gguf` (SigLIP2-400M + Qwen3.5-0.8B) | **llama.cpp** `llama-server` (OpenAI-compat, `--mmproj`, run with `--reasoning off`) | one local model for text *and* vision; small LLM = fast TTFT. It's a thinking model → `--reasoning off` (client also strips `<think>`) so the reasoning trace never delays/pollutes speech |
 | LLM (vision override) | `Qwen-Ambassador/Qwen3.7-Plus` (cloud), optional | OpenAI client | offload image turns to cloud if desired |
 | TTS | `hexgrad/Kokoro-82M` (zh voice `zf_*`, en `af_*`) | `mlx-audio` | lowest time-to-first-audio, streams |
 | AEC | WebRTC APM (optional) + gating | `webrtc-audio-processing` | stop TTS self-triggering VAD |
