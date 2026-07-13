@@ -81,3 +81,23 @@ def test_scan_emotion_invalid_name_ignored():
 def test_scan_emotion_incomplete_waits():
     name, remainder, decided = _scan_emotion("<emo>ye")
     assert decided is False
+
+
+def test_scan_emotion_unterminated_tag():
+    # model dropped </emo> and bolted on markdown — accept the name, keep the rest as text
+    name, remainder, decided = _scan_emotion("<emo>yes1**Reachy")
+    assert decided and name == "yes1" and remainder == "**Reachy"
+
+
+def test_scan_emotion_name_still_growing_waits():
+    # ends right at the name -> could still grow (welcoming1), so wait
+    _, _, decided = _scan_emotion("<emo>welcoming1")
+    assert decided is False
+
+
+def test_clean_spoken_strips_markdown_and_tags():
+    from reachy_mini_live_chat.text_utils import clean_spoken
+
+    assert clean_spoken("**你好** `code`") == "你好 code"
+    assert clean_spoken("<emo>yes1 好的") == "好的"
+    assert clean_spoken("答案</emo> 是") == "答案 是"
