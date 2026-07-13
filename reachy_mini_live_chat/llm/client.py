@@ -20,11 +20,13 @@ _OPEN, _CLOSE = "<think>", "</think>"
 
 
 class OpenAICompatClient:
-    def __init__(self, base_url: str, api_key: str, model: str) -> None:
+    def __init__(self, base_url: str, api_key: str, model: str, disable_thinking: bool = True) -> None:
         self.base_url = base_url
         self.model = model
+        self.disable_thinking = disable_thinking
         self._client = None
         self._api_key = api_key or "not-needed"
+        self._thinking_kwargs_unsupported = False
 
     def _ensure(self):
         if self._client is None:
@@ -46,17 +48,30 @@ class OpenAICompatClient:
 
     def _raw(self, messages, temperature, max_tokens, stop_check) -> Iterator[str]:
         client = self._ensure()
+        base = dict(model=self.model, messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, stream=True)
+        # Disable the model's thinking mode at the request level (server-flag-independent).
+        use_kwargs = self.disable_thinking and not self._thinking_kwargs_unsupported
         try:
-            resp = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            )
+            if use_kwargs:
+                resp = client.chat.completions.create(
+                    **base, extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+                )
+            else:
+                resp = client.chat.completions.create(**base)
         except Exception as e:
-            log.warning("LLM request failed (%s): %s", self.model, e)
-            return
+            if use_kwargs:
+                # endpoint rejected chat_template_kwargs — remember and retry without it
+                log.info("endpoint rejected enable_thinking kwarg (%s); retrying without", e)
+                self._thinking_kwargs_unsupported = True
+                try:
+                    resp = client.chat.completions.create(**base)
+                except Exception as e2:
+                    log.warning("LLM request failed (%s): %s", self.model, e2)
+                    return
+            else:
+                log.warning("LLM request failed (%s): %s", self.model, e)
+                return
         for chunk in resp:
             if stop_check is not None and stop_check():
                 try:

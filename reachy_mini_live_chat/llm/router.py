@@ -24,8 +24,8 @@ MAX_TURNS = 6  # user+assistant messages kept (besides system)
 class LlmEngine:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self._text = OpenAICompatClient(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_model)
-        self._vision = OpenAICompatClient(cfg.vision_base_url, cfg.vision_api_key, cfg.vision_model)
+        self._text = OpenAICompatClient(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_model, cfg.no_think)
+        self._vision = OpenAICompatClient(cfg.vision_base_url, cfg.vision_api_key, cfg.vision_model, cfg.no_think)
         self._history: List[dict] = []
 
     # -- public -------------------------------------------------------------

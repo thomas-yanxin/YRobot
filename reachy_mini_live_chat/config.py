@@ -46,6 +46,10 @@ class Config:
     llm_base_url: str = field(default_factory=lambda: _env("LLM_BASE_URL", "http://localhost:8080/v1"))
     llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "openbmb/MiniCPM-V-4.6-gguf"))
     llm_api_key: str = field(default_factory=lambda: _env("LLM_API_KEY", "not-needed"))
+    # Never use the model's "thinking" mode — it delays speech and wastes tokens. We send
+    # chat_template_kwargs{enable_thinking:false} on every request (works on llama.cpp with
+    # --jinja); if an endpoint rejects it, the client retries without it. Set NO_THINK=0 to disable.
+    no_think: bool = field(default_factory=lambda: _flag("NO_THINK", True))
 
     # Vision turns default to the SAME local MiniCPM-V server. Override to a cloud VLM
     # (e.g. ModelScope Qwen3.7-Plus) only if you'd rather offload image turns.
