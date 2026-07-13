@@ -40,14 +40,9 @@ if ! command -v llama-server >/dev/null 2>&1; then
   fi
 fi
 
-# --- MiniCPM-V-4.6 GGUF weights (LLM + vision projector) -------------------
-MODEL_DIR="${MODEL_DIR:-models/MiniCPM-V-4.6}"
-echo "==> Downloading MiniCPM-V-4.6 GGUF to ${MODEL_DIR} (a few GB)"
-uv pip install -q huggingface-hub || true
-huggingface-cli download openbmb/MiniCPM-V-4.6-gguf \
-  MiniCPM-V-4.6-Q4_K_M.gguf mmproj-MiniCPM-V-4.6-F16.gguf \
-  --local-dir "${MODEL_DIR}" || \
-  echo "Model download failed — fetch it later from https://huggingface.co/openbmb/MiniCPM-V-4.6-gguf" >&2
+# MiniCPM-V-4.6 GGUF weights (LLM + vision projector) are fetched automatically by
+# `llama-server -hf ...` on first launch (it also pulls the matching mmproj), so no
+# separate download step is needed here.
 
 cat <<EOF
 
@@ -59,11 +54,16 @@ Next:
   # Dev without any hardware or models:
   reachy-mini-live-chat --sim --stub
 
-  # Real local pipeline (mock robot). First, start the MiniCPM-V-4.6 server:
-  llama-server -m ${MODEL_DIR}/MiniCPM-V-4.6-Q4_K_M.gguf \\
-               --mmproj ${MODEL_DIR}/mmproj-MiniCPM-V-4.6-F16.gguf \\
-               --host 0.0.0.0 --port 8080 -c 4096 &
+  # Real local pipeline (mock robot). Start the MiniCPM-V-4.6 server — the first run
+  # auto-downloads the model + vision projector (~2-3 GB) from Hugging Face:
+  llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --host 0.0.0.0 --port 8080 -c 4096 &
   reachy-mini-live-chat --sim
+
+  # (Manual weights instead of -hf:
+  #   huggingface-cli download openbmb/MiniCPM-V-4.6-gguf \\
+  #     MiniCPM-V-4.6-Q4_K_M.gguf mmproj-MiniCPM-V-4.6-F16.gguf --local-dir models/MiniCPM-V-4.6
+  #   llama-server -m models/MiniCPM-V-4.6/MiniCPM-V-4.6-Q4_K_M.gguf \\
+  #     --mmproj models/MiniCPM-V-4.6/mmproj-MiniCPM-V-4.6-F16.gguf --port 8080 -c 4096 )
 
   # On the robot:
   reachy-mini-daemon &

@@ -41,9 +41,7 @@ usage tiny by only sending a camera frame to a vision model when it actually mat
 # or manually:
 uv venv --python 3.12 .venv && source .venv/bin/activate
 uv pip install -e ".[mac,dev]"
-brew install llama.cpp            # serves the MiniCPM-V-4.6 VLM
-huggingface-cli download openbmb/MiniCPM-V-4.6-gguf \
-  MiniCPM-V-4.6-Q4_K_M.gguf mmproj-MiniCPM-V-4.6-F16.gguf --local-dir models/MiniCPM-V-4.6
+brew install llama.cpp            # serves the MiniCPM-V-4.6 VLM (weights auto-download on first run)
 cp .env.example .env              # then edit model paths if needed
 ```
 
@@ -53,11 +51,14 @@ cp .env.example .env              # then edit model paths if needed
 # 1) hardware-free development (mock robot, stub engines):
 reachy-mini-live-chat --sim --stub
 
-# 2) real pipeline, mock robot. First start the MiniCPM-V-4.6 server:
-llama-server -m models/MiniCPM-V-4.6/MiniCPM-V-4.6-Q4_K_M.gguf \
-             --mmproj models/MiniCPM-V-4.6/mmproj-MiniCPM-V-4.6-F16.gguf \
-             --host 0.0.0.0 --port 8080 -c 4096 &
+# 2) real pipeline, mock robot. First start the MiniCPM-V-4.6 server (first run
+#    auto-downloads the model + vision projector, ~2-3 GB, from Hugging Face):
+llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --host 0.0.0.0 --port 8080 -c 4096 &
+# If Hugging Face is slow/blocked, use a mirror:
+#   HF_ENDPOINT=https://hf-mirror.com llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --port 8080 -c 4096 &
 reachy-mini-live-chat --sim
+# Note: the app's first non-sim/stub run also downloads the SenseVoice ASR model
+# (~900 MB) once — let it finish; it's cached afterwards.
 
 # 3) on the robot: start the daemon, then launch the app
 reachy-mini-daemon                       # Lite (USB)
