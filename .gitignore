@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Model / HF caches (if downloaded into the repo)
+*.onnx
+*.gguf
+models/

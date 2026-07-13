@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reachy-mini-live-chat"
+version = "0.1.0"
+description = "Full-duplex, low-latency bilingual (zh/en) voice+video conversation app for Reachy Mini, running VAD-ASR-LLM-TTS locally on Apple Silicon with expressive motion and DOA."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Reachy Mini Live Chat" }]
+keywords = ["reachy_mini", "robotics", "voice-assistant", "full-duplex", "mlx", "asr", "tts"]
+
+# Only the always-needed, light deps live here. Heavy ML runtimes are optional
+# extras (below) and are lazy-imported so the package imports without them.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "python-dotenv>=1.0",
+    "openai>=1.30",           # OpenAI-compatible client (local mlx-lm server + cloud VLM)
+]
+
+[project.optional-dependencies]
+# The robot SDK (installed on the machine wired to the robot / for --sim).
+robot = ["reachy-mini"]
+
+# Local Apple-Silicon inference stack.
+audio = ["silero-vad", "sounddevice", "soundfile"]
+asr = ["funasr", "modelscope"]
+llm = ["mlx-lm"]
+tts = ["mlx-audio", "misaki[zh]"]
+vision = ["opencv-python", "imagehash", "pillow"]
+turn = ["onnxruntime"]           # optional semantic turn detector
+aec = ["webrtc-audio-processing"]  # optional acoustic echo cancellation for true barge-in
+
+# Everything for a real on-Mac run.
+mac = [
+    "reachy-mini",
+    "silero-vad", "sounddevice", "soundfile",
+    "funasr", "modelscope",
+    "mlx-lm",
+    "mlx-audio", "misaki[zh]",
+    "opencv-python", "imagehash", "pillow",
+]
+
+dev = ["pytest>=7", "ruff", "numpy>=1.24", "pillow"]
+
+[project.entry-points."reachy_mini_apps"]
+# The Reachy Mini daemon discovers the app through this entry point.
+live_chat = "reachy_mini_live_chat.main:LiveChatApp"
+
+[project.scripts]
+reachy-mini-live-chat = "reachy_mini_live_chat.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["reachy_mini_live_chat*"]
+
+[tool.setuptools.package-data]
+reachy_mini_live_chat = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
