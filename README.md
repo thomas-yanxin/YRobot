@@ -24,22 +24,27 @@ usage tiny by only sending a camera frame to a vision model when it actually mat
 - **Full duplex** — streaming input, automatic endpointing, real-time reply, and **barge-in**
   (talk over the robot and it stops and listens).
 - **≤ 1.5 s** end-to-end latency (last word → first audio). Typical critical path ≈ 0.5–1.1 s.
-- **Local on Mac** — Silero VAD · FunASR *SenseVoice* · `mlx-lm` Qwen3 · Kokoro TTS (`mlx-audio`).
+- **Local on Mac** — Silero VAD · FunASR *SenseVoice* · **MiniCPM-V-4.6 VLM via llama.cpp** · Kokoro
+  TTS (`mlx-audio`). The VLM (SigLIP2-400M + Qwen3.5-0.8B) handles **both text and vision locally**.
 - **Expressive & context-aware motion** — nods on agreement, tilts on questions, plays emotions
   from `pollen-robotics/reachy-mini-emotions-library`, all **clamped to the safe joint range**.
 - **DOA** — the head orients toward the speaker's direction.
-- **Token-efficient vision** — a frame is sent to the vision LLM only on a visual question or a real
-  scene change; it is downscaled, JPEG-compressed, and only **one keyframe** is kept in context.
+- **Efficient vision** — a camera frame is attached only on a visual question or a real scene change;
+  it is downscaled, JPEG-compressed, and only **one keyframe** is kept in context. Since the VLM is
+  local, this saves compute/latency (the image encoder is the costly path), not cloud tokens.
 - **Runs without a robot** — `--sim` uses a mock backend so you can develop the whole pipeline.
 
 ## Install (Apple Silicon, Python 3.12)
 
 ```bash
-./scripts/setup_mac.sh            # creates a 3.12 uv venv and installs everything
+./scripts/setup_mac.sh            # 3.12 venv + Python deps + llama.cpp + MiniCPM-V-4.6 weights
 # or manually:
 uv venv --python 3.12 .venv && source .venv/bin/activate
 uv pip install -e ".[mac,dev]"
-cp .env.example .env              # then edit tokens / model ids
+brew install llama.cpp            # serves the MiniCPM-V-4.6 VLM
+huggingface-cli download openbmb/MiniCPM-V-4.6-gguf \
+  MiniCPM-V-4.6-Q4_K_M.gguf mmproj-MiniCPM-V-4.6-F16.gguf --local-dir models/MiniCPM-V-4.6
+cp .env.example .env              # then edit model paths if needed
 ```
 
 ## Run
@@ -48,7 +53,10 @@ cp .env.example .env              # then edit tokens / model ids
 # 1) hardware-free development (mock robot, stub engines):
 reachy-mini-live-chat --sim --stub
 
-# 2) real pipeline, mock robot (needs models downloaded):
+# 2) real pipeline, mock robot. First start the MiniCPM-V-4.6 server:
+llama-server -m models/MiniCPM-V-4.6/MiniCPM-V-4.6-Q4_K_M.gguf \
+             --mmproj models/MiniCPM-V-4.6/mmproj-MiniCPM-V-4.6-F16.gguf \
+             --host 0.0.0.0 --port 8080 -c 4096 &
 reachy-mini-live-chat --sim
 
 # 3) on the robot: start the daemon, then launch the app
@@ -62,8 +70,8 @@ Open the web UI at <http://localhost:8042> for the live transcript, camera view,
 
 | Var | Meaning | Default |
 |-----|---------|---------|
-| `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | local text LLM (mlx-lm server, OpenAI-compatible) | `http://localhost:8080/v1` · `Qwen3-4B` |
-| `VISION_BASE_URL` / `VISION_MODEL` / `VISION_API_KEY` | cloud/local vision LLM | ModelScope `Qwen-Ambassador/Qwen3.7-Plus` |
+| `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | MiniCPM-V-4.6 VLM served by llama.cpp (OpenAI-compatible) | `http://localhost:8080/v1` · `openbmb/MiniCPM-V-4.6-gguf` |
+| `VISION_BASE_URL` / `VISION_MODEL` / `VISION_API_KEY` | vision turns (defaults to the same local VLM; can point to a cloud VLM) | same local server |
 | `ASR_MODEL` | FunASR model id | `iic/SenseVoiceSmall` |
 | `TTS_VOICE_ZH` / `TTS_VOICE_EN` | Kokoro voices | `zf_xiaobei` · `af_heart` |
 | `VAD_SILENCE_MS` | silence to end a turn | `320` |

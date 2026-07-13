@@ -32,18 +32,21 @@ robot = ["reachy-mini"]
 # Local Apple-Silicon inference stack.
 audio = ["silero-vad", "sounddevice", "soundfile"]
 asr = ["funasr", "modelscope"]
-llm = ["mlx-lm"]
+# The conversational VLM (MiniCPM-V-4.6) runs on the llama.cpp `llama-server` binary,
+# which is NOT a pip package — install it with `brew install llama.cpp` (see scripts/
+# setup_mac.sh). `huggingface-hub` is only needed to fetch the GGUF + mmproj weights.
+llm = ["huggingface-hub"]
 tts = ["mlx-audio", "misaki[zh]"]
 vision = ["opencv-python", "imagehash", "pillow"]
 turn = ["onnxruntime"]           # optional semantic turn detector
 aec = ["webrtc-audio-processing"]  # optional acoustic echo cancellation for true barge-in
 
-# Everything for a real on-Mac run.
+# Everything for a real on-Mac run (except the llama.cpp binary — see setup_mac.sh).
 mac = [
     "reachy-mini",
     "silero-vad", "sounddevice", "soundfile",
     "funasr", "modelscope",
-    "mlx-lm",
+    "huggingface-hub",
     "mlx-audio", "misaki[zh]",
     "opencv-python", "imagehash", "pillow",
 ]

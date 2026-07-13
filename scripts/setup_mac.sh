@@ -30,18 +30,39 @@ if [ ! -f .env ]; then
   echo "==> Wrote .env from template — edit tokens/model ids as needed."
 fi
 
-cat <<'EOF'
+# --- llama.cpp (serves the MiniCPM-V-4.6 VLM) ------------------------------
+echo "==> Installing llama.cpp (llama-server)"
+if ! command -v llama-server >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    brew install llama.cpp || echo "brew install llama.cpp failed — install it manually." >&2
+  else
+    echo "Homebrew not found. Install llama.cpp manually: https://github.com/ggml-org/llama.cpp" >&2
+  fi
+fi
+
+# --- MiniCPM-V-4.6 GGUF weights (LLM + vision projector) -------------------
+MODEL_DIR="${MODEL_DIR:-models/MiniCPM-V-4.6}"
+echo "==> Downloading MiniCPM-V-4.6 GGUF to ${MODEL_DIR} (a few GB)"
+uv pip install -q huggingface-hub || true
+huggingface-cli download openbmb/MiniCPM-V-4.6-gguf \
+  MiniCPM-V-4.6-Q4_K_M.gguf mmproj-MiniCPM-V-4.6-F16.gguf \
+  --local-dir "${MODEL_DIR}" || \
+  echo "Model download failed — fetch it later from https://huggingface.co/openbmb/MiniCPM-V-4.6-gguf" >&2
+
+cat <<EOF
 
 ==> Done.
 
 Next:
-  source .venv/bin/activate
+  source ${VENV}/bin/activate
 
   # Dev without any hardware or models:
   reachy-mini-live-chat --sim --stub
 
-  # Real local pipeline (mock robot). First, start the text LLM server:
-  python -m mlx_lm server --model mlx-community/Qwen3-4B-Instruct-2507-4bit --port 8080 &
+  # Real local pipeline (mock robot). First, start the MiniCPM-V-4.6 server:
+  llama-server -m ${MODEL_DIR}/MiniCPM-V-4.6-Q4_K_M.gguf \\
+               --mmproj ${MODEL_DIR}/mmproj-MiniCPM-V-4.6-F16.gguf \\
+               --host 0.0.0.0 --port 8080 -c 4096 &
   reachy-mini-live-chat --sim
 
   # On the robot:
