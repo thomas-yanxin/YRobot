@@ -84,16 +84,24 @@ class _OnnxVad:
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
 
 
-def build_vad(stub: bool = False):
-    if stub:
-        log.info("VAD: energy fallback (stub)")
+def build_vad(stub: bool = False, backend: str = "energy"):
+    """Build the VAD. ``backend``: ``energy`` (cheap, default) | ``onnx`` | ``auto``.
+
+    The VAD only triggers DOA / listen-mood / barge-in — the omni model does the real
+    turn-taking — so the ~free energy detector is the sensible default, especially on a
+    CM4 where running Silero ~31×/s competes for the GIL and makes the app stutter.
+    """
+    if stub or backend == "energy":
+        log.info("VAD: numpy energy")
         return _EnergyVad()
+    # onnx / auto → try Silero, fall back to energy
     try:
         vad = _OnnxVad()
         log.info("VAD: Silero v5 (onnxruntime, CPU)")
         return vad
     except Exception as e:
-        log.warning("VAD: onnxruntime unavailable (%s); using numpy energy fallback", e)
+        level = log.warning if backend == "onnx" else log.info
+        level("VAD: onnxruntime unavailable (%s); using numpy energy", e)
         return _EnergyVad()
 
 

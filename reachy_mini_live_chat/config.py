@@ -128,6 +128,10 @@ class Config:
     omni_tts_temperature: Optional[float] = field(default_factory=lambda: _opt_float("OMNI_TTS_TEMPERATURE"))
 
     # -- VAD (now only a local trigger for DOA / listen-mood / barge-in) -----
+    # Backend: energy (pure numpy, ~free — the default; plenty for "is someone talking")
+    # | onnx (Silero v5 on CPU, more accurate but ~31 inferences/s — heavier on a CM4)
+    # | auto (onnx if onnxruntime present, else energy).
+    vad_backend: str = field(default_factory=lambda: _env("VAD_BACKEND", "energy"))
     vad_threshold: float = field(default_factory=lambda: _float("VAD_THRESHOLD", 0.5))
     vad_silence_ms: int = field(default_factory=lambda: _int("VAD_SILENCE_MS", 320))
     vad_min_speech_ms: int = field(default_factory=lambda: _int("VAD_MIN_SPEECH_MS", 200))
@@ -141,7 +145,7 @@ class Config:
     enable_motion: bool = field(default_factory=lambda: _flag("ENABLE_MOTION", True))
     enable_doa: bool = field(default_factory=lambda: _flag("ENABLE_DOA", True))
     emotions_dataset: str = field(default_factory=lambda: _env("EMOTIONS_DATASET", "pollen-robotics/reachy-mini-emotions-library"))
-    control_hz: int = field(default_factory=lambda: _int("CONTROL_HZ", 100))
+    control_hz: int = field(default_factory=lambda: _int("CONTROL_HZ", 50))
 
     # -- Web UI --------------------------------------------------------------
     web_ui: bool = field(default_factory=lambda: _flag("WEB_UI", True))

@@ -72,7 +72,7 @@ pure-numpy/stdlib fallback, so you add only what you want:
 
 | Extra | Adds | Fallback if absent |
 |-------|------|--------------------|
-| `vad` | Silero v5 VAD on CPU via **onnxruntime** (model vendored; no torch) | pure-numpy energy VAD |
+| `vad` | Silero v5 VAD on CPU via **onnxruntime** (model vendored; no torch) — opt in with `VAD_BACKEND=onnx` | pure-numpy energy VAD (default) |
 | `vision` | `pillow` (downscale frames) | the SDK's full-res `get_frame_jpeg()` |
 | `hifi` | `scipy` polyphase resampling | numpy linear-interp resampling |
 | `web` | `fastapi`/`uvicorn` control UI | headless (state via logs) |

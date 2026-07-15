@@ -69,7 +69,7 @@ class AudioEngine:
         self._on_audio_chunk = on_audio_chunk
 
         self.echo = EchoController(cfg.enable_aec, cfg.barge_in_energy)
-        vad = build_vad(stub=cfg.stub)
+        vad = build_vad(stub=cfg.stub, backend=cfg.vad_backend)
         self.endpointer = Endpointer(
             vad,
             threshold=cfg.vad_threshold,
@@ -81,6 +81,9 @@ class AudioEngine:
 
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
+        # tts_audio carries raw omni output (float32 at the model's TTS rate); we resample
+        # to the device rate here on the playback thread — once, and off the WS read path.
+        self._tts_sr = int(cfg.omni_out_sr or TARGET_SR)
         self._recent_loud = False
         self._chunk_samples = max(1, int(TARGET_SR * cfg.omni_chunk_ms / 1000))
         self._chunk_buf = np.zeros(0, dtype=np.float32)
@@ -189,7 +192,7 @@ class AudioEngine:
             self.bus.pending_measured = True
             log.info("e2e latency (user stop → first audio): %.0f ms", ms)
         self.bus.robot_speaking.set()
-        chunk = _resample(chunk.astype(np.float32), TARGET_SR, self._out_sr)
+        chunk = _resample(chunk.astype(np.float32), self._tts_sr, self._out_sr)
         for i in range(0, len(chunk), SUBCHUNK):
             if self.bus.interrupt_event.is_set():
                 break
