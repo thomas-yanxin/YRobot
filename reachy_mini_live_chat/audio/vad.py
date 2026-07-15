@@ -1,13 +1,18 @@
 """Voice-activity detection + turn endpointing.
 
-Primary detector: **Silero VAD** (32 ms frames). If ``silero-vad`` is unavailable
-(e.g. ``--stub`` dev), we fall back to a robust **energy/zero-crossing** VAD so the
-whole pipeline still runs. An optional **semantic turn detector** can be layered on
-top of the transcript to avoid cutting the user off mid-thought.
+The VAD here is *only* a local trigger — it decides "is a human talking right now" to
+steer DOA, raise the listen mood, and detect barge-in. The remote omni model does the
+real turn-taking, so we don't need anything heavy.
 
-The :class:`Endpointer` turns a stream of 16 kHz mono chunks into discrete
-utterances via a start/silence-window state machine, and exposes a cheap
-``speech_prob`` for barge-in detection while the robot is talking.
+Primary detector: **Silero VAD v5** run on CPU via **onnxruntime** (the model is
+vendored in ``assets/silero_vad_16k.onnx``). This deliberately avoids the ``silero-vad``
+pip package, which depends on ``torch`` and would drag in the CUDA/cuDNN runtime for a
+client that never touches a GPU. If ``onnxruntime`` isn't installed, we fall back to a
+robust pure-**numpy energy** VAD, so the whole pipeline still runs with zero extra deps.
+
+The :class:`Endpointer` turns a stream of 16 kHz mono chunks into discrete utterances
+via a start/silence-window state machine, and exposes a cheap ``speech_prob`` for
+barge-in detection while the robot is talking.
 """
 from __future__ import annotations
 
@@ -38,26 +43,45 @@ class _EnergyVad:
         return float(np.clip((snr - 2.5) / 6.0, 0.0, 1.0))
 
 
-class _SileroVad:
+def _silero_model_path() -> str:
+    """Filesystem path to the vendored Silero v5 onnx model."""
+    import os
+
+    return os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "silero_vad_16k.onnx")
+
+
+class _OnnxVad:
+    """Silero VAD v5 on CPU via onnxruntime (no torch). 512-sample frames @ 16 kHz.
+
+    Model I/O (op15 16k build): inputs ``input`` (batch, samples) float32,
+    ``state`` (2, batch, 128) float32, ``sr`` int64 scalar; outputs ``output``
+    (batch, 1) speech-prob and ``stateN`` (recurrent state to feed back).
+    """
+
     def __init__(self) -> None:
-        from silero_vad import load_silero_vad  # lazy
+        import onnxruntime as ort  # lazy
 
-        import torch  # noqa: F401
-
-        self._model = load_silero_vad()
-        self._torch = __import__("torch")
-        self._model.reset_states()
+        opts = ort.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        self._sess = ort.InferenceSession(
+            _silero_model_path(), sess_options=opts, providers=["CPUExecutionProvider"]
+        )
+        self._sr = np.array(16000, dtype=np.int64)
+        self.reset()
 
     def speech_prob(self, frame: np.ndarray) -> float:
-        t = self._torch.from_numpy(frame.astype(np.float32))
-        with self._torch.no_grad():
-            return float(self._model(t, 16000).item())
+        x = np.asarray(frame, dtype=np.float32).reshape(1, -1)
+        try:
+            out, self._state = self._sess.run(
+                ["output", "stateN"], {"input": x, "state": self._state, "sr": self._sr}
+            )
+        except Exception:
+            return 0.0
+        return float(out[0, 0])
 
     def reset(self) -> None:
-        try:
-            self._model.reset_states()
-        except Exception:
-            pass
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
 
 
 def build_vad(stub: bool = False):
@@ -65,11 +89,11 @@ def build_vad(stub: bool = False):
         log.info("VAD: energy fallback (stub)")
         return _EnergyVad()
     try:
-        vad = _SileroVad()
-        log.info("VAD: Silero v5")
+        vad = _OnnxVad()
+        log.info("VAD: Silero v5 (onnxruntime, CPU)")
         return vad
     except Exception as e:
-        log.warning("VAD: Silero unavailable (%s); using energy fallback", e)
+        log.warning("VAD: onnxruntime unavailable (%s); using numpy energy fallback", e)
         return _EnergyVad()
 
 

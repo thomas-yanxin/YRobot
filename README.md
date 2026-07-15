@@ -58,8 +58,17 @@ Primary target — **on the robot's CM4** (Wireless, ARM64 Linux):
 
 The robot is only a client, so the hard dependencies are just **`numpy` + `websockets`**
 (`reachy-mini` is already in the CM4 image). There is **no torch / CUDA / scipy** — the omni
-server does all inference. Optional extras (`vad`, `vision`, `web`, `hifi`, `aec`) each improve
-one thing and each has a pure-numpy/stdlib fallback, so you add only what you want.
+server does all inference. Optional extras each improve one thing and each has a
+pure-numpy/stdlib fallback, so you add only what you want:
+
+| Extra | Adds | Fallback if absent |
+|-------|------|--------------------|
+| `vad` | Silero v5 VAD on CPU via **onnxruntime** (model vendored; no torch) | pure-numpy energy VAD |
+| `vision` | `pillow` (downscale frames) | the SDK's full-res `get_frame_jpeg()` |
+| `hifi` | `scipy` polyphase resampling | numpy linear-interp resampling |
+| `web` | `fastapi`/`uvicorn` control UI | headless (state via logs) |
+| `aec` | WebRTC echo cancellation | duck-and-gate |
+| `simcam` | `opencv`/`sounddevice` for laptop `--sim` | synthetic frames/silence |
 
 Dev on a laptop (bridged to the robot, or `--sim`):
 

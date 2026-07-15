@@ -23,3 +23,5 @@ env/
 *.onnx
 *.gguf
 models/
+# ...but the tiny vendored Silero VAD model IS part of the package (ships in the wheel).
+!reachy_mini_live_chat/assets/silero_vad_16k.onnx
