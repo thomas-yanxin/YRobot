@@ -100,6 +100,8 @@ EV_AUDIO = "audio"
 EV_LISTEN = "listen"
 EV_DONE = "done"
 EV_CLOSED = "closed"
+EV_STATUS = "status"   # gateway control events (e.g. session.queued) — non-fatal
+EV_ERROR = "error"     # server/gateway error events (e.g. queue_full)
 EV_OTHER = "other"
 
 
@@ -114,6 +116,8 @@ class OmniEvent:
     audio: Optional[np.ndarray] = None  # float32 mono, at the server's TTS rate
     reason: Optional[str] = None        # response.done reason / session.closed reason
     mode: Optional[str] = None          # session.created mode
+    status: Optional[str] = None        # EV_STATUS: the raw control type (e.g. session.queued)
+    message: str = ""                   # EV_ERROR: human-readable message
     raw: dict = field(default_factory=dict)
 
 
@@ -149,6 +153,19 @@ def parse_event(msg: dict) -> OmniEvent:
 
     if mtype == "session.closed":
         return OmniEvent(EV_CLOSED, session_id=session_id, reason=msg.get("reason"), raw=msg)
+
+    # Gateway control frames (MiniCPM-o-Demo gateway sits in front of the backend and
+    # queues sessions): tolerate and surface, don't treat as protocol violations.
+    if isinstance(mtype, str) and mtype.startswith("session."):
+        return OmniEvent(EV_STATUS, session_id=session_id, status=mtype, raw=msg)
+
+    if mtype == "error":
+        err = msg.get("error") if isinstance(msg.get("error"), dict) else {}
+        return OmniEvent(
+            EV_ERROR, session_id, response_id,
+            message=str(err.get("message") or msg.get("message") or "error"),
+            reason=err.get("code"), raw=msg,
+        )
 
     return OmniEvent(EV_OTHER, session_id, response_id, raw=msg)
 
