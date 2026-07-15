@@ -1,149 +1,158 @@
-# Reachy Mini — Live Video Chat (全双工实时视频对话 App)
+# Reachy Mini — Realtime Full-Duplex Audio-Visual Dialogue (MiniCPM-o 4.5 omni)
 
-> A full-duplex, low-latency, bilingual (中文 / English) voice+video conversational agent for
-> **Reachy Mini**, running the `VAD → ASR → LLM → TTS` pipeline locally on Apple Silicon, with
-> expressive motion, DOA-driven head orientation, and token-efficient vision.
+> Rebuilds the conversational core of `reachy_mini_live_chat` around a **remote end-to-end
+> omni model** (MiniCPM-o 4.5, served by `llama.cpp-omni`'s `llama-omni-server`) over a
+> **full-duplex WebSocket**, replacing the local `VAD→ASR→LLM→TTS` pipeline. Runs **on-robot
+> (CM4, Wireless)**; all heavy inference is offloaded to the GPU server at
+> `wss://10.0.16.187:8006`. Keeps the robot's DOA, expressive motion, and hard safety limits.
 
-## 1. Goals & hard requirements (from the user)
+## 0. Decisions (confirmed with the user)
 
-| # | Requirement | How we meet it |
-|---|-------------|----------------|
-| 1 | Full-duplex conversation (streaming in, auto endpointing, real-time reply, barge-in) | Concurrent stage threads + a conversation state machine; barge-in cancels TTS + motion |
-| 2 | **End-to-end latency ≤ 1.5 s** (user's last word → first audio out) | Streaming ASR during speech, LLM clause-flush, Kokoro first-chunk TTS. Budget ≈ 0.5–1.1 s (§5) |
-| 3 | Reachy-specific motion + **DOA** for emotional value | 100 Hz control loop, emotions library moves, DOA head look-at, state-driven idle/listen/think/speak |
-| 4 | Motions must **match the language/content** (user or robot) | Bilingual intent→emotion mapping + LLM inline `<emo>` tags; nod on "yes/好的", tilt on questions, etc. |
-| 5 | Motions within **safety range** — never exceed | `motion/safety.py` clamps every command to the documented joint limits (§4) |
-| 6 | zh + en support | SenseVoice ASR (zh/en/code-switch), bilingual LLM prompt, Kokoro zh + en voices, language auto-detect |
-| 7 | Pipeline = VAD-ASR-LLM-TTS, squeeze Mac compute (MLX / llama.cpp) | **llama.cpp** for the MiniCPM-V-4.6 VLM; MLX for TTS; FunASR for ASR; see stack (§3) |
-| 8 | Video → high image demand, but **save cost/compute** | Vision gating: attach a frame only on visual-question intent or scene change; downscale+JPEG; keep 1 keyframe. VLM is local (MiniCPM-V), so this saves the costly image-encoder compute/latency (§6) |
+1. **Deployment**: app runs **on the robot's CM4** (Wireless). Direct mic-array/DOA, camera,
+   speaker; cognition fully offloaded → CM4 only does I/O + WebSocket + 100 Hz motion. Light load.
+2. **Scope**: **fully replace** the local `asr/`, `llm/`, `tts/`, `vision/gating` modules with the
+   omni client. No local ML models remain. (Removes the mlx/funasr/kokoro/llama.cpp dependency.)
+3. **Video**: **continuous ~1 fps** — one current camera frame attached to each 1 s audio chunk
+   (matches the model's 1 Hz TDM design; LAN bandwidth is ample).
 
-## 2. Hardware / platform facts (from Reachy Mini SDK, verified)
+## 1. Hard requirements → how we meet them
 
-- App type: **Python app** (`ReachyMiniApp`), heavy on-robot/local compute — not a web-only Space.
-- 6-DOF head (Stewart platform), rotating body, 2 antennas. Mic array with **DOA**, camera, speaker.
-- Client/daemon split: daemon on the machine wired to the robot exposes REST + WS on `:8000`.
-- Media (16 kHz float32 audio, BGR camera frames) via `mini.media.*`.
-- Dev without hardware → `--sim` uses `reachy-mini[mujoco]` daemon, or our `FakeMini` shim.
+| # | Requirement (from user) | How |
+|---|---|---|
+| 1 | 视听交互尽可能实时 (full-duplex, low latency) | End-to-end omni over WS in `full_duplex` mode: stream 1 s mic chunks + 1 frame; the model decides listen/speak at 1 Hz; audio deltas play as they arrive. No local ASR/LLM/TTS hops. |
+| 2 | DOA 融入：说话时机器人依 DOA 转向说话人 | Kept **unchanged** — `MotionController` polls `mini.media.get_DoA()` at 10 Hz while a lightweight local VAD says a human is speaking, EMA-smoothed → head yaw (+ body yaw past ±45°), all clamped. |
+| 3 | 必要时动作交互，且**务必保证物理安全** | Motion moods per conversation state + emotion gestures inferred from the omni **text** stream (`kind:"text"` deltas). **Every** command routed through `motion/safety.py` clamps (head pitch/roll ±40°, yaw ±180°, body ±160°, head−body Δ≤65°); SDK clamps again (defense-in-depth). Return-to-rest on interrupt/shutdown. |
 
-### Key SDK calls we use
-- Motion: `set_target(head=4x4, antennas=[r,l]rad, body_yaw=rad)` (100 Hz), `goto_target(...)` (blocking),
-  `look_at_world(x,y,z,duration)`, `play_move(move, ...)`, `cancel_move()`, `enable_motors()`.
-- Pose helper: `create_head_pose(x,y,z,roll,pitch,yaw, mm=, degrees=)`.
-- Audio: `media.start_recording()/get_audio_sample()` (→(N,2) f32 16k), `media.push_audio_sample()`, `media.start_playing()`.
-- DOA: `media.get_DoA() -> (angle_rad, is_speech)`. Convention: 0=left, π/2=front, π=right.
-- Camera: `media.get_frame() -> (H,W,3) uint8 BGR`.
-- Emotions: `RecordedMoves("pollen-robotics/reachy-mini-emotions-library").get(name)`.
+## 2. Confirmed omni WS protocol (verified against `tc-mb/llama.cpp-omni` source)
 
-## 3. Local model stack (Apple Silicon, validated)
+Source of truth: `tools/server/ws_handler.cpp` + `protocol.cpp` (not just the cookbook).
 
-| Stage | Model / repo | Library | Role |
-|-------|--------------|---------|------|
-| VAD | `snakers4/silero-vad` v5 (+ optional TEN-VAD) | `silero-vad` | 32 ms frame speech/silence |
-| Turn detect | `livekit/turn-detector` (multilingual, optional) | onnxruntime | semantic endpoint to cut false cuts |
-| ASR | `FunAudioLLM/SenseVoiceSmall` | `funasr` | zh/en/code-switch, RTF≈0.007 |
-| LLM+Vision (VLM) | `openbmb/MiniCPM-V-4.6-gguf` (SigLIP2-400M + Qwen3.5-0.8B) | **llama.cpp** `llama-server` (OpenAI-compat, `--mmproj`, run with `--reasoning off`) | one local model for text *and* vision; small LLM = fast TTFT. It's a thinking model → `--reasoning off` (client also strips `<think>`) so the reasoning trace never delays/pollutes speech |
-| LLM (vision override) | `Qwen-Ambassador/Qwen3.7-Plus` (cloud), optional | OpenAI client | offload image turns to cloud if desired |
-| TTS | `hexgrad/Kokoro-82M` (zh voice `zf_*`, en `af_*`) | `mlx-audio` | lowest time-to-first-audio, streams |
-| AEC | WebRTC APM (optional) + gating | `webrtc-audio-processing` | stop TTS self-triggering VAD |
+- **Endpoint**: `wss://10.0.16.187:8006/backend` (auto-append `/backend` if absent). Self-signed
+  cert → TLS verification disabled by default (`OMNI_TLS_INSECURE=1`). **One active session** at a
+  time server-side.
+- **Audio encoding**: base64 of **raw float32 little-endian PCM**, **mono, 16 kHz** (input WAV is
+  hardcoded 16 k/mono/IEEE-float). Output audio deltas are float32 PCM too.
+- **`session.init`** (client→server):
+  ```json
+  {"type":"session.init","payload":{
+     "mode":"full_duplex", "use_tts":true,
+     "system_prompt":"…",
+     "voice":{"ref_audio":"<b64 wav>"},          // optional voice-clone
+     "config":{"temperature":…, "top_p":…, "top_k":…,
+               "listen_prob_scale":…, "force_listen_count":…,
+               "max_new_speak_tokens_per_chunk":…, "tts_temperature":…}}}
+  ```
+  → server replies `session.created {session_id, mode, metrics}`. In full-duplex the server does an
+  index-0 prefill (system prompt / ref audio) on init.
+- **`input.append`** (full-duplex; client→server, ≈ once/second):
+  ```json
+  {"type":"input.append","input":{
+     "audio":"<b64 float32 PCM 16k mono ~1s>",
+     "video_frames":["<b64 jpeg>"],   // only the FIRST frame is used per append
+     "force_listen": false }}          // optional: force this step to LISTEN
+  ```
+  Must **not** carry `messages` (that's turn_based only → `mode_mismatch` fail-fast).
+- **Server → client events**:
+  - `response.output.delta` + `kind`:
+    - `"text"` → `{text}` (accumulate for UI + drive emotion gestures)
+    - `"audio"` → `{audio:"<b64 float32 PCM>"}` (async, as TTS is produced → play)
+    - `"listen"` → model chose to listen this step (robot stays quiet)
+  - `response.done` → `{text, reason:"turn_end", audio:null|…}` (turn boundary)
+  - `session.closed` → `{reason}` (reconnect)
 
-All heavy deps are **lazy-imported** inside each engine so the package imports and unit-tests run
-without them; a `FakeMini` + stub engines let the pipeline run end-to-end in `--sim` for development.
-
-## 4. Safety limits (clamped in `motion/safety.py`)
-
-| Joint / axis | Range |
-|---|---|
-| Head pitch / roll | [-40°, +40°] |
-| Head yaw | [-180°, +180°] |
-| Body yaw | [-160°, +160°] |
-| Head−body yaw delta | ≤ 65° |
-
-`clamp_head_pose()` decomposes the 4×4 to rpy, clamps, recomposes. `clamp_body_yaw()` also enforces
-the delta vs the current head yaw. The SDK clamps too — this is defense-in-depth and keeps our own
-generated idle/DOA motion honest. Emotion-library moves are pre-authored within range; we still route
-their target stream through the clamp when we drive `set_target` ourselves.
-
-## 5. Latency budget (end-of-speech → first audio)
-
-ASR runs *during* speech; LLM streams into TTS clause-by-clause; stages overlap. Critical path after
-the user stops talking:
-
-| Step | Budget |
-|---|---|
-| VAD endpoint + (semantic) turn confirm | 200–350 ms |
-| ASR finalize last chunk (SenseVoice) | 50–150 ms |
-| VLM time-to-first-token (MiniCPM-V-4.6, 0.8B LLM, text turn) | 100–250 ms |
-| First clause → TTS | overlaps |
-| Kokoro time-to-first-audio | 100–300 ms |
-| **Total critical path** | **~0.5–1.1 s** (headroom under 1.5 s) |
-
-Levers if over budget: shorter VAD silence window + semantic turn; smaller quant (Q4); flush TTS on
-first clause; gate vision so the image encoder only runs when needed. Note a *vision* turn adds the
-SigLIP2 encode + more prefill, so those turns are slower — another reason to gate frames.
-
-## 6. Efficient vision
-
-The conversational model **is** a VLM (MiniCPM-V-4.6), so vision runs locally — the cost we optimize
-is the SigLIP2 image-encoder + extra prefill compute/latency, not cloud tokens. The gating is the same:
-
-1. **Gate on intent first** — only attach a frame when the user asks something visual
-   (bilingual keyword/intent check: "看/这是什么/what is this/what am I holding" …).
-2. **Scene-change filter** — 64×64 gray mean-abs-diff + `imagehash.phash` Hamming distance vs last
-   kept frame; skip near-duplicates.
-3. **Compress** — resize long edge → ~768 px, JPEG q75, base64.
-4. **One keyframe in context** — keep a single "current visual" slot; drop the previous image (keep a
-   short text description for continuity). Caps the image encoder to one frame per visual turn.
-5. Text-only turns skip the vision tower entirely, keeping TTFT low; a cloud VLM stays a config-only
-   override if you ever want to move image turns off-box.
-
-## 7. Concurrency / architecture
+## 3. Architecture (what changes, what stays)
 
 ```
- mic ─► AudioIn ─► VAD/Turn ─► ASR ──► Orchestrator ──► LLM(stream) ─► clause ─► TTS ─► AudioOut ─► speaker
-                     │                    │  ▲                                   │
-                  barge-in            state machine        Vision(gated) ────────┘ (keyframe)
-                     │                    │
-                     ▼                    ▼
-                MotionController  ◄── intents (DOA look-at, listen/think/speak, emotion moves)
-                 (single 100 Hz owner of set_target — control-loop skill rule)
+ mic ─► AudioEngine ─┬─► energy VAD ──► user_speaking (DOA trigger + listen mood + barge-in)
+                     └─► 1 s float32 16k chunk ─┐
+ camera ─► VideoGrabber ─► latest JPEG b64 ─────┤
+                                                ▼
+                                        OmniClient  (asyncio thread, WebSocket /backend)
+                                          send: input.append(audio[, frame])
+                                          recv: text→emit; audio→bus.tts_audio; listen/done→state
+                                                ▼
+ speaker ◄── AudioEngine.playback ◄── bus.tts_audio (float32 16k, barge-in-cuttable)
+                                                │
+                    MotionController (100 Hz, single set_target owner)
+                    ◄── DOA look-at · state moods · emotion gestures (from omni text)
+                        all clamped by motion/safety.py
 ```
 
-- **One** thread owns `set_target` (per control-loop skill). Others enqueue motion *intents*.
-- Conversation states: `IDLE → LISTENING → THINKING → SPEAKING` (+ `INTERRUPTED`). Each maps to a
-  motion mood (idle breathing, attentive lean + DOA turn, thoughtful, subtle speak wobble).
-- Barge-in: while `SPEAKING`, VAD still runs (echo-gated); confirmed human speech → `cancel_move()`
-  + stop TTS → `LISTENING`.
+**Reused unchanged**: `bus.py` (state machine, queues, events, barge-in), `motion/*`
+(controller, safety, doa, emotions), `audio/aec.py`, `audio/vad.py` (now only DOA/barge-in gate),
+`audio/io.py` playback path, `sim/fake_mini.py`, `web.py` + `static/` UI, `text_utils.py`.
 
-## 8. Project layout
+**New**:
+- `omni/protocol.py` — pure codec: base64⇄float32 PCM, `build_session_init`, `build_input_append`,
+  `parse_event`. No I/O → fully unit-testable.
+- `omni/client.py` — `OmniClient`: runs asyncio (websockets) in its own thread; sender pulls 1 s
+  chunks + latest frame; receiver dispatches events onto the `Bus`; init/reconnect w/ backoff;
+  resamples omni output SR→16 k onto `bus.tts_audio`.
+- `omni/video.py` — grab `mini.media.get_frame()` → downscale (long edge ≤ `OMNI_VIDEO_MAX_EDGE`)
+  → JPEG (`OMNI_VIDEO_JPEG_QUALITY`) → base64, throttled to `OMNI_VIDEO_FPS`. (Salvaged from
+  `vision/gating.py`'s encode helpers; gating removed since video is continuous.)
+- `omni/fake_server.py` — tiny local asyncio omni WS server for `--stub`/tests: exercises the real
+  client path offline (emits `session.created`, alternating `listen`/`text`+`audio`+`done`).
+
+**Rewritten**:
+- `pipeline.py` → thin **orchestrator**: wires AudioEngine + VideoGrabber + OmniClient +
+  MotionController; maps omni events + local VAD → `ConvState` (LISTENING/SPEAKING/IDLE); barge-in;
+  greeting; graceful shutdown → safe rest.
+- `audio/io.py` → capture assembles 1 s 16 k mono chunks and hands them to a callback (+ keeps the
+  VAD start/stop → `user_speaking`); playback loop kept.
+- `config.py` → drop ASR/LLM/TTS/vision-model knobs; add `OMNI_*` (see §4).
+- `main.py` → CLI/`LiveChatApp` unchanged in shape; `--stub` starts the fake omni server.
+
+**Removed**: `asr/`, `llm/`, `tts/`, `vision/` packages; their deps in `pyproject.toml`.
+
+## 4. Config (env-driven, `.env`)
 
 ```
-reachy_mini_live_chat/          package (entrypoint reachy_mini_apps → main:LiveChatApp)
-  main.py            ReachyMiniApp subclass, wires Pipeline, optional web UI
-  config.py          env-driven dataclass config
-  bus.py             ConvState enum, thread-safe queues/events
-  pipeline.py        full-duplex orchestrator + state machine
-  audio/  io.py vad.py aec.py
-  asr/    funasr_asr.py
-  llm/    client.py router.py prompts.py
-  tts/    kokoro_tts.py
-  vision/ gating.py
-  motion/ safety.py controller.py emotions.py doa.py
-  sim/    fake_mini.py         mock ReachyMini + media for hardware-free dev
-static/   index.html style.css main.js   web UI (transcript, video, settings)
-tests/    pure-logic unit tests
-scripts/  setup_mac.sh
-pyproject.toml  README.md(+HF tag)  .env.example  index.html/style.css(HF landing)
+OMNI_WS_URL=wss://10.0.16.187:8006        # /backend auto-appended
+OMNI_MODE=full_duplex                       # full_duplex | turn_based
+OMNI_USE_TTS=1
+OMNI_TLS_INSECURE=1                         # self-signed cert
+OMNI_SYSTEM_PROMPT="你是 Reachy Mini…（中英双语，简洁口语化）"
+OMNI_VOICE_REF=                             # optional path to ref .wav for voice-clone
+OMNI_OUT_SR=24000                           # omni TTS output rate (assumption; 16000 fallback)
+OMNI_CHUNK_MS=1000                          # 1 s per input.append (model's TDM period)
+OMNI_SEND_VIDEO=1
+OMNI_VIDEO_FPS=1
+OMNI_VIDEO_MAX_EDGE=448
+OMNI_VIDEO_JPEG_QUALITY=70
+# sampling passthrough → session.init.config
+OMNI_TEMPERATURE / OMNI_TOP_P / OMNI_TOP_K / OMNI_LISTEN_PROB_SCALE /
+OMNI_FORCE_LISTEN_COUNT / OMNI_MAX_SPEAK_TOKENS_PER_CHUNK / OMNI_TTS_TEMPERATURE
+# kept: VAD (DOA/barge-in only), ENABLE_AEC, motion (ENABLE_MOTION/DOA, CONTROL_HZ), WEB_*
 ```
 
-## 9. Milestones
+## 5. Real-time, barge-in & safety notes
 
-1. Scaffold (pyproject/README/env). 2. Core (config/bus/sim). 3. Audio (io/vad/aec).
-4. Engines (asr/llm/tts). 5. Motion (safety/controller/emotions/doa). 6. Vision + orchestrator + entry
-+ web UI. 7. Tests + 3.12 venv install + sim smoke test.
+- **Latency**: granularity is the 1 s TDM chunk (model design); first audio ≈ chunk boundary +
+  LAN RTT + prefill + generate. Audio deltas play incrementally. `OMNI_CHUNK_MS` tunable.
+- **Echo**: we keep streaming mic while the robot speaks (so the model can barge-in), so we must
+  feed **echo-suppressed** mic (`audio/aec.py` capture processing) or the model hears itself; this
+  is the main real-hardware tuning knob. Local energy-VAD barge-in also flushes `bus.tts_audio`.
+- **Output SR assumption**: MiniCPM-o token2wav ≈ 24 kHz; the server callback drops the rate field,
+  so `OMNI_OUT_SR` is configurable and flip-to-16000 is one env change if pitch sounds off.
+- **Safety**: unchanged clamps on every `set_target`; emotion moves are pre-authored in-range and
+  still clamped; interrupt/shutdown returns to a safe rest pose. Physical safety is not weakened.
 
-## 10. Open assumptions (proceeding with sensible defaults)
+## 6. Tests & tooling
 
-- **Single local VLM: MiniCPM-V-4.6 via llama.cpp** handles text *and* vision. A cloud VLM remains a
-  drop-in override via `.env` (`VISION_BASE_URL`/`VISION_MODEL`) if you'd rather offload image turns.
-- Reachy **Lite** (USB, full Mac compute) is the primary target; wireless works but vision→cloud.
-- Dev happens in `--sim`/FakeMini; real-robot run needs the daemon + downloaded models on a 3.12 venv.
+- New pure-logic tests: `omni/protocol.py` (b64⇄float32 round-trip, init/append builders,
+  event parsing incl. all `kind`s + `done`/`closed`), `omni/video.py` encode.
+- Keep motion/safety/doa/bus tests. Remove ASR/LLM/TTS tests.
+- `--sim --stub` smoke test drives the **real** OmniClient against `omni/fake_server.py` end-to-end
+  (mic→chunk→WS→audio back→speaker→motion) with no GPU server and no hardware.
+- `scripts/setup_cm4.sh` (+ README): lightweight venv (numpy, scipy, websockets, pillow, opencv or
+  SDK frames, python-dotenv) — no mlx/funasr/kokoro. Update README + `.env.example`.
+
+## 7. Milestones
+
+1. `omni/protocol.py` + tests.  2. `omni/client.py` (asyncio thread, init/reconnect, event bridge).
+3. `omni/video.py` grabber.  4. Rewrite `audio/io.py` capture chunking; keep playback.
+5. Rewrite `pipeline.py` orchestrator + state mapping + barge-in.  6. `config.py`/`main.py`/`--stub`
+   fake server.  7. Delete `asr`/`llm`/`tts`/`vision`; update `pyproject`, `.env.example`, README,
+   `scripts/`.  8. Tests green + `ruff` clean + `--sim --stub` smoke run.
+```

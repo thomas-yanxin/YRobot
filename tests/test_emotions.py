@@ -1,5 +1,4 @@
-from reachy_mini_live_chat.llm.prompts import ALLOWED_EMOTIONS
-from reachy_mini_live_chat.motion.emotions import map_intent
+from reachy_mini_live_chat.motion.emotions import ALLOWED_EMOTIONS, map_intent
 
 
 def test_affirmation_zh():

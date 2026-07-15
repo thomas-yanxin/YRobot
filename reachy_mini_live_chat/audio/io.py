@@ -1,11 +1,17 @@
-"""Audio transport: mic capture -> VAD/endpointer, and TTS -> speaker.
+"""Audio transport: mic capture → 1 s chunks for the omni brain, and omni audio → speaker.
 
 Owns two threads:
-* **capture** — polls ``mini.media.get_audio_sample()``, downmixes to mono 16 kHz,
-  runs echo control, and drives the :class:`Endpointer`. Handles barge-in.
-* **playback** — drains ``bus.tts_audio`` and pushes to ``mini.media.push_audio_sample()``
-  in 20 ms sub-chunks so a barge-in can cut speech off mid-sentence. Stamps end-to-end
-  latency on the first chunk of each answer.
+* **capture** — polls ``mini.media.get_audio_sample()``, downmixes to mono 16 kHz, runs
+  echo suppression, then (a) feeds a lightweight VAD that only drives ``user_speaking``
+  (→ DOA head-turn + attentive mood + barge-in), and (b) accumulates the cleaned signal
+  into fixed ~1 s chunks handed to ``on_audio_chunk`` — the continuous full-duplex uplink.
+* **playback** — drains ``bus.tts_audio`` (float32 @ 16 kHz) and pushes to
+  ``mini.media.push_audio_sample()`` in 20 ms sub-chunks so a barge-in can cut the robot
+  off mid-word. Stamps end-to-end latency on the first chunk after the user stops talking.
+
+We stream the mic **continuously** (even while the robot speaks) so the model can hear a
+barge-in — which is exactly why the capture path runs echo suppression first, so the model
+doesn't hear the robot's own voice.
 """
 from __future__ import annotations
 
@@ -37,9 +43,9 @@ def _resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
     if sr_in == sr_out or len(x) == 0:
         return x
     try:
-        from scipy.signal import resample_poly
-
         from math import gcd
+
+        from scipy.signal import resample_poly
 
         g = gcd(sr_in, sr_out)
         return resample_poly(x, sr_out // g, sr_in // g).astype(np.float32)
@@ -55,12 +61,12 @@ class AudioEngine:
         mini,
         cfg: Config,
         bus: Bus,
-        on_utterance_pcm: Callable[[np.ndarray, float], None],
+        on_audio_chunk: Callable[[np.ndarray], None],
     ) -> None:
         self.mini = mini
         self.cfg = cfg
         self.bus = bus
-        self._on_utterance_pcm = on_utterance_pcm
+        self._on_audio_chunk = on_audio_chunk
 
         self.echo = EchoController(cfg.enable_aec, cfg.barge_in_energy)
         vad = build_vad(stub=cfg.stub)
@@ -70,12 +76,14 @@ class AudioEngine:
             silence_ms=cfg.vad_silence_ms,
             min_speech_ms=cfg.vad_min_speech_ms,
             on_speech_start=self._on_speech_start,
-            on_utterance=self._on_utterance,
+            on_utterance=self._on_speech_end,
         )
 
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         self._recent_loud = False
+        self._chunk_samples = max(1, int(TARGET_SR * cfg.omni_chunk_ms / 1000))
+        self._chunk_buf = np.zeros(0, dtype=np.float32)
         self._threads: list[threading.Thread] = []
 
     # -- lifecycle ----------------------------------------------------------
@@ -91,7 +99,8 @@ class AudioEngine:
             t = threading.Thread(target=target, name=target.__name__, daemon=True)
             t.start()
             self._threads.append(t)
-        log.info("AudioEngine started (in=%dHz out=%dHz)", self._in_sr, self._out_sr)
+        log.info("AudioEngine started (in=%dHz out=%dHz, chunk=%dms)",
+                 self._in_sr, self._out_sr, self.cfg.omni_chunk_ms)
 
     def join(self) -> None:
         for t in self._threads:
@@ -114,12 +123,25 @@ class AudioEngine:
             # barge-in energy check on the *raw* mic (before ducking)
             self._recent_loud = self.echo.is_barge_in(mono, robot_speaking)
             clean = self.echo.process_capture(mono, robot_speaking)
+            # (a) local VAD only sets user_speaking → DOA / mood / barge-in
             self.endpointer.process(clean)
+            # (b) continuous 1 s chunks → the omni uplink
+            self._accumulate(clean)
+
+    def _accumulate(self, clean: np.ndarray) -> None:
+        self._chunk_buf = np.concatenate([self._chunk_buf, clean.astype(np.float32)])
+        while len(self._chunk_buf) >= self._chunk_samples:
+            chunk = self._chunk_buf[: self._chunk_samples]
+            self._chunk_buf = self._chunk_buf[self._chunk_samples:]
+            try:
+                self._on_audio_chunk(chunk)
+            except Exception as e:
+                log.debug("on_audio_chunk error: %s", e)
 
     def _on_speech_start(self) -> None:
         if self.bus.robot_speaking.is_set():
-            # Human started talking while the robot was speaking. Only treat as a real
-            # barge-in if they're clearly louder than the residual echo.
+            # Human started while the robot spoke → only a real barge-in if clearly
+            # louder than the residual echo.
             if not self._recent_loud:
                 return
             log.info("barge-in detected")
@@ -128,14 +150,18 @@ class AudioEngine:
         self.bus.set_state(ConvState.LISTENING)
         self.bus.emit("system", {"text": "listening"})
 
-    def _on_utterance(self, pcm: np.ndarray) -> None:
+    def _on_speech_end(self, pcm: np.ndarray) -> None:
+        # We don't consume the utterance PCM (the omni server does the ASR); this only
+        # marks the end of human speech for DOA decay + the e2e latency clock.
         self.bus.user_speaking.clear()
-        t_end = time.monotonic()
-        # ignore utterances that are essentially silence
-        if float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2))) < 1e-4:
-            self.bus.set_state(ConvState.IDLE)
-            return
-        self._on_utterance_pcm(pcm, t_end)
+        self.bus.pending_t_end = time.monotonic()
+        self.bus.pending_measured = False
+        # If we cut the robot off (barge-in), recover: allow future audio to play and
+        # leave the INTERRUPTED state so motion stops the speaking wobble.
+        if self.bus.interrupt_event.is_set() or self.bus.state == ConvState.INTERRUPTED:
+            self.bus.clear_interrupt()
+            if self.bus.state == ConvState.INTERRUPTED:
+                self.bus.set_state(ConvState.IDLE)
 
     # -- playback -----------------------------------------------------------
     def _playback_loop(self) -> None:
@@ -148,7 +174,7 @@ class AudioEngine:
                     self.bus.robot_speaking.clear()
                     self.bus.emit("system", {"text": "spoke"})
                 continue
-            if item is None:  # end-of-utterance sentinel
+            if item is None:  # end-of-turn sentinel
                 idle_since = time.monotonic()
                 continue
             self._play_chunk(item)
@@ -156,12 +182,12 @@ class AudioEngine:
 
     def _play_chunk(self, chunk: np.ndarray) -> None:
         if self.bus.interrupt_event.is_set():
-            return  # dropped: this belongs to an interrupted turn
-        # first audio of the answer -> stamp end-to-end latency
+            return  # dropped: belongs to an interrupted turn
+        # first audio after the user stopped → stamp end-to-end latency
         if not self.bus.pending_measured and self.bus.pending_t_end is not None:
             ms = self.bus.measure_e2e(self.bus.pending_t_end)
             self.bus.pending_measured = True
-            log.info("e2e latency: %.0f ms", ms)
+            log.info("e2e latency (user stop → first audio): %.0f ms", ms)
         self.bus.robot_speaking.set()
         chunk = _resample(chunk.astype(np.float32), TARGET_SR, self._out_sr)
         for i in range(0, len(chunk), SUBCHUNK):
