@@ -84,10 +84,17 @@ class AudioEngine:
         # fixed gain (omni_mic_gain). AGC is preferred over a fixed gain — it lifts quiet
         # speech to a target level without the hard clipping a fixed multiplier causes.
         self._mic = MicPreprocessor(
-            agc_dbfs=getattr(cfg, "omni_agc_dbfs", 15),
+            agc_dbfs=getattr(cfg, "omni_agc_dbfs", 6),
             ns_level=getattr(cfg, "omni_ns_level", 2),
             fallback_gain=getattr(cfg, "omni_mic_gain", 1.0),
         )
+        # Uplink self-echo guard. Muting only while `robot_speaking` isn't enough: after the
+        # last audio is pushed the speaker keeps physically ringing for a moment, and that
+        # tail leaks into the mic (AGC even amplifies it) → the model hears itself finish and
+        # replies again → a self-triggering turn loop. Keep muting for a short hangover after
+        # the robot stops so the tail is swallowed too. Barge-in still overrides.
+        self._uplink_hangover_s = max(0.0, getattr(cfg, "omni_uplink_hangover_ms", 400) / 1000.0)
+        self._last_spoke_t = 0.0
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # playback pacing (set once out_sr is known in start())
@@ -153,12 +160,16 @@ class AudioEngine:
                 self.endpointer.process(clean)
                 # (b) continuous 1 s chunks → the omni uplink.
                 # Never feed the robot's own voice back to a full-duplex model: it would
-                # transcribe itself and reply to its own words (→ answers drift / off-topic).
-                # With real AEC the echo is already removed, so stream continuously. Without
-                # it (duck-only fallback — e.g. webrtc APM not installed), the ducked signal
-                # still leaks the robot's voice, so send silence while it speaks and only
-                # send the real mic when the human is clearly barging in over it.
-                if robot_speaking and not self.echo.enable_aec and not self._recent_loud:
+                # transcribe itself and reply to its own words (→ answers drift / off-topic /
+                # a self-triggering turn loop). With real AEC the echo is already removed, so
+                # stream continuously. Without it (duck-only fallback — e.g. webrtc APM not
+                # installed), send silence while the robot speaks *and for a short hangover
+                # after* (to swallow the speaker's physical tail), except during a clear
+                # barge-in.
+                if robot_speaking:
+                    self._last_spoke_t = t0
+                recently_spoke = robot_speaking or (t0 - self._last_spoke_t) < self._uplink_hangover_s
+                if recently_spoke and not self.echo.enable_aec and not self._recent_loud:
                     self._accumulate(np.zeros_like(clean))
                 else:
                     self._accumulate(clean)

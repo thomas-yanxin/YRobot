@@ -118,9 +118,13 @@ class Config:
     #   omni_ns_level: noise suppression, 0–4 (0 disables, 4 = max)
     # omni_mic_gain is only the FALLBACK fixed gain used when webrtc-noise-gain is absent
     # (hard-clipped to [-1, 1]; 1.0 = no change).
-    omni_agc_dbfs: int = field(default_factory=lambda: _int("OMNI_AGC_DBFS", 15))
+    omni_agc_dbfs: int = field(default_factory=lambda: _int("OMNI_AGC_DBFS", 6))
     omni_ns_level: int = field(default_factory=lambda: _int("OMNI_NS_LEVEL", 2))
     omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
+    # Self-echo guard: keep muting the uplink this long after the robot stops speaking, so
+    # the speaker's physical tail doesn't leak back and re-trigger the model (a turn loop).
+    # Raise if the robot still talks to itself; lower if it clips the start of your replies.
+    omni_uplink_hangover_ms: int = field(default_factory=lambda: _int("OMNI_UPLINK_HANGOVER_MS", 400))
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
     # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real
     # time. The cushion absorbs CPU/scheduling jitter on the CM4 so speech doesn't stutter;
