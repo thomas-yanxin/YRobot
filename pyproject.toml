@@ -32,6 +32,7 @@ vad = ["onnxruntime"]                     # Silero v5 VAD on CPU via onnx (else 
 vision = ["pillow"]                       # downscale frames (else the SDK's full-res get_frame_jpeg)
 web = ["fastapi", "uvicorn"]              # control/monitor web UI (headless works without it)
 aec = ["webrtc-audio-processing"]         # true echo cancellation (else duck-and-gate)
+denoise = ["webrtc-noise-gain"]           # mic noise-suppression + auto-gain (else fixed OMNI_MIC_GAIN)
 simcam = ["opencv-python", "sounddevice", "soundfile"]  # laptop --sim: Mac mic/speaker/webcam
 
 # On-robot (Wireless CM4, ARM64 Linux): minimal client. reachy-mini is usually already in the
@@ -44,6 +45,7 @@ laptop = [
     "scipy>=1.10", "onnxruntime", "pillow",
     "fastapi", "uvicorn",
     "opencv-python", "sounddevice", "soundfile",
+    "webrtc-noise-gain",
 ]
 
 dev = ["pytest>=7", "ruff", "numpy>=1.24", "pillow", "python-dotenv>=1.0", "onnxruntime"]

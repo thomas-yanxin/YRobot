@@ -25,6 +25,7 @@ import numpy as np
 from ..bus import Bus, ConvState
 from ..config import Config
 from .aec import EchoController
+from .denoise import MicPreprocessor
 from .vad import Endpointer, build_vad
 
 log = logging.getLogger("live_chat.audio")
@@ -79,7 +80,14 @@ class AudioEngine:
             on_utterance=self._on_speech_end,
         )
 
-        self._mic_gain = float(getattr(cfg, "omni_mic_gain", 1.0) or 1.0)
+        # Mic front-end: WebRTC noise-suppression + auto-gain when available, else a plain
+        # fixed gain (omni_mic_gain). AGC is preferred over a fixed gain — it lifts quiet
+        # speech to a target level without the hard clipping a fixed multiplier causes.
+        self._mic = MicPreprocessor(
+            agc_dbfs=getattr(cfg, "omni_agc_dbfs", 15),
+            ns_level=getattr(cfg, "omni_ns_level", 2),
+            fallback_gain=getattr(cfg, "omni_mic_gain", 1.0),
+        )
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # playback pacing (set once out_sr is known in start())
@@ -133,15 +141,27 @@ class AudioEngine:
                 mono = _to_mono(sample)
                 mono = _resample(mono, self._in_sr, TARGET_SR)
                 robot_speaking = self.bus.robot_speaking.is_set()
-                # barge-in energy check on the *raw* mic (before ducking)
+                # barge-in energy check on the *raw* mic (before NS/AGC/ducking)
                 self._recent_loud = self.echo.is_barge_in(mono, robot_speaking)
-                clean = self.echo.process_capture(mono, robot_speaking)
-                if self._mic_gain != 1.0:
-                    clean = np.clip(clean * self._mic_gain, -1.0, 1.0)
+                # Clean the mic for both the VAD and the model uplink: WebRTC NS + auto-gain
+                # (or a fixed fallback gain). Buffers to whole 10 ms frames, so the returned
+                # length can differ slightly — every consumer below handles arbitrary lengths.
+                mic = self._mic.process(mono)
+                # Duck residual echo for the local VAD while the robot speaks (no-AEC fallback).
+                clean = self.echo.process_capture(mic, robot_speaking)
                 # (a) local VAD only sets user_speaking → DOA / mood / barge-in
                 self.endpointer.process(clean)
-                # (b) continuous 1 s chunks → the omni uplink
-                self._accumulate(clean)
+                # (b) continuous 1 s chunks → the omni uplink.
+                # Never feed the robot's own voice back to a full-duplex model: it would
+                # transcribe itself and reply to its own words (→ answers drift / off-topic).
+                # With real AEC the echo is already removed, so stream continuously. Without
+                # it (duck-only fallback — e.g. webrtc APM not installed), the ducked signal
+                # still leaks the robot's voice, so send silence while it speaks and only
+                # send the real mic when the human is clearly barging in over it.
+                if robot_speaking and not self.echo.enable_aec and not self._recent_loud:
+                    self._accumulate(np.zeros_like(clean))
+                else:
+                    self._accumulate(clean)
             time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
 
     def _accumulate(self, clean: np.ndarray) -> None:
