@@ -110,20 +110,28 @@ class Config:
     # played voice sounds pitched/sped.
     omni_chunk_ms: int = field(default_factory=lambda: _int("OMNI_CHUNK_MS", 1000))
     omni_out_sr: int = field(default_factory=lambda: _int("OMNI_OUT_SR", 24000))
-    # Mic front-end. Preferred: WebRTC noise-suppression + auto-gain (needs the
-    # `webrtc-noise-gain` package) — AGC lifts quiet speech to a target level without the
-    # hard clipping a fixed multiplier causes, and NS removes steady background noise, so
-    # the omni model mishears less.
-    #   omni_agc_dbfs: auto-gain target, 0–31 (0 disables; higher = more boost for a quiet mic)
+    # Echo/noise/gain on Reachy Mini is done in HARDWARE by the ReSpeaker XVF3800 mic board
+    # (always on). omni_respeaker_config writes the tuned XVF3800 params at startup, the way
+    # the official app does — this is the real echo fix. Leave it on unless you're on
+    # hardware without that board.
+    omni_respeaker_config: bool = field(default_factory=lambda: _flag("OMNI_RESPEAKER_CONFIG", True))
+
+    # Software mic front-end (WebRTC noise-suppression + auto-gain, needs `webrtc-noise-gain`).
+    # OFF by default — the XVF3800 already does NS+AGC in hardware, and stacking software AGC
+    # on top causes pumping. Only enable on hardware that lacks the board.
+    #   omni_agc_dbfs: auto-gain target, 0–31 (0 disables; higher = more boost)
     #   omni_ns_level: noise suppression, 0–4 (0 disables, 4 = max)
-    # omni_mic_gain is only the FALLBACK fixed gain used when webrtc-noise-gain is absent
-    # (hard-clipped to [-1, 1]; 1.0 = no change).
-    omni_agc_dbfs: int = field(default_factory=lambda: _int("OMNI_AGC_DBFS", 6))
-    omni_ns_level: int = field(default_factory=lambda: _int("OMNI_NS_LEVEL", 2))
+    # omni_mic_gain is only the FALLBACK fixed gain used when webrtc-noise-gain is absent.
+    omni_agc_dbfs: int = field(default_factory=lambda: _int("OMNI_AGC_DBFS", 0))
+    omni_ns_level: int = field(default_factory=lambda: _int("OMNI_NS_LEVEL", 0))
     omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
-    # Self-echo guard: keep muting the uplink this long after the robot stops speaking, so
-    # the speaker's physical tail doesn't leak back and re-trigger the model (a turn loop).
-    # Raise if the robot still talks to itself; lower if it clips the start of your replies.
+
+    # Software echo guard (duck + self-mute + hangover). OFF by default — the XVF3800 removes
+    # the echo in hardware, so we stream the mic continuously like the official app. Enable
+    # (OMNI_SW_ECHO_GUARD=1) only on hardware without XVF3800 AEC.
+    omni_sw_echo_guard: bool = field(default_factory=lambda: _flag("OMNI_SW_ECHO_GUARD", False))
+    # Guard-only: keep muting the uplink this long after the robot stops (swallow the speaker
+    # tail). Unused unless omni_sw_echo_guard is on.
     omni_uplink_hangover_ms: int = field(default_factory=lambda: _int("OMNI_UPLINK_HANGOVER_MS", 400))
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
     # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real
