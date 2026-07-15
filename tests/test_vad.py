@@ -20,6 +20,12 @@ def test_build_vad_stub_is_energy():
     assert isinstance(vad.build_vad(stub=True), vad._EnergyVad)
 
 
+def test_build_vad_defaults_to_energy():
+    # cheap energy VAD is the default (onnx is opt-in) so the CM4 stays responsive
+    assert isinstance(vad.build_vad(stub=False), vad._EnergyVad)
+    assert isinstance(vad.build_vad(stub=False, backend="energy"), vad._EnergyVad)
+
+
 def test_onnx_vad_loads_and_scores():
     ort = pytest.importorskip("onnxruntime")  # noqa: F841
     v = vad._OnnxVad()
@@ -36,6 +42,7 @@ def test_onnx_vad_loads_and_scores():
     assert v.speech_prob(np.zeros(FRAME, dtype=np.float32)) < 0.5
 
 
-def test_build_vad_prefers_onnx_when_available():
+def test_build_vad_onnx_when_requested():
     pytest.importorskip("onnxruntime")
-    assert isinstance(vad.build_vad(stub=False), vad._OnnxVad)
+    assert isinstance(vad.build_vad(stub=False, backend="onnx"), vad._OnnxVad)
+    assert isinstance(vad.build_vad(stub=False, backend="auto"), vad._OnnxVad)

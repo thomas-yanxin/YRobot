@@ -22,7 +22,7 @@ from typing import Optional
 
 import numpy as np
 
-from .audio.io import TARGET_SR, AudioEngine, _resample
+from .audio.io import AudioEngine
 from .bus import Bus, ConvState, MotionIntent
 from .config import Config
 from .motion import MotionController
@@ -106,10 +106,13 @@ class Pipeline:
             self.bus.emit("assistant", {"text": shown, "lang": detect_lang(self._turn_text)})
 
     def on_audio(self, pcm: np.ndarray) -> None:
+        # Queue raw omni audio (float32 at omni_out_sr); the playback thread resamples to
+        # the device rate. Keeping the WS receive thread free of resampling avoids choppy
+        # speech on the CM4.
         self._begin_speaking()
-        pcm16k = _resample(np.asarray(pcm, dtype=np.float32), self.cfg.omni_out_sr, TARGET_SR)
-        if len(pcm16k):
-            self.bus.tts_audio.put(pcm16k)
+        arr = np.asarray(pcm, dtype=np.float32)
+        if len(arr):
+            self.bus.tts_audio.put(arr)
 
     def on_listen(self) -> None:
         # Model chose to listen this step: end any current spoken turn.
