@@ -115,6 +115,11 @@ class Config:
     # to the model. Applied with hard clipping to [-1, 1]. 1.0 = no change.
     omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
+    # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real
+    # time. The cushion absorbs CPU/scheduling jitter on the CM4 so speech doesn't stutter;
+    # pacing to the cushion keeps latency bounded if the server produces audio fast.
+    omni_playback_chunk_ms: int = field(default_factory=lambda: _int("OMNI_PLAYBACK_CHUNK_MS", 60))
+    omni_playback_cushion_ms: int = field(default_factory=lambda: _int("OMNI_PLAYBACK_CUSHION_MS", 200))
 
     # Video → omni: attach a current frame to input.append. Sending a frame every chunk
     # makes the server run its vision encoder ~1×/s; if its GPU can't sustain vision+audio
