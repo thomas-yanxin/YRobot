@@ -26,6 +26,7 @@ from ..bus import Bus, ConvState
 from ..config import Config
 from .aec import EchoController
 from .denoise import MicPreprocessor
+from .respeaker_config import apply_startup_config
 from .vad import Endpointer, build_vad
 
 log = logging.getLogger("live_chat.audio")
@@ -95,6 +96,11 @@ class AudioEngine:
         # the robot stops so the tail is swallowed too. Barge-in still overrides.
         self._uplink_hangover_s = max(0.0, getattr(cfg, "omni_uplink_hangover_ms", 400) / 1000.0)
         self._last_spoke_t = 0.0
+        # Reachy Mini's XVF3800 mic board does AEC/NS/AGC in hardware (always on), so by
+        # default we trust it: stream the mic continuously, no software duck/mute/hangover
+        # (mirrors the official conversation app). The software echo guard is only for
+        # hardware that lacks the XVF3800 AEC — enable it with OMNI_SW_ECHO_GUARD=1.
+        self._sw_echo_guard = bool(getattr(cfg, "omni_sw_echo_guard", False))
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # playback pacing (set once out_sr is known in start())
@@ -118,6 +124,10 @@ class AudioEngine:
         except Exception:
             pass
         self._play_sub_n = max(1, int(self._out_sr * self.cfg.omni_playback_chunk_ms / 1000))
+        # Tune the ReSpeaker XVF3800 (hardware AEC/NS/AGC) before we start streaming, the way
+        # the official app does. Best-effort: no-op on sim/older SDK.
+        if getattr(self.cfg, "omni_respeaker_config", True):
+            apply_startup_config(self.mini)
         self.mini.media.start_recording()
         self.mini.media.start_playing()
         for target in (self._capture_loop, self._playback_loop):
@@ -148,31 +158,31 @@ class AudioEngine:
                 mono = _to_mono(sample)
                 mono = _resample(mono, self._in_sr, TARGET_SR)
                 robot_speaking = self.bus.robot_speaking.is_set()
-                # barge-in energy check on the *raw* mic (before NS/AGC/ducking)
+                # barge-in energy check on the mic (raw, before any software processing)
                 self._recent_loud = self.echo.is_barge_in(mono, robot_speaking)
-                # Clean the mic for both the VAD and the model uplink: WebRTC NS + auto-gain
-                # (or a fixed fallback gain). Buffers to whole 10 ms frames, so the returned
-                # length can differ slightly — every consumer below handles arbitrary lengths.
+                # Optional software NS/auto-gain. Off by default — the XVF3800 does NS+AGC in
+                # hardware; this is a no-op passthrough unless OMNI_AGC_DBFS/OMNI_NS_LEVEL are set.
                 mic = self._mic.process(mono)
-                # Duck residual echo for the local VAD while the robot speaks (no-AEC fallback).
-                clean = self.echo.process_capture(mic, robot_speaking)
-                # (a) local VAD only sets user_speaking → DOA / mood / barge-in
-                self.endpointer.process(clean)
-                # (b) continuous 1 s chunks → the omni uplink.
-                # Never feed the robot's own voice back to a full-duplex model: it would
-                # transcribe itself and reply to its own words (→ answers drift / off-topic /
-                # a self-triggering turn loop). With real AEC the echo is already removed, so
-                # stream continuously. Without it (duck-only fallback — e.g. webrtc APM not
-                # installed), send silence while the robot speaks *and for a short hangover
-                # after* (to swallow the speaker's physical tail), except during a clear
-                # barge-in.
-                if robot_speaking:
-                    self._last_spoke_t = t0
-                recently_spoke = robot_speaking or (t0 - self._last_spoke_t) < self._uplink_hangover_s
-                if recently_spoke and not self.echo.enable_aec and not self._recent_loud:
-                    self._accumulate(np.zeros_like(clean))
+
+                if self._sw_echo_guard:
+                    # Software echo path (only for hardware without XVF3800 AEC): duck residual
+                    # echo for the VAD, and mute the uplink while the robot speaks + a hangover
+                    # after (swallow the speaker tail) so the model never hears itself.
+                    clean = self.echo.process_capture(mic, robot_speaking)
+                    self.endpointer.process(clean)
+                    if robot_speaking:
+                        self._last_spoke_t = t0
+                    recently_spoke = robot_speaking or (t0 - self._last_spoke_t) < self._uplink_hangover_s
+                    if recently_spoke and not self.echo.enable_aec and not self._recent_loud:
+                        self._accumulate(np.zeros_like(clean))
+                    else:
+                        self._accumulate(clean)
                 else:
-                    self._accumulate(clean)
+                    # Hardware-AEC path (default): the mic is already echo-cancelled by the
+                    # XVF3800, so feed the VAD and stream the uplink continuously — same as the
+                    # official app. No duck, no self-mute.
+                    self.endpointer.process(mic)
+                    self._accumulate(mic)
             time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
 
     def _accumulate(self, clean: np.ndarray) -> None:
