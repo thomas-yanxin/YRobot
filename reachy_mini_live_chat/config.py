@@ -165,6 +165,14 @@ class Config:
     sample_rate: int = 16000
 
     @property
+    def omni_video_active(self) -> bool:
+        """Send camera frames? Never in an audio-only session (sending video into an
+        audio duplex session confuses the backend → it stops responding)."""
+        if not self.omni_send_video:
+            return False
+        return "mode=audio" not in self.omni_backend_url
+
+    @property
     def omni_backend_url(self) -> str:
         """Resolve the WS URL to connect to (adds the right path unless one is given)."""
         url = self.omni_ws_url.rstrip("/")

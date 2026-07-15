@@ -46,6 +46,7 @@ class OmniClient:
         # rolling 5 s telemetry so "no response" is diagnosable from one run:
         # is the mic reaching us (uplink rms), and what is the server sending back?
         self._stats = {"up": 0, "up_rms": 0.0, "text": 0, "audio": 0, "listen": 0, "done": 0}
+        self._seen_other: set = set()  # unrecognized event (type, kind) — logged once each
 
     # -- public API (called from other threads) -----------------------------
     def set_frame_source(self, fn: FrameSource) -> None:
@@ -195,6 +196,7 @@ class OmniClient:
 
         only_fd = self.cfg.omni_mode == "full_duplex"
         every_n = max(1, int(self.cfg.omni_video_every_n))
+        send_video = self.cfg.omni_video_active
         sent = 0
         while not self.bus.stop_event.is_set():
             chunk = await self._next_chunk()
@@ -204,8 +206,8 @@ class OmniClient:
                 # turn_based has no continuous mic push path here.
                 continue
             # Attach a frame only every Nth chunk — sending vision every second can push
-            # the server past real time (→ backlog / choppy speech).
-            want_frame = self._frame_source and self.cfg.omni_send_video and (sent % every_n == 0)
+            # the server past real time (→ backlog / choppy speech). Never in audio mode.
+            want_frame = self._frame_source and send_video and (sent % every_n == 0)
             frame_b64 = self._frame_source() if want_frame else None
             msg = protocol.build_input_append(chunk, frame_b64=frame_b64)
             await ws.send(json.dumps(msg))
@@ -288,6 +290,14 @@ class OmniClient:
                     log.debug("omni: status %s", evt.status)
             elif cat == protocol.EV_ERROR:
                 log.warning("omni: server error (%s): %s", evt.reason, evt.message)
+            elif cat == protocol.EV_OTHER:
+                # Surface unrecognized frames once each — if the audio path replies with
+                # a differently-named event, this reveals it instead of silently dropping.
+                key = (evt.raw.get("type"), evt.raw.get("kind"))
+                if key not in self._seen_other:
+                    self._seen_other.add(key)
+                    log.info("omni: unhandled server event type=%r kind=%r (keys=%s)",
+                             key[0], key[1], list(evt.raw.keys()))
         except Exception as e:  # pragma: no cover - sink must never kill the loop
             log.debug("omni sink error on %s: %s", cat, e)
 

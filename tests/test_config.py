@@ -33,3 +33,20 @@ def test_explicit_path_used_verbatim():
 def test_trailing_slash_base():
     c = _cfg(omni_ws_url="wss://host:8006/", omni_endpoint="gateway", omni_gateway_mode="video")
     assert c.omni_backend_url == "wss://host:8006/v1/realtime?mode=video"
+
+
+def test_video_inactive_in_audio_mode():
+    # audio-only session → never attach video frames (even via an explicit URL)
+    c = _cfg(omni_ws_url="wss://host:8006", omni_endpoint="gateway", omni_gateway_mode="audio",
+             omni_send_video=True)
+    assert c.omni_video_active is False
+    c2 = _cfg(omni_ws_url="wss://host:8006/v1/realtime?mode=audio", omni_send_video=True)
+    assert c2.omni_video_active is False
+
+
+def test_video_active_in_video_mode():
+    c = _cfg(omni_ws_url="wss://host:8006", omni_endpoint="gateway", omni_gateway_mode="video",
+             omni_send_video=True)
+    assert c.omni_video_active is True
+    c2 = _cfg(omni_send_video=False, omni_gateway_mode="video")
+    assert c2.omni_video_active is False
