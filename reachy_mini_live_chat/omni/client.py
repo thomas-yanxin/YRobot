@@ -45,7 +45,7 @@ class OmniClient:
         self._turn_text: dict[str, str] = {}
         # rolling 5 s telemetry so "no response" is diagnosable from one run:
         # is the mic reaching us (uplink rms), and what is the server sending back?
-        self._stats = {"up": 0, "up_rms": 0.0, "text": 0, "audio": 0, "listen": 0, "done": 0}
+        self._stats = {"up": 0, "up_rms": 0.0, "drop": 0, "text": 0, "audio": 0, "listen": 0, "done": 0}
         self._seen_other: set = set()  # unrecognized event (type, kind) — logged once each
 
     # -- public API (called from other threads) -----------------------------
@@ -173,8 +173,8 @@ class OmniClient:
             playq = self.bus.tts_audio.qsize()  # unplayed audio backlog (→ choppy if it grows)
             if n or s["text"] or s["audio"] or s["listen"] or s["done"]:
                 log.info(
-                    "omni 5s: uplink=%d chunks (mic rms~%.4f) | downlink text=%d audio=%d listen=%d done=%d | playq=%d",
-                    n, (s["up_rms"] / n if n else 0.0), s["text"], s["audio"], s["listen"], s["done"], playq,
+                    "omni 5s: uplink=%d chunks (mic rms~%.4f, dropped=%d) | downlink text=%d audio=%d listen=%d done=%d | playq=%d",
+                    n, (s["up_rms"] / n if n else 0.0), s["drop"], s["text"], s["audio"], s["listen"], s["done"], playq,
                 )
                 if playq > 25:
                     log.warning("omni: audio backlog (playq=%d) — the server is producing "
@@ -235,6 +235,7 @@ class OmniClient:
                 except queue.Empty:
                     break
             if dropped:
+                self._stats["drop"] += dropped
                 log.debug("omni: dropped %d stale audio chunk(s) to catch up", dropped)
             return chunk
         return None
