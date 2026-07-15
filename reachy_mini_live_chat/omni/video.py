@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -25,20 +26,43 @@ log = logging.getLogger("live_chat.omni.video")
 
 
 class VideoGrabber:
+    """Grabs + encodes frames on a **background thread** so the omni audio uplink
+    never blocks on a slow camera read. :meth:`latest_b64` just returns the most
+    recent cached encoding (non-blocking)."""
+
     def __init__(self, cfg: Config, mini) -> None:
         self.cfg = cfg
         self.mini = mini
-        self._last_t = 0.0
         self._last_b64: Optional[str] = None
         self._min_dt = 1.0 / max(0.1, cfg.omni_video_fps)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not self.cfg.omni_send_video or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="video", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
 
     def latest_b64(self) -> Optional[str]:
-        """Return the current frame as base64 JPEG (cached between fps ticks)."""
-        if not self.cfg.omni_send_video:
-            return None
-        now = time.monotonic()
-        if self._last_b64 is not None and now - self._last_t < self._min_dt:
-            return self._last_b64
+        """Non-blocking: return the most recently encoded frame (or None)."""
+        return self._last_b64 if self.cfg.omni_send_video else None
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            try:
+                self._refresh()
+            except Exception as e:
+                log.debug("video refresh error: %s", e)
+            time.sleep(max(0.0, self._min_dt - (time.monotonic() - t0)))
+
+    def _refresh(self) -> None:
         jpeg = None
         frame = self._grab()
         if frame is not None:
@@ -48,11 +72,8 @@ class VideoGrabber:
             # No frame array or no encoder (pillow/opencv absent) → let the SDK
             # hand us a ready-made JPEG. Full resolution, but zero extra deps.
             jpeg = self._grab_jpeg()
-        if jpeg is None:
-            return self._last_b64  # keep the last good frame rather than dropping video
-        self._last_b64 = base64.b64encode(jpeg).decode("ascii")
-        self._last_t = now
-        return self._last_b64
+        if jpeg is not None:
+            self._last_b64 = base64.b64encode(jpeg).decode("ascii")
 
     def _grab(self) -> Optional[np.ndarray]:
         try:

@@ -43,6 +43,9 @@ class OmniClient:
         self._ws = None
         # per-response accumulated text, keyed by response_id
         self._turn_text: dict[str, str] = {}
+        # rolling 5 s telemetry so "no response" is diagnosable from one run:
+        # is the mic reaching us (uplink rms), and what is the server sending back?
+        self._stats = {"up": 0, "up_rms": 0.0, "text": 0, "audio": 0, "listen": 0, "done": 0}
 
     # -- public API (called from other threads) -----------------------------
     def set_frame_source(self, fn: FrameSource) -> None:
@@ -144,18 +147,35 @@ class OmniClient:
 
         sender = asyncio.create_task(self._sender(ws, ready))
         receiver = asyncio.create_task(self._receiver(ws, ready))
+        stats = asyncio.create_task(self._stats_loop())
         try:
             # Whichever finishes first (sender returns on stop; receiver on ws close)
-            # tears the session down; the other is cancelled below.
+            # tears the session down; the others are cancelled below.
             await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (sender, receiver):
+            for t in (sender, receiver, stats):
                 t.cancel()
-            for t in (sender, receiver):
+            for t in (sender, receiver, stats):
                 try:
                     await t
                 except Exception:
                     pass
+
+    async def _stats_loop(self) -> None:
+        """Every 5 s, log uplink chunk count + mean RMS and the downlink event mix."""
+        import asyncio
+
+        while not self.bus.stop_event.is_set():
+            await asyncio.sleep(5.0)
+            s = self._stats
+            n = s["up"]
+            if n or s["text"] or s["audio"] or s["listen"] or s["done"]:
+                log.info(
+                    "omni 5s: uplink=%d chunks (mic rms~%.4f) | downlink text=%d audio=%d listen=%d done=%d",
+                    n, (s["up_rms"] / n if n else 0.0), s["text"], s["audio"], s["listen"], s["done"],
+                )
+            for k in s:
+                s[k] = 0
 
     async def _sender(self, ws, ready) -> None:
         import asyncio
@@ -179,6 +199,9 @@ class OmniClient:
             frame_b64 = self._frame_source() if (self._frame_source and self.cfg.omni_send_video) else None
             msg = protocol.build_input_append(chunk, frame_b64=frame_b64)
             await ws.send(json.dumps(msg))
+            self._stats["up"] += 1
+            if len(chunk):
+                self._stats["up_rms"] += float(np.sqrt(np.mean(np.asarray(chunk, dtype=np.float64) ** 2)))
 
     async def _next_chunk(self):
         """Await the next audio chunk, coalescing a backlog to stay real-time."""
@@ -228,13 +251,17 @@ class OmniClient:
             elif cat == protocol.EV_TEXT:
                 rid = evt.response_id or "_"
                 self._turn_text[rid] = self._turn_text.get(rid, "") + evt.text
+                self._stats["text"] += 1
                 self.sink.on_text(evt.text)
             elif cat == protocol.EV_AUDIO:
                 if evt.audio is not None and len(evt.audio):
+                    self._stats["audio"] += 1
                     self.sink.on_audio(evt.audio)
             elif cat == protocol.EV_LISTEN:
+                self._stats["listen"] += 1
                 self.sink.on_listen()
             elif cat == protocol.EV_DONE:
+                self._stats["done"] += 1
                 rid = evt.response_id or "_"
                 full = self._turn_text.pop(rid, "") or evt.text
                 if evt.audio is not None and len(evt.audio):
