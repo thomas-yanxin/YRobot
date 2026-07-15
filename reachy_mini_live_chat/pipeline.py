@@ -133,6 +133,10 @@ class Pipeline:
         if not self._speaking:
             self._speaking = True
             self._turn_text = ""
+            # A new reply is starting, so any earlier barge-in is over. Drop a stale
+            # interrupt flag here or the playback path would silently discard this
+            # reply's audio ("occasionally no reply").
+            self.bus.clear_interrupt()
             self.bus.set_state(ConvState.SPEAKING)
 
     def _end_turn(self, reset_state: bool = False) -> None:

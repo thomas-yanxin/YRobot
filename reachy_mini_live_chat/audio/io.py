@@ -235,6 +235,10 @@ class AudioEngine:
                     self.bus.robot_speaking.clear()
                     self.bus.emit("system", {"text": "spoke"})
                     self._turn_start = None  # reset pacing for the next spoken turn
+                # Safety net: never let a barge-in interrupt persist into an idle gap —
+                # otherwise the next reply's audio would be dropped by _play_chunk.
+                if self.bus.interrupt_event.is_set() and not self.bus.robot_speaking.is_set():
+                    self.bus.clear_interrupt()
                 continue
             if item is None:  # end-of-turn sentinel
                 idle_since = time.monotonic()
