@@ -52,6 +52,17 @@ class MotionController:
         self._thread: Optional[threading.Thread] = None
         self._t0 = time.monotonic()
 
+        # Output smoothing: EMA the commanded antennas (and head rpy) so state changes
+        # and any control-loop jitter don't show up as jerky steps. Time constant is a
+        # few tens of ms at 100 Hz — smooth to the eye, still responsive for gestures.
+        self._ant_cmd = [0.0, 0.0]
+        self._head_rpy_cmd = None     # (roll, pitch, yaw) degrees, smoothed
+        self._ant_alpha = 0.25
+        self._head_alpha = 0.35
+        # effective-rate telemetry
+        self._rate_t0 = self._t0
+        self._rate_n = 0
+
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
         if not self.cfg.enable_motion:
@@ -99,15 +110,51 @@ class MotionController:
                 self._drain_intents()
                 self._poll_doa(tick)
                 head, antennas, body_yaw = self._compute(tick)
-                head = safety.clamp_head_pose(head)
-                antennas = safety.clamp_antennas(antennas)
+                head = self._smooth_head(safety.clamp_head_pose(head))
+                antennas = self._smooth_antennas(safety.clamp_antennas(antennas))
                 if body_yaw is not None:
                     body_yaw = safety.clamp_body_yaw(body_yaw, safety.head_yaw_deg(head) * math.pi / 180.0)
                 self.mini.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
+                self._tick_rate(tick)
             except Exception as e:
                 log.debug("motion tick error: %s", e)
             elapsed = time.monotonic() - tick
             time.sleep(max(0.0, dt - elapsed))
+
+    # -- output smoothing ---------------------------------------------------
+    def _smooth_antennas(self, antennas) -> list:
+        a = self._ant_alpha
+        for i in range(min(2, len(antennas))):
+            self._ant_cmd[i] += a * (float(antennas[i]) - self._ant_cmd[i])
+        return list(self._ant_cmd)
+
+    def _smooth_head(self, head: np.ndarray) -> np.ndarray:
+        """EMA the head in rpy space (matrix EMA isn't a valid rotation)."""
+        roll, pitch, yaw = safety.matrix_to_rpy(head[:3, :3], degrees=True)
+        if self._head_rpy_cmd is None:
+            self._head_rpy_cmd = [roll, pitch, yaw]
+        else:
+            a = self._head_alpha
+            cur = self._head_rpy_cmd
+            cur[0] += a * (roll - cur[0])
+            cur[1] += a * (pitch - cur[1])
+            # yaw wraps: smooth the shortest angular delta
+            dyaw = (yaw - cur[2] + 180.0) % 360.0 - 180.0
+            cur[2] += a * dyaw
+        out = np.array(head, dtype=np.float64, copy=True)
+        out[:3, :3] = safety.rpy_to_matrix(*self._head_rpy_cmd, degrees=True)
+        return out
+
+    def _tick_rate(self, tick: float) -> None:
+        self._rate_n += 1
+        if tick - self._rate_t0 >= 5.0:
+            hz = self._rate_n / (tick - self._rate_t0)
+            if hz < 0.8 * max(20, self.cfg.control_hz):
+                log.info("motion: effective control rate %.0f Hz (target %d Hz)", hz, self.cfg.control_hz)
+            else:
+                log.debug("motion: effective control rate %.0f Hz", hz)
+            self._rate_t0 = tick
+            self._rate_n = 0
 
     def _poll_doa(self, now: float) -> None:
         if not (self.cfg.enable_doa and self.bus.user_speaking.is_set()):

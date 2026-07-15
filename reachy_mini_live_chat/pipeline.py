@@ -56,6 +56,7 @@ class Pipeline:
         except Exception:
             pass
         self.motion.start()
+        self.video.start()
         self.audio.start()
         self.omni.start()
         log.info("pipeline started (omni @ %s)", self.cfg.omni_backend_url)
@@ -65,6 +66,7 @@ class Pipeline:
         self.bus.tts_audio.put(None)
         self.omni.join()
         self.audio.join()
+        self.video.stop()
         self.motion.join()
         try:
             self.mini.goto_sleep()
