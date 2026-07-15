@@ -271,11 +271,16 @@ class OmniClient:
             evt = protocol.parse_event(msg)
             self._dispatch(evt, ready)
             if evt.category == protocol.EV_CLOSED:
-                self._clean_close = True
-                if evt.reason == "timeout":
-                    log.info("omni: gateway session cap reached (timeout) — reconnecting")
+                # Only an expected close (the gateway's ~5 min session cap = "timeout", or a
+                # graceful close) is "clean" → fast reconnect. An error close (backend_error,
+                # etc.) means the server side is unhealthy; fast-reconnecting would just hammer
+                # a failing backend, so treat it as non-clean and back off (omni_reconnect_s).
+                if evt.reason in ("timeout", "closed", "session_ended", None, ""):
+                    self._clean_close = True
+                    log.info("omni: gateway session cap reached (%s) — reconnecting", evt.reason)
                 else:
-                    log.info("omni: session.closed (%s) — reconnecting", evt.reason)
+                    self._clean_close = False
+                    log.warning("omni: session.closed (%s) — backing off before reconnect", evt.reason)
                 break
 
     # -- event → sink -------------------------------------------------------
