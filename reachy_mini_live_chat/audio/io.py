@@ -82,6 +82,11 @@ class AudioEngine:
         self._mic_gain = float(getattr(cfg, "omni_mic_gain", 1.0) or 1.0)
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
+        # playback pacing (set once out_sr is known in start())
+        self._play_sub_n = SUBCHUNK
+        self._play_cushion = max(0.0, cfg.omni_playback_cushion_ms / 1000.0)
+        self._turn_start = None       # wall-clock start of the current spoken turn
+        self._turn_played = 0.0       # seconds of audio pushed this turn
         # tts_audio carries raw omni output (float32 at the model's TTS rate); we resample
         # to the device rate here on the playback thread — once, and off the WS read path.
         self._tts_sr = int(cfg.omni_out_sr or TARGET_SR)
@@ -97,6 +102,7 @@ class AudioEngine:
             self._out_sr = int(self.mini.media.get_output_audio_samplerate() or TARGET_SR)
         except Exception:
             pass
+        self._play_sub_n = max(1, int(self._out_sr * self.cfg.omni_playback_chunk_ms / 1000))
         self.mini.media.start_recording()
         self.mini.media.start_playing()
         for target in (self._capture_loop, self._playback_loop):
@@ -183,6 +189,7 @@ class AudioEngine:
                 if self.bus.robot_speaking.is_set() and time.monotonic() - idle_since > 0.25:
                     self.bus.robot_speaking.clear()
                     self.bus.emit("system", {"text": "spoke"})
+                    self._turn_start = None  # reset pacing for the next spoken turn
                 continue
             if item is None:  # end-of-turn sentinel
                 idle_since = time.monotonic()
@@ -200,13 +207,23 @@ class AudioEngine:
             log.info("e2e latency (user stop → first audio): %.0f ms", ms)
         self.bus.robot_speaking.set()
         chunk = _resample(chunk.astype(np.float32), self._tts_sr, self._out_sr)
-        for i in range(0, len(chunk), SUBCHUNK):
+        if self._turn_start is None:
+            self._turn_start = time.monotonic()
+            self._turn_played = 0.0
+        n = self._play_sub_n
+        for i in range(0, len(chunk), n):
             if self.bus.interrupt_event.is_set():
                 break
-            sub = chunk[i:i + SUBCHUNK]
+            sub = chunk[i:i + n]
             self.echo.note_playback(sub)
             try:
                 self.mini.media.push_audio_sample(sub.reshape(-1, 1))
             except Exception as e:
                 log.debug("push_audio_sample error: %s", e)
-            time.sleep(len(sub) / self._out_sr)
+            # Pace to stay ~cushion ahead of real time: push freely to build the cushion,
+            # only sleep once we're further ahead than the cushion (bounds latency). If the
+            # server falls behind, `ahead` goes negative and we never sleep (catch up).
+            self._turn_played += len(sub) / self._out_sr
+            ahead = self._turn_played - (time.monotonic() - self._turn_start)
+            if ahead > self._play_cushion:
+                time.sleep(ahead - self._play_cushion)
