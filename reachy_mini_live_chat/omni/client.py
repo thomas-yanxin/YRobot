@@ -47,6 +47,7 @@ class OmniClient:
         # is the mic reaching us (uplink rms), and what is the server sending back?
         self._stats = {"up": 0, "up_rms": 0.0, "drop": 0, "text": 0, "audio": 0, "listen": 0, "done": 0}
         self._seen_other: set = set()  # unrecognized event (type, kind) — logged once each
+        self._clean_close = False      # last session ended via a server session.closed
 
     # -- public API (called from other threads) -----------------------------
     def set_frame_source(self, fn: FrameSource) -> None:
@@ -111,6 +112,7 @@ class OmniClient:
         backoff = self.cfg.omni_reconnect_s
 
         while not self.bus.stop_event.is_set():
+            clean = False
             try:
                 log.info("omni: connecting to %s", url)
                 async with websockets.connect(
@@ -118,7 +120,7 @@ class OmniClient:
                     ping_interval=20, ping_timeout=20,
                 ) as ws:
                     self._ws = ws
-                    await self._session(ws)
+                    clean = await self._session(ws)
             except asyncio.CancelledError:  # pragma: no cover
                 break
             except Exception as e:
@@ -128,9 +130,16 @@ class OmniClient:
                 except Exception:
                     pass
             self._ws = None
+            if clean:
+                # A clean server close (e.g. the gateway's ~5 min session cap) is expected;
+                # reset turn state and reconnect right away so the gap is barely noticeable.
+                try:
+                    self.sink.on_disconnected("reconnecting")
+                except Exception:
+                    pass
             if self.bus.stop_event.is_set():
                 break
-            await asyncio.sleep(backoff)
+            await asyncio.sleep(0.1 if clean else backoff)
 
     async def _session(self, ws) -> None:
         import asyncio
@@ -144,6 +153,7 @@ class OmniClient:
         )
         await ws.send(json.dumps(init))
         self._turn_text.clear()
+        self._clean_close = False
         ready = asyncio.Event()
 
         sender = asyncio.create_task(self._sender(ws, ready))
@@ -161,6 +171,7 @@ class OmniClient:
                     await t
                 except Exception:
                     pass
+        return self._clean_close
 
     async def _stats_loop(self) -> None:
         """Every 5 s, log uplink chunk count + mean RMS and the downlink event mix."""
@@ -251,7 +262,11 @@ class OmniClient:
             evt = protocol.parse_event(msg)
             self._dispatch(evt, ready)
             if evt.category == protocol.EV_CLOSED:
-                log.info("omni: session.closed (%s)", evt.reason)
+                self._clean_close = True
+                if evt.reason == "timeout":
+                    log.info("omni: gateway session cap reached (timeout) — reconnecting")
+                else:
+                    log.info("omni: session.closed (%s) — reconnecting", evt.reason)
                 break
 
     # -- event → sink -------------------------------------------------------
