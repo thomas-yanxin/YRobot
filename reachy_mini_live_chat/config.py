@@ -82,12 +82,24 @@ class Config:
     lang: str = field(default_factory=lambda: _env("LANG", "auto"))
 
     # -- Omni conversational model (remote, over WebSocket) ------------------
-    # The llama-omni-server /backend endpoint. `/backend` is auto-appended if the
-    # URL has no path. Self-signed TLS certs are common → verification off by default.
+    # Base WS URL (scheme://host:port). The path is derived from `omni_endpoint`:
+    #   gateway  → /v1/realtime?mode=<omni_gateway_mode>   (MiniCPM-o-Demo gateway.py, e.g. :8006)
+    #   backend  → /backend                                (raw llama-omni-server, e.g. :28099)
+    # If OMNI_WS_URL already contains a path, it's used verbatim (escape hatch).
+    # Self-signed TLS certs are common → verification off by default.
     omni_ws_url: str = field(default_factory=lambda: _env("OMNI_WS_URL", "wss://10.0.16.187:8006"))
-    omni_mode: str = field(default_factory=lambda: _env("OMNI_MODE", "full_duplex"))  # full_duplex|turn_based
+    omni_endpoint: str = field(default_factory=lambda: _env("OMNI_ENDPOINT", "gateway"))  # gateway|backend
+    # Gateway routing mode (only for endpoint=gateway): video = audiovisual full-duplex,
+    # audio = audio-only full-duplex, chat = turn-based.
+    omni_gateway_mode: str = field(default_factory=lambda: _env("OMNI_GATEWAY_MODE", "video"))
+    # session.init protocol mode sent to the backend (full_duplex|turn_based).
+    omni_mode: str = field(default_factory=lambda: _env("OMNI_MODE", "full_duplex"))
     omni_use_tts: bool = field(default_factory=lambda: _flag("OMNI_USE_TTS", True))
     omni_tls_insecure: bool = field(default_factory=lambda: _flag("OMNI_TLS_INSECURE", True))
+    # How long to wait for session.created before streaming audio anyway. The gateway
+    # queues sessions and the backend lazy-loads the model on first use (10–60 s), so
+    # keep this generous.
+    omni_session_ready_s: float = field(default_factory=lambda: _float("OMNI_SESSION_READY_S", 60.0))
     omni_system_prompt: str = field(default_factory=lambda: _env("OMNI_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT))
     # Optional reference .wav (path) for voice-cloning the robot's spoken voice.
     omni_voice_ref: str = field(default_factory=lambda: _env("OMNI_VOICE_REF", ""))
@@ -144,13 +156,14 @@ class Config:
 
     @property
     def omni_backend_url(self) -> str:
-        """The WS URL with the ``/backend`` path ensured."""
+        """Resolve the WS URL to connect to (adds the right path unless one is given)."""
         url = self.omni_ws_url.rstrip("/")
-        # crude path check: everything after the host[:port]
         after_scheme = url.split("://", 1)[-1]
-        if "/" not in after_scheme:
-            return url + "/backend"
-        return url
+        if "/" in after_scheme:  # explicit path/query provided → use verbatim
+            return self.omni_ws_url
+        if self.omni_endpoint == "gateway":
+            return f"{url}/v1/realtime?mode={self.omni_gateway_mode}"
+        return f"{url}/backend"
 
     def omni_sampling_config(self) -> dict:
         """Assemble the optional session.init `config` object from set knobs only."""

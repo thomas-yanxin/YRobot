@@ -110,3 +110,15 @@ def test_parse_session_closed_and_unknown():
     assert ev.category == protocol.EV_CLOSED and ev.reason == "client_closed"
     assert protocol.parse_event({"type": "whatever"}).category == protocol.EV_OTHER
     assert protocol.parse_event("not a dict").category == protocol.EV_OTHER
+
+
+def test_parse_gateway_queued_status():
+    ev = protocol.parse_event({"type": "session.queued", "position": 2, "estimated_wait_s": 8})
+    assert ev.category == protocol.EV_STATUS and ev.status == "session.queued"
+    assert ev.raw.get("position") == 2
+
+
+def test_parse_error_event():
+    ev = protocol.parse_event({"type": "error", "error": {"code": "queue_full", "message": "Queue full"}})
+    assert ev.category == protocol.EV_ERROR and ev.reason == "queue_full"
+    assert "Queue full" in ev.message

@@ -47,6 +47,15 @@ The client speaks llama.cpp-omni's `/backend` WebSocket protocol
 - Server events: `response.output.delta` with `kind` ∈ `text` / `audio` (base64 float32 PCM) / `listen`;
   `response.done` (turn boundary); `session.closed`.
 
+**Two ways to reach it** (set `OMNI_ENDPOINT`):
+
+- `gateway` (default) — the MiniCPM-o-Demo `gateway.py` public entry (e.g. `:8006`). The client connects
+  to `/v1/realtime?mode=<video|audio|chat>`; the gateway queues the session (emits `session.queued`, model
+  cold-start 10–60 s) then passes the protocol above through to the backend unchanged. `video` = audiovisual.
+- `backend` — a raw `llama-omni-server` (e.g. `:28099`), connecting directly to `/backend`.
+
+Either way the on-the-wire `session.init`/`input.append` protocol is identical; only the URL path differs.
+
 ## Install
 
 Primary target — **on the robot's CM4** (Wireless, ARM64 Linux):
@@ -98,9 +107,12 @@ Open the web UI at <http://localhost:8042> for the live transcript, camera view,
 
 | Var | Meaning | Default |
 |-----|---------|---------|
-| `OMNI_WS_URL` | llama-omni-server endpoint (`/backend` auto-appended) | `wss://10.0.16.187:8006` |
-| `OMNI_MODE` | `full_duplex` (realtime) \| `turn_based` | `full_duplex` |
+| `OMNI_WS_URL` | base WS url (scheme://host:port); path derived from `OMNI_ENDPOINT` | `wss://10.0.16.187:8006` |
+| `OMNI_ENDPOINT` | `gateway` (MiniCPM-o-Demo `:8006`) \| `backend` (raw `llama-omni-server`) | `gateway` |
+| `OMNI_GATEWAY_MODE` | gateway only: `video` (audiovisual) \| `audio` \| `chat` | `video` |
+| `OMNI_MODE` | `session.init` protocol mode: `full_duplex` \| `turn_based` | `full_duplex` |
 | `OMNI_USE_TTS` / `OMNI_TLS_INSECURE` | model speaks / skip TLS verify (self-signed) | `1` / `1` |
+| `OMNI_SESSION_READY_S` | wait for `session.created` (gateway queue + cold start) | `60` |
 | `OMNI_SYSTEM_PROMPT` / `OMNI_VOICE_REF` | persona / voice-clone ref .wav | built-in / — |
 | `OMNI_OUT_SR` | server TTS output rate (set `16000` if voice sounds sped up) | `24000` |
 | `OMNI_CHUNK_MS` | mic audio per `input.append` | `1000` |

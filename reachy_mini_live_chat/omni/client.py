@@ -160,11 +160,13 @@ class OmniClient:
     async def _sender(self, ws, ready) -> None:
         import asyncio
 
-        # Wait for session.created (or a short grace) before streaming audio.
+        # Wait for session.created before streaming audio. The gateway queues sessions
+        # and the backend lazy-loads the model on first use (10–60 s), so wait generously.
+        ready_s = max(1.0, float(self.cfg.omni_session_ready_s))
         try:
-            await asyncio.wait_for(ready.wait(), timeout=10)
+            await asyncio.wait_for(ready.wait(), timeout=ready_s)
         except asyncio.TimeoutError:
-            log.warning("omni: no session.created within 10s; sending anyway")
+            log.warning("omni: no session.created within %.0fs; sending anyway", ready_s)
 
         only_fd = self.cfg.omni_mode == "full_duplex"
         while not self.bus.stop_event.is_set():
@@ -238,6 +240,16 @@ class OmniClient:
                 if evt.audio is not None and len(evt.audio):
                     self.sink.on_audio(evt.audio)  # turn_based TTS returns audio here
                 self.sink.on_turn_done(full)
+            elif cat == protocol.EV_STATUS:
+                # gateway control frame (e.g. session.queued) — surface, keep waiting
+                if evt.status == "session.queued":
+                    pos = evt.raw.get("position")
+                    wait = evt.raw.get("estimated_wait_s")
+                    log.info("omni: queued at the gateway (position=%s, ~%ss)", pos, wait)
+                else:
+                    log.debug("omni: status %s", evt.status)
+            elif cat == protocol.EV_ERROR:
+                log.warning("omni: server error (%s): %s", evt.reason, evt.message)
         except Exception as e:  # pragma: no cover - sink must never kill the loop
             log.debug("omni sink error on %s: %s", cat, e)
 
