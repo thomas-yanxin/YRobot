@@ -112,8 +112,12 @@ class Config:
     omni_out_sr: int = field(default_factory=lambda: _int("OMNI_OUT_SR", 24000))
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
 
-    # Video → omni: one current frame attached to each audio chunk (~1 fps).
+    # Video → omni: attach a current frame to input.append. Sending a frame every chunk
+    # makes the server run its vision encoder ~1×/s; if its GPU can't sustain vision+audio
+    # at real time, a backlog builds (laggy/choppy speech). Raise OMNI_VIDEO_EVERY_N (e.g.
+    # 3) to attach a frame only every Nth chunk — cheaper on the server, still grounded.
     omni_send_video: bool = field(default_factory=lambda: _flag("OMNI_SEND_VIDEO", True))
+    omni_video_every_n: int = field(default_factory=lambda: max(1, _int("OMNI_VIDEO_EVERY_N", 1)))
     omni_video_fps: float = field(default_factory=lambda: _float("OMNI_VIDEO_FPS", 1.0))
     omni_video_max_edge: int = field(default_factory=lambda: _int("OMNI_VIDEO_MAX_EDGE", 448))
     omni_video_jpeg_quality: int = field(default_factory=lambda: _int("OMNI_VIDEO_JPEG_QUALITY", 70))

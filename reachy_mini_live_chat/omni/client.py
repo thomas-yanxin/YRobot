@@ -169,11 +169,16 @@ class OmniClient:
             await asyncio.sleep(5.0)
             s = self._stats
             n = s["up"]
+            playq = self.bus.tts_audio.qsize()  # unplayed audio backlog (→ choppy if it grows)
             if n or s["text"] or s["audio"] or s["listen"] or s["done"]:
                 log.info(
-                    "omni 5s: uplink=%d chunks (mic rms~%.4f) | downlink text=%d audio=%d listen=%d done=%d",
-                    n, (s["up_rms"] / n if n else 0.0), s["text"], s["audio"], s["listen"], s["done"],
+                    "omni 5s: uplink=%d chunks (mic rms~%.4f) | downlink text=%d audio=%d listen=%d done=%d | playq=%d",
+                    n, (s["up_rms"] / n if n else 0.0), s["text"], s["audio"], s["listen"], s["done"], playq,
                 )
+                if playq > 25:
+                    log.warning("omni: audio backlog (playq=%d) — the server is producing "
+                                "audio faster than real time OR playback is starved; try "
+                                "OMNI_GATEWAY_MODE=audio or raise OMNI_VIDEO_EVERY_N", playq)
             for k in s:
                 s[k] = 0
 
@@ -189,6 +194,8 @@ class OmniClient:
             log.warning("omni: no session.created within %.0fs; sending anyway", ready_s)
 
         only_fd = self.cfg.omni_mode == "full_duplex"
+        every_n = max(1, int(self.cfg.omni_video_every_n))
+        sent = 0
         while not self.bus.stop_event.is_set():
             chunk = await self._next_chunk()
             if chunk is None:
@@ -196,9 +203,13 @@ class OmniClient:
             if not only_fd:
                 # turn_based has no continuous mic push path here.
                 continue
-            frame_b64 = self._frame_source() if (self._frame_source and self.cfg.omni_send_video) else None
+            # Attach a frame only every Nth chunk — sending vision every second can push
+            # the server past real time (→ backlog / choppy speech).
+            want_frame = self._frame_source and self.cfg.omni_send_video and (sent % every_n == 0)
+            frame_b64 = self._frame_source() if want_frame else None
             msg = protocol.build_input_append(chunk, frame_b64=frame_b64)
             await ws.send(json.dumps(msg))
+            sent += 1
             self._stats["up"] += 1
             if len(chunk):
                 self._stats["up_rms"] += float(np.sqrt(np.mean(np.asarray(chunk, dtype=np.float64) ** 2)))
