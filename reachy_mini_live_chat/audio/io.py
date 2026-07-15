@@ -197,9 +197,13 @@ class AudioEngine:
 
     def _on_speech_start(self) -> None:
         if self.bus.robot_speaking.is_set():
-            # Human started while the robot spoke → only a real barge-in if clearly
-            # louder than the residual echo.
-            if not self._recent_loud:
+            # Human started while the robot spoke → barge-in.
+            # Hardware-AEC path: the mic is already echo-free, so a VAD speech-onset during
+            # playback IS a real human — trust the VAD (which already gates on threshold +
+            # min_speech_ms). The old raw-energy gate was tuned to reject the robot's own
+            # echo; with the XVF3800 removing it, that gate only blocked genuine barge-ins.
+            # Software-guard path keeps the energy gate to reject residual echo.
+            if self._sw_echo_guard and not self._recent_loud:
                 return
             log.info("barge-in detected")
             self.bus.request_interrupt()
