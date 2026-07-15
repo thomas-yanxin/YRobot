@@ -14,14 +14,20 @@ def test_clamp_rpy_exceeding():
     assert r == 40 and p == -40 and y == 180
 
 
+def test_rpy_matrix_round_trip():
+    # the numpy rpy<->matrix helpers (which replaced scipy) must invert cleanly
+    for rpy in [(0, 0, 0), (10, -20, 35), (-40, 39, 179), (5, 0, -170)]:
+        m = safety.rpy_to_matrix(*rpy, degrees=True)
+        back = safety.matrix_to_rpy(m, degrees=True)
+        assert np.allclose(back, rpy, atol=1e-6)
+
+
 def test_clamp_head_pose_limits_pitch_roll():
     # request roll=70, pitch=-60 which exceed +/-40
-    from scipy.spatial.transform import Rotation as R
-
     pose = np.eye(4)
-    pose[:3, :3] = R.from_euler("xyz", [70, -60, 10], degrees=True).as_matrix()
+    pose[:3, :3] = safety.rpy_to_matrix(70, -60, 10, degrees=True)
     clamped = safety.clamp_head_pose(pose)
-    roll, pitch, yaw = R.from_matrix(clamped[:3, :3]).as_euler("xyz", degrees=True)
+    roll, pitch, yaw = safety.matrix_to_rpy(clamped[:3, :3], degrees=True)
     assert abs(roll) <= 40 + 1e-6
     assert abs(pitch) <= 40 + 1e-6
     assert abs(yaw - 10) < 1e-3
