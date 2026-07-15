@@ -1,32 +1,35 @@
-"""Full-duplex orchestrator: wires VAD/ASR/LLM/TTS/vision/motion via the Bus.
+"""Orchestrator: wires the mic, camera, remote omni brain, and motion via the Bus.
 
-Threads:
-* AudioEngine's capture + playback threads (mic <-> speaker).
-* MotionController's 100 Hz control loop.
-* **brain** — this module's worker: consumes finalized utterances, runs ASR (if needed),
-  gates vision, streams the LLM into clauses, synthesizes TTS, and drives motion moods.
-  One turn at a time; a barge-in sets ``interrupt_event`` and the brain abandons the reply
-  and picks up the next turn.
+This is deliberately thin — the omni model does ASR + reasoning + TTS end-to-end, so the
+robot side just moves bytes and bodies:
+
+* :class:`~reachy_mini_live_chat.audio.io.AudioEngine` streams 1 s mic chunks up and plays
+  the returned speech.
+* :class:`~reachy_mini_live_chat.omni.video.VideoGrabber` attaches one current frame per chunk.
+* :class:`~reachy_mini_live_chat.omni.client.OmniClient` runs the full-duplex WebSocket and
+  calls back into this object (the *sink*) with text / audio / listen / turn-done events.
+* :class:`~reachy_mini_live_chat.motion.MotionController` (unchanged) owns ``set_target`` at
+  100 Hz: DOA head-turn while the user talks, conversation-state moods, and emotion gestures
+  inferred from the transcript — every command clamped to the safe joint range.
+
+The conversation state is a blend of a **local VAD** (``user_speaking`` → LISTENING, DOA) and
+the **omni events** (text/audio → SPEAKING; listen/done → IDLE).
 """
 from __future__ import annotations
 
 import logging
-import queue
-import threading
-import time
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
-from .asr import Asr
-from .audio.io import AudioEngine
+from .audio.io import TARGET_SR, AudioEngine, _resample
 from .bus import Bus, ConvState, MotionIntent
 from .config import Config
-from .llm import LlmEngine
 from .motion import MotionController
-from .text_utils import detect_lang
-from .tts import TtsEngine
-from .vision import VisionGate
+from .motion.emotions import map_intent
+from .omni.client import OmniClient
+from .omni.video import VideoGrabber
+from .text_utils import clean_spoken, detect_lang
 
 log = logging.getLogger("live_chat.pipeline")
 
@@ -37,16 +40,14 @@ class Pipeline:
         self.cfg = cfg
         self.bus = bus or Bus()
 
-        self.asr = Asr(cfg)
-        self.llm = LlmEngine(cfg)
-        self.tts = TtsEngine(cfg)
-        self.vision = VisionGate(cfg, mini)
         self.motion = MotionController(mini, cfg, bus=self.bus)
-        self.audio = AudioEngine(mini, cfg, self.bus, on_utterance_pcm=self._on_utterance)
+        self.video = VideoGrabber(cfg, mini)
+        self.omni = OmniClient(cfg, self.bus, sink=self)
+        self.omni.set_frame_source(self.video.latest_b64)
+        self.audio = AudioEngine(mini, cfg, self.bus, on_audio_chunk=self.omni.submit_audio_chunk)
 
-        # ('audio', pcm, t_end) or ('text', text, t_end)
-        self._turns: "queue.Queue[Tuple[str, object, float]]" = queue.Queue()
-        self._brain: Optional[threading.Thread] = None
+        self._speaking = False          # is the robot mid-turn (speaking)?
+        self._turn_text = ""            # transcript of the current spoken turn
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -56,140 +57,91 @@ class Pipeline:
             pass
         self.motion.start()
         self.audio.start()
-        self._brain = threading.Thread(target=self._brain_loop, name="brain", daemon=True)
-        self._brain.start()
-        self._greet()
-        log.info("pipeline started")
+        self.omni.start()
+        log.info("pipeline started (omni @ %s)", self.cfg.omni_backend_url)
 
     def shutdown(self) -> None:
         self.bus.stop_event.set()
         self.bus.tts_audio.put(None)
+        self.omni.join()
         self.audio.join()
         self.motion.join()
-        if self._brain:
-            self._brain.join(timeout=1.0)
         try:
             self.mini.goto_sleep()
         except Exception:
             pass
 
-    # -- inputs -------------------------------------------------------------
-    def _on_utterance(self, pcm: np.ndarray, t_end: float) -> None:
-        self._turns.put(("audio", pcm, t_end))
-
+    # -- web UI: type-to-talk is voice-driven in full-duplex omni -----------
     def inject_text(self, text: str) -> None:
-        """Feed a typed message as if it were a spoken turn (web UI / stub demo)."""
-        if text and text.strip():
-            self._turns.put(("text", text.strip(), time.monotonic()))
+        """Full-duplex omni is a live voice channel — there's no text-turn injection.
 
-    # -- brain --------------------------------------------------------------
-    def _brain_loop(self) -> None:
-        while not self.bus.stop_event.is_set():
-            try:
-                kind, payload, t_end = self._turns.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            try:
-                self._handle_turn(kind, payload, t_end)
-            except Exception as e:
-                log.exception("turn failed: %s", e)
-                self.bus.set_state(ConvState.IDLE)
-
-    def _handle_turn(self, kind: str, payload, t_end: float) -> None:
-        self.bus.clear_interrupt()
-        self.bus.next_turn()
-        self.bus.set_state(ConvState.THINKING)
-
-        # 1) transcribe
-        if kind == "audio":
-            text, lang = self.asr.transcribe(payload)
-        else:
-            text = str(payload)
-            lang = self.cfg.lang if self.cfg.lang != "auto" else detect_lang(text)
+        We surface the typed text in the transcript so the UI stays useful, but the robot
+        replies to *spoken* input only.
+        """
         text = (text or "").strip()
         if not text:
-            self.bus.set_state(ConvState.IDLE)
             return
-        self.bus.emit("user", {"text": text, "lang": lang})
-        log.info("user(%s): %s", lang, text)
+        self.bus.emit("system", {"text": "文本输入在全双工语音模式下不发送给模型（请直接说话）。"})
+        self.bus.emit("user", {"text": text, "lang": detect_lang(text)})
 
-        # 2) latency clock starts now (end of user speech)
-        self.bus.pending_t_end = t_end
-        self.bus.pending_measured = False
+    # ======================================================================
+    # OmniClient sink — called from the omni asyncio thread
+    # ======================================================================
+    def on_connected(self) -> None:
+        self.bus.emit("system", {"text": "omni connected"})
+        # a small welcoming gesture (no spoken greeting: TTS is the model's job)
+        self._enqueue_emotion("welcoming1")
 
-        # 3) vision (token-gated)
-        keyframe = self.vision.maybe_keyframe(text)
+    def on_disconnected(self, reason: str) -> None:
+        self.bus.emit("system", {"text": f"omni disconnected: {reason}"})
+        self._end_turn(reset_state=True)
 
-        # 4) stream reply -> clauses -> TTS; drive motion
-        def stop_check() -> bool:
-            return self.bus.interrupt_event.is_set() or self.bus.stop_event.is_set()
+    def on_text(self, text: str) -> None:
+        self._begin_speaking()
+        shown = clean_spoken(text)
+        if shown:
+            self._turn_text += text
+            self.bus.emit("assistant", {"text": shown, "lang": detect_lang(self._turn_text)})
 
-        emitted_emotion = False
-        first_clause = True
-        full_text = ""
-        for evt in self.llm.respond(text, lang, keyframe_b64=keyframe, stop_check=stop_check):
-            if stop_check():
-                break
-            if evt["type"] == "emotion":
-                self._enqueue_emotion(evt["name"])
-                emitted_emotion = True
-            elif evt["type"] == "clause":
-                if first_clause:
-                    self.bus.set_state(ConvState.SPEAKING)
-                    self.bus.motion_intents.put(MotionIntent(kind="mood", mood="speaking"))
-                    if not emitted_emotion:
-                        # no explicit tag from the model -> infer from content/language
-                        from .motion.emotions import map_intent
+    def on_audio(self, pcm: np.ndarray) -> None:
+        self._begin_speaking()
+        pcm16k = _resample(np.asarray(pcm, dtype=np.float32), self.cfg.omni_out_sr, TARGET_SR)
+        if len(pcm16k):
+            self.bus.tts_audio.put(pcm16k)
 
-                        inferred = map_intent(full_text or text, lang)
-                        if inferred:
-                            self._enqueue_emotion(inferred)
-                    first_clause = False
-                self.bus.emit("assistant", {"text": evt["text"], "lang": lang})
-                self._speak_clause(evt["text"], lang, stop_check)
-            elif evt["type"] == "final":
-                full_text = evt["text"]
+    def on_listen(self) -> None:
+        # Model chose to listen this step: end any current spoken turn.
+        if self._speaking:
+            self._end_turn()
 
-        # 5) end of answer
-        self.bus.tts_audio.put(None)  # sentinel
-        if not stop_check():
-            self._wait_until_quiet()
-            self.bus.set_state(ConvState.IDLE)
+    def on_turn_done(self, full_text: str) -> None:
+        # Match a body gesture to what was just said (bilingual keyword cues).
+        text = (full_text or self._turn_text).strip()
+        if text:
+            emo = map_intent(text, detect_lang(text))
+            if emo:
+                self._enqueue_emotion(emo)
+        self._end_turn()
 
-    def _speak_clause(self, clause: str, lang: str, stop_check) -> None:
-        for chunk in self.tts.synthesize(clause, lang, stop_check=stop_check):
-            if stop_check():
-                return
-            self.bus.tts_audio.put(chunk)
+    # -- state helpers ------------------------------------------------------
+    def _begin_speaking(self) -> None:
+        if not self._speaking:
+            self._speaking = True
+            self._turn_text = ""
+            self.bus.set_state(ConvState.SPEAKING)
+
+    def _end_turn(self, reset_state: bool = False) -> None:
+        was_speaking = self._speaking
+        self._speaking = False
+        self._turn_text = ""
+        if was_speaking:
+            self.bus.tts_audio.put(None)  # flush sentinel → playback marks end-of-turn
+        # Return to LISTENING if the human is mid-sentence, else IDLE.
+        if reset_state or self.bus.state in (ConvState.SPEAKING, ConvState.INTERRUPTED):
+            self.bus.set_state(
+                ConvState.LISTENING if self.bus.user_speaking.is_set() else ConvState.IDLE
+            )
 
     def _enqueue_emotion(self, name: str) -> None:
         if self.cfg.enable_motion:
             self.bus.motion_intents.put(MotionIntent(kind="emotion", emotion=name))
-
-    def _wait_until_quiet(self, timeout: float = 15.0) -> None:
-        t0 = time.monotonic()
-        # give playback a moment to start, then wait for it to finish
-        time.sleep(0.1)
-        while self.bus.robot_speaking.is_set() and not self.bus.interrupt_event.is_set():
-            if time.monotonic() - t0 > timeout:
-                break
-            time.sleep(0.05)
-
-    # -- greeting -----------------------------------------------------------
-    def _greet(self) -> None:
-        lang = "en" if self.cfg.lang == "en" else "zh"
-        text = "你好！我在听，随时可以聊。" if lang == "zh" else "Hi! I'm listening — talk to me anytime."
-        self.bus.emit("assistant", {"text": text, "lang": lang})
-        self._enqueue_emotion("welcoming1")
-        self.bus.set_state(ConvState.SPEAKING)
-
-        def _run():
-            for chunk in self.tts.synthesize(text, lang):
-                if self.bus.stop_event.is_set():
-                    return
-                self.bus.tts_audio.put(chunk)
-            self.bus.tts_audio.put(None)
-            self._wait_until_quiet()
-            self.bus.set_state(ConvState.IDLE)
-
-        threading.Thread(target=_run, name="greet", daemon=True).start()

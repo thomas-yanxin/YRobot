@@ -1,5 +1,5 @@
 ---
-title: Reachy Mini Live Chat
+title: Reachy Mini Realtime Dialogue
 emoji: 🤖
 colorFrom: indigo
 colorTo: pink
@@ -9,95 +9,111 @@ tags:
   - reachy_mini_python_app
 ---
 
-# Reachy Mini — Live Video Chat 🤖🎙️
+# Reachy Mini — Realtime Full-Duplex Audio-Visual Dialogue 🤖🎙️👁️
 
-A **full-duplex, low-latency, bilingual (中文 / English)** voice + video conversational app for
-[Reachy Mini](https://github.com/pollen-robotics/reachy_mini). It runs the classic
-`VAD → ASR → LLM → TTS` pipeline **locally on Apple Silicon** (MLX), reacts with Reachy's
-expressive motions, turns its head toward whoever is speaking via **DOA**, and keeps vision-token
-usage tiny by only sending a camera frame to a vision model when it actually matters.
+A **full-duplex, bilingual (中文 / English)** voice + video conversational app for
+[Reachy Mini](https://github.com/pollen-robotics/reachy_mini). The brain is a **remote
+end-to-end omni model** — **MiniCPM-o 4.5** served by
+[`llama.cpp-omni`](https://github.com/tc-mb/llama.cpp-omni)'s `llama-omni-server` — reached
+over a **full-duplex WebSocket**. The robot side (Wireless **CM4**) just streams 1-second mic
+chunks + a camera frame up, plays the returned speech, turns its head toward whoever is speaking
+via **DOA**, and reacts with expressive, **safety-clamped** motion.
 
-> Design & rationale: see [`plan.md`](plan.md).
+Because ASR + reasoning + TTS all happen on the omni server, the on-robot workload is tiny — no
+local ML models. Design & rationale: see [`plan.md`](plan.md).
 
 ## Highlights
 
-- **Full duplex** — streaming input, automatic endpointing, real-time reply, and **barge-in**
-  (talk over the robot and it stops and listens).
-- **≤ 1.5 s** end-to-end latency (last word → first audio). Typical critical path ≈ 0.5–1.1 s.
-- **Local on Mac** — Silero VAD · FunASR *SenseVoice* · **MiniCPM-V-4.6 VLM via llama.cpp** · Kokoro
-  TTS (`mlx-audio`). The VLM (SigLIP2-400M + Qwen3.5-0.8B) handles **both text and vision locally**.
-- **Expressive & context-aware motion** — nods on agreement, tilts on questions, plays emotions
-  from `pollen-robotics/reachy-mini-emotions-library`, all **clamped to the safe joint range**.
-- **DOA** — the head orients toward the speaker's direction.
-- **Efficient vision** — a camera frame is attached only on a visual question or a real scene change;
-  it is downscaled, JPEG-compressed, and only **one keyframe** is kept in context. Since the VLM is
-  local, this saves compute/latency (the image encoder is the costly path), not cloud tokens.
-- **Runs without a robot** — `--sim` uses a mock backend so you can develop the whole pipeline.
+- **End-to-end omni, full duplex** — the model itself decides *listen* vs *speak* at ~1 Hz;
+  audio plays incrementally as it streams back. Talk over the robot and it can barge-in.
+- **DOA** — while you speak, the head (and body, past ±45°) turns toward your direction, using the
+  robot's mic-array `get_DoA()`, EMA-smoothed and clamped.
+- **Expressive, safe motion** — conversation-state moods (idle / listening / speaking) plus emotion
+  gestures inferred from the model's transcript (nod on "好的/yes", tilt on questions, …). **Every**
+  command is clamped to the documented joint range in `motion/safety.py`.
+- **Continuous vision** — one downscaled JPEG frame is attached to each audio chunk (~1 fps), so the
+  model always has current visual context.
+- **Runs without hardware or a server** — `--sim --stub` drives the *real* WebSocket client against a
+  built-in fake omni server, using the Mac's mic/speaker/webcam when available.
 
-## Install (Apple Silicon, Python 3.12)
+## Protocol (verified against the source)
+
+The client speaks llama.cpp-omni's `/backend` WebSocket protocol
+(`tools/server/ws_handler.cpp` + `protocol.cpp`):
+
+- `session.init` `{payload:{mode:"full_duplex", use_tts, system_prompt, voice, config}}` → `session.created`.
+- Full-duplex `input.append` carries base64 **float32-LE PCM, mono, 16 kHz** (~1 s) as `audio`, plus an
+  optional `video_frames:[<b64 jpeg>]` (only the first frame is used). It must **not** carry `messages`.
+- Server events: `response.output.delta` with `kind` ∈ `text` / `audio` (base64 float32 PCM) / `listen`;
+  `response.done` (turn boundary); `session.closed`.
+
+## Install
+
+Primary target — **on the robot's CM4** (Wireless, ARM64 Linux):
 
 ```bash
-./scripts/setup_mac.sh            # 3.12 venv + Python deps + llama.cpp + MiniCPM-V-4.6 weights
-# or manually:
+./scripts/setup_cm4.sh            # 3.12 venv + light stack (no local ML models)
+# then edit .env → set OMNI_WS_URL=wss://<your-omni-server>:8006
+```
+
+Dev on a laptop (bridged to the robot, or `--sim`):
+
+```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate
-uv pip install -e ".[mac,dev]"
-brew install llama.cpp            # serves the MiniCPM-V-4.6 VLM (weights auto-download on first run)
-cp .env.example .env              # then edit model paths if needed
+uv pip install -e ".[laptop,dev]"   # or ".[dev]" for sim/stub only
+cp .env.example .env
 ```
 
 ## Run
 
 ```bash
-# 1) hardware-free development (mock robot, stub engines):
+# 1) hardware-free dev — real WS client against a built-in fake omni server:
 reachy-mini-live-chat --sim --stub
 
-# 2) real pipeline, mock robot. First start the MiniCPM-V-4.6 server (first run
-#    auto-downloads the model + vision projector, ~2-3 GB, from Hugging Face):
-llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --reasoning off --host 0.0.0.0 --port 8080 -c 4096 &
-# --reasoning off is important: MiniCPM-V-4.6 is a thinking model; leaving it on adds a
-# long reasoning trace before the answer and blows the latency budget. Vision works either way.
-# If Hugging Face is slow/blocked, prefix with a mirror:
-#   HF_ENDPOINT=https://hf-mirror.com llama-server -hf openbmb/MiniCPM-V-4.6-gguf:Q4_K_M --reasoning off --port 8080 -c 4096 &
+# 2) sim robot against your REAL omni server (set OMNI_WS_URL in .env first):
 reachy-mini-live-chat --sim
-# Note: the app's first non-sim/stub run also downloads the SenseVoice ASR model
-# (~900 MB) once — let it finish; it's cached afterwards.
 
-# 3) on the robot: start the daemon, then launch the app
-reachy-mini-daemon                       # Lite (USB)
-reachy-mini-live-chat                     # connects to the daemon, opens web UI on :8042
+# 3) on the robot (daemon running on the CM4):
+reachy-mini-live-chat                # connects to the daemon, opens web UI on :8042
+#    or let the Reachy Mini app launcher discover it (entry point: reachy_mini_apps).
 ```
 
-Open the web UI at <http://localhost:8042> for the live transcript, camera view, and settings.
+Open the web UI at <http://localhost:8042> for the live transcript, camera view, and state.
 
 ## Configuration (`.env`)
 
 | Var | Meaning | Default |
 |-----|---------|---------|
-| `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | MiniCPM-V-4.6 VLM served by llama.cpp (OpenAI-compatible) | `http://localhost:8080/v1` · `openbmb/MiniCPM-V-4.6-gguf` |
-| `VISION_BASE_URL` / `VISION_MODEL` / `VISION_API_KEY` | vision turns (defaults to the same local VLM; can point to a cloud VLM) | same local server |
-| `ASR_MODEL` | FunASR model id | `iic/SenseVoiceSmall` |
-| `TTS_VOICE_ZH` / `TTS_VOICE_EN` | Kokoro voices | `zf_xiaobei` · `af_heart` |
-| `VAD_SILENCE_MS` | silence to end a turn | `320` |
+| `OMNI_WS_URL` | llama-omni-server endpoint (`/backend` auto-appended) | `wss://10.0.16.187:8006` |
+| `OMNI_MODE` | `full_duplex` (realtime) \| `turn_based` | `full_duplex` |
+| `OMNI_USE_TTS` / `OMNI_TLS_INSECURE` | model speaks / skip TLS verify (self-signed) | `1` / `1` |
+| `OMNI_SYSTEM_PROMPT` / `OMNI_VOICE_REF` | persona / voice-clone ref .wav | built-in / — |
+| `OMNI_OUT_SR` | server TTS output rate (set `16000` if voice sounds sped up) | `24000` |
+| `OMNI_CHUNK_MS` | mic audio per `input.append` | `1000` |
+| `OMNI_SEND_VIDEO` / `OMNI_VIDEO_*` | attach a frame per chunk; size/quality | `1` / 448px q70 |
+| `VAD_SILENCE_MS` | silence marking end of human speech (DOA/barge-in) | `320` |
+| `ENABLE_MOTION` / `ENABLE_DOA` / `ENABLE_AEC` | feature toggles | `1` / `1` / `0` |
 | `LANG` | `auto` \| `zh` \| `en` | `auto` |
-| `ENABLE_VISION` / `ENABLE_MOTION` / `ENABLE_AEC` | feature toggles | `1` / `1` / `0` |
 
 ## Architecture
 
-`VAD → ASR → LLM → TTS` stages run as concurrent threads coordinated by a conversation state machine
-(`IDLE → LISTENING → THINKING → SPEAKING`). A single 100 Hz control-loop thread owns `set_target`
-(per the SDK control-loop guidance); every other thread only enqueues motion *intents*. See
-[`plan.md`](plan.md) for the diagram, latency budget, and safety table.
+The mic feeds a lightweight local VAD (only to set `user_speaking` → DOA + listen mood + barge-in)
+and a continuous 1-second chunker. `OmniClient` runs the full-duplex WebSocket on its own asyncio
+thread: a sender streams `{audio, frame}` up; a receiver dispatches `text`/`audio`/`listen`/`done`
+events. A single 100 Hz control-loop thread owns `set_target` (per the SDK guidance); every other
+thread only enqueues motion *intents*. See [`plan.md`](plan.md) for the diagram and safety table.
 
 ## Safety
 
 Every motion command is clamped to Reachy Mini's documented limits (head pitch/roll ±40°, head yaw
 ±180°, body yaw ±160°, head−body yaw delta ≤65°) in `motion/safety.py` — defense-in-depth on top of
-the SDK's own clamping. The app never commands beyond that range.
+the SDK's own clamping. On barge-in/shutdown the robot returns to a safe rest pose. The app never
+commands beyond that range.
 
 ## Tests
 
 ```bash
-pytest            # pure-logic tests: safety clamp, emotion mapping, DOA math, vision gating, clause split
+pytest            # omni protocol codec, video encode, safety clamp, emotion mapping, DOA math, wiring smoke
 ```
 
 ## License

@@ -4,51 +4,53 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reachy-mini-live-chat"
-version = "0.1.0"
-description = "Full-duplex, low-latency bilingual (zh/en) voice+video conversation app for Reachy Mini, running VAD-ASR-LLM-TTS locally on Apple Silicon with expressive motion and DOA."
+version = "0.2.0"
+description = "Realtime full-duplex audio-visual dialogue for Reachy Mini: streams mic+camera to a remote MiniCPM-o 4.5 omni model (llama.cpp-omni) over WebSocket, with DOA head-tracking and safety-clamped expressive motion."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Reachy Mini Live Chat" }]
-keywords = ["reachy_mini", "robotics", "voice-assistant", "full-duplex", "mlx", "asr", "tts"]
+keywords = ["reachy_mini", "robotics", "voice-assistant", "full-duplex", "omni", "minicpm-o", "websocket"]
 
-# Only the always-needed, light deps live here. Heavy ML runtimes are optional
-# extras (below) and are lazy-imported so the package imports without them.
+# The brain is remote (over WebSocket), so the always-needed deps are tiny: numpy for
+# audio/PCM, websockets for the omni link, dotenv for config. Everything else (robot SDK,
+# VAD, camera, web UI, AEC) is an optional extra and lazy-imported.
 dependencies = [
-    # numpy is capped <2.3 on purpose: the audio stack pulls librosa -> numba, and no
-    # numba release supports numpy >=2.3 yet. Without the cap the resolver falls back to
-    # the ancient numba 0.51/llvmlite 0.34 (no Apple-Silicon wheel -> source build fails).
-    # reachy-mini itself requires numpy>=2.2.5, so 2.2.x satisfies everything.
-    "numpy>=2.2.5,<2.3",
+    "numpy>=1.24",
     "scipy>=1.10",
     "python-dotenv>=1.0",
-    "openai>=1.30",           # OpenAI-compatible client (local mlx-lm server + cloud VLM)
+    "websockets>=12",
 ]
 
 [project.optional-dependencies]
-# The robot SDK (installed on the machine wired to the robot / for --sim).
+# The robot SDK — installed on the machine wired to the robot (or on the CM4 image) / for --sim.
 robot = ["reachy-mini"]
 
-# Local Apple-Silicon inference stack.
+# Local VAD (drives DOA / listen mood / barge-in) + sim audio I/O on a laptop.
 audio = ["silero-vad", "sounddevice", "soundfile"]
-asr = ["funasr", "modelscope"]
-# The conversational VLM (MiniCPM-V-4.6) runs on the llama.cpp `llama-server` binary,
-# which is NOT a pip package — install it with `brew install llama.cpp` (see scripts/
-# setup_mac.sh). `huggingface-hub` is only needed to fetch the GGUF + mmproj weights.
-llm = ["huggingface-hub"]
-tts = ["mlx-audio", "misaki[zh]"]
-vision = ["opencv-python", "imagehash", "pillow"]
-turn = ["onnxruntime"]           # optional semantic turn detector
-aec = ["webrtc-audio-processing"]  # optional acoustic echo cancellation for true barge-in
+# Camera frame downscale + JPEG encode (on-robot frames come from the SDK; PIL/cv2 encode them).
+vision = ["opencv-python", "pillow"]
+# Web control/monitor UI (transcript, video preview, state) — used by the standalone dev runner.
+web = ["fastapi", "uvicorn"]
+# Optional true acoustic echo cancellation (else a duck-and-gate fallback is used).
+aec = ["webrtc-audio-processing"]
 
-# Everything for a real on-Mac run (except the llama.cpp binary — see setup_mac.sh).
-mac = [
+# On-robot (Wireless CM4, ARM64 Linux). Minimal: no local ML — the omni server does it all.
+# `reachy-mini` is normally already present in the robot image.
+cm4 = [
+    "reachy-mini",
+    "silero-vad",
+    "opencv-python-headless",
+    "pillow",
+    "fastapi", "uvicorn",
+]
+
+# Everything for a full run on a dev laptop bridging to the robot.
+laptop = [
     "reachy-mini",
     "silero-vad", "sounddevice", "soundfile",
-    "funasr", "modelscope",
-    "huggingface-hub",
-    "mlx-audio", "misaki[zh]",
-    "opencv-python", "imagehash", "pillow",
+    "opencv-python", "pillow",
+    "fastapi", "uvicorn",
 ]
 
 dev = ["pytest>=7", "ruff", "numpy>=1.24", "pillow"]

@@ -46,7 +46,7 @@ def _setup_logging() -> None:
 
 
 class LiveChatApp(ReachyMiniApp):
-    """Reachy Mini full-duplex live video chat."""
+    """Reachy Mini realtime full-duplex audio-visual dialogue (remote omni brain)."""
 
     def __init__(self, running_on_wireless: bool = False) -> None:
         super().__init__(running_on_wireless)
@@ -94,6 +94,22 @@ def _make_mini(cfg: Config):
         raise SystemExit("reachy_mini SDK not installed; use --sim for hardware-free dev.")
     log.info("connecting to Reachy Mini daemon...")
     return ReachyMini()
+
+
+def _maybe_start_fake_omni(cfg: Config):
+    """In --stub mode, run a local fake omni server and point the client at it.
+
+    Returns a stop callable (or None). Lets the *real* OmniClient path run end-to-end
+    with no GPU server.
+    """
+    if not cfg.stub:
+        return None
+    from .omni.fake_server import serve_in_thread
+
+    _thread, stop, port = serve_in_thread(out_sr=cfg.omni_out_sr)
+    cfg.omni_ws_url = f"ws://127.0.0.1:{port}/backend"
+    log.info("stub: fake omni server on %s", cfg.omni_ws_url)
+    return stop
 
 
 def _serve_web(pipeline, cfg: Config):
@@ -145,6 +161,7 @@ def cli(argv=None) -> None:
 
     from .pipeline import Pipeline
 
+    stop_fake = _maybe_start_fake_omni(cfg)
     mini = _make_mini(cfg)
     with mini:
         pipeline = Pipeline(mini, cfg)
@@ -161,6 +178,8 @@ def cli(argv=None) -> None:
         finally:
             log.info("shutting down...")
             pipeline.shutdown()
+            if stop_fake:
+                stop_fake()
 
 
 if __name__ == "__main__":

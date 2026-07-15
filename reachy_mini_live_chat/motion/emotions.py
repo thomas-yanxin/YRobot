@@ -1,9 +1,9 @@
 """Emotion library wrapper + bilingual intent→move mapping.
 
-Two ways a move gets chosen:
-1. The LLM emits an ``<emo>NAME</emo>`` tag (primary; content-matched, either language).
-2. Fallback heuristic: if no tag, :func:`map_intent` picks a move from bilingual keyword
-   cues in the *spoken text* (zh + en), so behavior still matches the language/content.
+The omni model speaks end-to-end, so we can't ask it for an inline motion tag (that tag
+would be read aloud). Instead :func:`map_intent` picks a move from bilingual keyword cues
+in the model's *transcript* (zh + en), so the robot's body language still matches what it
+just said, in either language.
 
 Moves come from ``pollen-robotics/reachy-mini-emotions-library`` (authored within the safe
 range). If the library can't load (offline / stub), the controller falls back to a small
@@ -15,9 +15,15 @@ import logging
 from typing import Optional
 
 from ..config import Config
-from ..llm.prompts import ALLOWED_EMOTIONS
 
 log = logging.getLogger("live_chat.emotions")
+
+# Curated subset of the emotions library that maps cleanly to conversational moods.
+ALLOWED_EMOTIONS = [
+    "yes1", "no1", "curious1", "cheerful1", "laughing1", "surprised1", "sad1",
+    "thoughtful1", "welcoming1", "proud1", "confused1", "attentive1", "grateful1",
+    "loving1", "enthusiastic1", "calming1", "relief1", "uncertain1",
+]
 
 # Bilingual cue -> emotion move. Order matters (first match wins).
 _INTENT_RULES = [
