@@ -110,6 +110,10 @@ class Config:
     # played voice sounds pitched/sped.
     omni_chunk_ms: int = field(default_factory=lambda: _int("OMNI_CHUNK_MS", 1000))
     omni_out_sr: int = field(default_factory=lambda: _int("OMNI_OUT_SR", 24000))
+    # Uplink mic gain. The robot's mic can be quiet (rms ~0.02 while speaking); the omni
+    # model then rarely decides to speak. Boost it (e.g. 3–5) so speech is clearly audible
+    # to the model. Applied with hard clipping to [-1, 1]. 1.0 = no change.
+    omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
 
     # Video → omni: attach a current frame to input.append. Sending a frame every chunk

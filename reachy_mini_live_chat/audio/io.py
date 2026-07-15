@@ -79,6 +79,7 @@ class AudioEngine:
             on_utterance=self._on_speech_end,
         )
 
+        self._mic_gain = float(getattr(cfg, "omni_mic_gain", 1.0) or 1.0)
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # tts_audio carries raw omni output (float32 at the model's TTS rate); we resample
@@ -129,6 +130,8 @@ class AudioEngine:
                 # barge-in energy check on the *raw* mic (before ducking)
                 self._recent_loud = self.echo.is_barge_in(mono, robot_speaking)
                 clean = self.echo.process_capture(mono, robot_speaking)
+                if self._mic_gain != 1.0:
+                    clean = np.clip(clean * self._mic_gain, -1.0, 1.0)
                 # (a) local VAD only sets user_speaking → DOA / mood / barge-in
                 self.endpointer.process(clean)
                 # (b) continuous 1 s chunks → the omni uplink
