@@ -6,7 +6,9 @@ matches the model's 1 Hz time-division design. Frames are downscaled to
 throttled to ``omni_video_fps`` and the last encoding is cached, so calling
 :meth:`latest_b64` faster than the fps just re-uses the cached frame.
 
-Encoding degrades gracefully: cv2 → PIL → (resize) numpy.
+Encoding degrades gracefully: cv2/PIL downscaled JPEG → the SDK's own
+``media.get_frame_jpeg()`` (full-res, zero extra deps). So a minimal on-robot
+install needs no image library at all — pillow/opencv only buy smaller frames.
 """
 from __future__ import annotations
 
@@ -37,13 +39,17 @@ class VideoGrabber:
         now = time.monotonic()
         if self._last_b64 is not None and now - self._last_t < self._min_dt:
             return self._last_b64
+        jpeg = None
         frame = self._grab()
-        if frame is None:
-            return self._last_b64  # keep the last good frame rather than dropping video
-        small = _resize_max_edge(frame, self.cfg.omni_video_max_edge)
-        jpeg = _encode_jpeg(small, self.cfg.omni_video_jpeg_quality)
+        if frame is not None:
+            small = _resize_max_edge(frame, self.cfg.omni_video_max_edge)
+            jpeg = _encode_jpeg(small, self.cfg.omni_video_jpeg_quality)
         if jpeg is None:
-            return self._last_b64
+            # No frame array or no encoder (pillow/opencv absent) → let the SDK
+            # hand us a ready-made JPEG. Full resolution, but zero extra deps.
+            jpeg = self._grab_jpeg()
+        if jpeg is None:
+            return self._last_b64  # keep the last good frame rather than dropping video
         self._last_b64 = base64.b64encode(jpeg).decode("ascii")
         self._last_t = now
         return self._last_b64
@@ -53,6 +59,16 @@ class VideoGrabber:
             return self.mini.media.get_frame()
         except Exception as e:
             log.debug("get_frame error: %s", e)
+            return None
+
+    def _grab_jpeg(self) -> Optional[bytes]:
+        get = getattr(self.mini.media, "get_frame_jpeg", None)
+        if get is None:
+            return None
+        try:
+            return get()
+        except Exception as e:
+            log.debug("get_frame_jpeg error: %s", e)
             return None
 
 

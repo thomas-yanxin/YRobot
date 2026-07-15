@@ -31,6 +31,32 @@ def _clip(v: float, lim: float) -> float:
     return float(max(-lim, min(lim, v)))
 
 
+# --- rpy <-> matrix (extrinsic "xyz": R = Rz(yaw) @ Ry(pitch) @ Rx(roll)) -----
+# Matches scipy Rotation.from_euler("xyz")/as_euler("xyz") for our clamped range
+# (|pitch| <= 40°, so no gimbal lock), letting us drop the scipy dependency: an
+# on-robot client that offloads all inference shouldn't pull in scipy just for this.
+def rpy_to_matrix(roll: float, pitch: float, yaw: float, degrees: bool = True) -> np.ndarray:
+    if degrees:
+        roll, pitch, yaw = roll * _D2R, pitch * _D2R, yaw * _D2R
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]], dtype=np.float64)
+    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]], dtype=np.float64)
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float64)
+    return rz @ ry @ rx
+
+
+def matrix_to_rpy(m: np.ndarray, degrees: bool = True) -> Tuple[float, float, float]:
+    m = np.asarray(m, dtype=np.float64)
+    pitch = np.arctan2(-m[2, 0], np.hypot(m[0, 0], m[1, 0]))
+    roll = np.arctan2(m[2, 1], m[2, 2])
+    yaw = np.arctan2(m[1, 0], m[0, 0])
+    if degrees:
+        return (float(roll * _R2D), float(pitch * _R2D), float(yaw * _R2D))
+    return (float(roll), float(pitch), float(yaw))
+
+
 def clamp_rpy_deg(roll: float, pitch: float, yaw: float) -> Tuple[float, float, float]:
     return (
         _clip(roll, HEAD_PITCH_ROLL_DEG),
@@ -41,19 +67,15 @@ def clamp_rpy_deg(roll: float, pitch: float, yaw: float) -> Tuple[float, float, 
 
 def clamp_head_pose(pose: np.ndarray) -> np.ndarray:
     """Clamp the rotation of a 4x4 head pose (translation preserved)."""
-    from scipy.spatial.transform import Rotation as R
-
     pose = np.array(pose, dtype=np.float64, copy=True)
-    roll, pitch, yaw = R.from_matrix(pose[:3, :3]).as_euler("xyz", degrees=True)
+    roll, pitch, yaw = matrix_to_rpy(pose[:3, :3], degrees=True)
     roll, pitch, yaw = clamp_rpy_deg(roll, pitch, yaw)
-    pose[:3, :3] = R.from_euler("xyz", [roll, pitch, yaw], degrees=True).as_matrix()
+    pose[:3, :3] = rpy_to_matrix(roll, pitch, yaw, degrees=True)
     return pose
 
 
 def head_yaw_deg(pose: np.ndarray) -> float:
-    from scipy.spatial.transform import Rotation as R
-
-    return float(R.from_matrix(np.asarray(pose)[:3, :3]).as_euler("xyz", degrees=True)[2])
+    return matrix_to_rpy(np.asarray(pose)[:3, :3], degrees=True)[2]
 
 
 def clamp_body_yaw(body_yaw_rad: float, head_yaw_rad: float = 0.0) -> float:

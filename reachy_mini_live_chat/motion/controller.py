@@ -32,10 +32,8 @@ log = logging.getLogger("live_chat.motion")
 
 def _head_pose(roll: float, pitch: float, yaw: float, z: float = 0.0) -> np.ndarray:
     """Build a 4x4 head pose from rpy degrees (matches reachy create_head_pose xyz order)."""
-    from scipy.spatial.transform import Rotation as R
-
     pose = np.eye(4, dtype=np.float64)
-    pose[:3, :3] = R.from_euler("xyz", [roll, pitch, yaw], degrees=True).as_matrix()
+    pose[:3, :3] = safety.rpy_to_matrix(roll, pitch, yaw, degrees=True)
     pose[2, 3] = z
     return pose
 

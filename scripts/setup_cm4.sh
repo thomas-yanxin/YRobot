@@ -2,8 +2,9 @@
 # ---------------------------------------------------------------------------
 # Reachy Mini — on-robot (Wireless CM4) setup.
 # The conversational brain is REMOTE (MiniCPM-o 4.5 on llama-omni-server), so the
-# robot side is light: no local ML models. This installs the app + a lightweight
-# stack (VAD, camera encode, web UI) into a Python 3.12 venv.
+# robot side is a thin client: the only hard deps are numpy + websockets. No torch,
+# no CUDA, no local ML. This installs the app into a Python 3.12 venv. Optional
+# extras (web UI, neural VAD, pillow) can be added later — each has a fallback.
 #
 # Run this ON the robot's CM4 (ARM64 Linux). `reachy-mini` is usually already present
 # in the robot image; if so the `.[cm4]` reinstall is a no-op for it.

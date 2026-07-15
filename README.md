@@ -52,9 +52,14 @@ The client speaks llama.cpp-omni's `/backend` WebSocket protocol
 Primary target — **on the robot's CM4** (Wireless, ARM64 Linux):
 
 ```bash
-./scripts/setup_cm4.sh            # 3.12 venv + light stack (no local ML models)
+./scripts/setup_cm4.sh            # 3.12 venv, thin client — no local ML models
 # then edit .env → set OMNI_WS_URL=wss://<your-omni-server>:8006
 ```
+
+The robot is only a client, so the hard dependencies are just **`numpy` + `websockets`**
+(`reachy-mini` is already in the CM4 image). There is **no torch / CUDA / scipy** — the omni
+server does all inference. Optional extras (`vad`, `vision`, `web`, `hifi`, `aec`) each improve
+one thing and each has a pure-numpy/stdlib fallback, so you add only what you want.
 
 Dev on a laptop (bridged to the robot, or `--sim`):
 

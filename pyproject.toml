@@ -12,48 +12,41 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Reachy Mini Live Chat" }]
 keywords = ["reachy_mini", "robotics", "voice-assistant", "full-duplex", "omni", "minicpm-o", "websocket"]
 
-# The brain is remote (over WebSocket), so the always-needed deps are tiny: numpy for
-# audio/PCM, websockets for the omni link, dotenv for config. Everything else (robot SDK,
-# VAD, camera, web UI, AEC) is an optional extra and lazy-imported.
+# The brain is remote (over WebSocket), so the robot is just a client. The only hard deps
+# are numpy (PCM math) and websockets (the omni link). Everything else — scipy, VAD, camera
+# codecs, web UI, AEC — is an optional, lazy-imported extra with a pure-numpy/stdlib fallback,
+# so a minimal on-robot install stays tiny.
 dependencies = [
     "numpy>=1.24",
-    "scipy>=1.10",
-    "python-dotenv>=1.0",
     "websockets>=12",
 ]
 
 [project.optional-dependencies]
-# The robot SDK — installed on the machine wired to the robot (or on the CM4 image) / for --sim.
+# The robot SDK — provides media I/O + motion. Normally already present in the CM4 image.
 robot = ["reachy-mini"]
 
-# Local VAD (drives DOA / listen mood / barge-in) + sim audio I/O on a laptop.
-audio = ["silero-vad", "sounddevice", "soundfile"]
-# Camera frame downscale + JPEG encode (on-robot frames come from the SDK; PIL/cv2 encode them).
-vision = ["opencv-python", "pillow"]
-# Web control/monitor UI (transcript, video preview, state) — used by the standalone dev runner.
-web = ["fastapi", "uvicorn"]
-# Optional true acoustic echo cancellation (else a duck-and-gate fallback is used).
-aec = ["webrtc-audio-processing"]
+# --- optional quality/feature add-ons (each has a fallback if absent) ---------
+config = ["python-dotenv>=1.0"]          # read a .env file (else use real env vars)
+hifi = ["scipy>=1.10"]                    # polyphase resampling (else numpy linear interp)
+vad = ["silero-vad"]                      # neural VAD for DOA/barge-in (else energy VAD; pulls torch)
+vision = ["pillow"]                       # downscale frames (else the SDK's full-res get_frame_jpeg)
+web = ["fastapi", "uvicorn"]              # control/monitor web UI (headless works without it)
+aec = ["webrtc-audio-processing"]         # true echo cancellation (else duck-and-gate)
+simcam = ["opencv-python", "sounddevice", "soundfile"]  # laptop --sim: Mac mic/speaker/webcam
 
-# On-robot (Wireless CM4, ARM64 Linux). Minimal: no local ML — the omni server does it all.
-# `reachy-mini` is normally already present in the robot image.
-cm4 = [
-    "reachy-mini",
-    "silero-vad",
-    "opencv-python-headless",
-    "pillow",
-    "fastapi", "uvicorn",
-]
+# On-robot (Wireless CM4, ARM64 Linux): minimal client. reachy-mini is usually already in the
+# robot image, so in practice `pip install .` (numpy + websockets) is enough. dotenv is a nicety.
+cm4 = ["reachy-mini", "python-dotenv>=1.0"]
 
-# Everything for a full run on a dev laptop bridging to the robot.
+# A comfortable dev-laptop bridge to the robot (smaller frames, neural VAD, web UI, hi-fi audio).
 laptop = [
-    "reachy-mini",
-    "silero-vad", "sounddevice", "soundfile",
-    "opencv-python", "pillow",
+    "reachy-mini", "python-dotenv>=1.0",
+    "scipy>=1.10", "silero-vad", "pillow",
     "fastapi", "uvicorn",
+    "opencv-python", "sounddevice", "soundfile",
 ]
 
-dev = ["pytest>=7", "ruff", "numpy>=1.24", "pillow"]
+dev = ["pytest>=7", "ruff", "numpy>=1.24", "pillow", "python-dotenv>=1.0"]
 
 [project.entry-points."reachy_mini_apps"]
 # The Reachy Mini daemon discovers the app through this entry point.
