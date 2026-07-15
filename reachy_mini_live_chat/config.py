@@ -110,9 +110,16 @@ class Config:
     # played voice sounds pitched/sped.
     omni_chunk_ms: int = field(default_factory=lambda: _int("OMNI_CHUNK_MS", 1000))
     omni_out_sr: int = field(default_factory=lambda: _int("OMNI_OUT_SR", 24000))
-    # Uplink mic gain. The robot's mic can be quiet (rms ~0.02 while speaking); the omni
-    # model then rarely decides to speak. Boost it (e.g. 3–5) so speech is clearly audible
-    # to the model. Applied with hard clipping to [-1, 1]. 1.0 = no change.
+    # Mic front-end. Preferred: WebRTC noise-suppression + auto-gain (needs the
+    # `webrtc-noise-gain` package) — AGC lifts quiet speech to a target level without the
+    # hard clipping a fixed multiplier causes, and NS removes steady background noise, so
+    # the omni model mishears less.
+    #   omni_agc_dbfs: auto-gain target, 0–31 (0 disables; higher = more boost for a quiet mic)
+    #   omni_ns_level: noise suppression, 0–4 (0 disables, 4 = max)
+    # omni_mic_gain is only the FALLBACK fixed gain used when webrtc-noise-gain is absent
+    # (hard-clipped to [-1, 1]; 1.0 = no change).
+    omni_agc_dbfs: int = field(default_factory=lambda: _int("OMNI_AGC_DBFS", 15))
+    omni_ns_level: int = field(default_factory=lambda: _int("OMNI_NS_LEVEL", 2))
     omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
     # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real
