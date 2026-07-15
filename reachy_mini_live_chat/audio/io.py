@@ -111,25 +111,29 @@ class AudioEngine:
 
     # -- capture ------------------------------------------------------------
     def _capture_loop(self) -> None:
+        # Poll on a fixed ~10 ms cadence instead of spinning: the mic buffers audio, so
+        # reading every 10 ms batches ~10 ms per call and frees a whole core on the CM4
+        # (a hot poll loop was a big part of the CPU starvation → choppy playback).
+        poll_dt = 0.01
         while not self.bus.stop_event.is_set():
+            t0 = time.monotonic()
             try:
                 sample = self.mini.media.get_audio_sample()
             except Exception as e:
                 log.debug("get_audio_sample error: %s", e)
                 sample = None
-            if sample is None or len(sample) == 0:
-                time.sleep(0.005)
-                continue
-            mono = _to_mono(sample)
-            mono = _resample(mono, self._in_sr, TARGET_SR)
-            robot_speaking = self.bus.robot_speaking.is_set()
-            # barge-in energy check on the *raw* mic (before ducking)
-            self._recent_loud = self.echo.is_barge_in(mono, robot_speaking)
-            clean = self.echo.process_capture(mono, robot_speaking)
-            # (a) local VAD only sets user_speaking → DOA / mood / barge-in
-            self.endpointer.process(clean)
-            # (b) continuous 1 s chunks → the omni uplink
-            self._accumulate(clean)
+            if sample is not None and len(sample):
+                mono = _to_mono(sample)
+                mono = _resample(mono, self._in_sr, TARGET_SR)
+                robot_speaking = self.bus.robot_speaking.is_set()
+                # barge-in energy check on the *raw* mic (before ducking)
+                self._recent_loud = self.echo.is_barge_in(mono, robot_speaking)
+                clean = self.echo.process_capture(mono, robot_speaking)
+                # (a) local VAD only sets user_speaking → DOA / mood / barge-in
+                self.endpointer.process(clean)
+                # (b) continuous 1 s chunks → the omni uplink
+                self._accumulate(clean)
+            time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
 
     def _accumulate(self, clean: np.ndarray) -> None:
         self._chunk_buf = np.concatenate([self._chunk_buf, clean.astype(np.float32)])

@@ -149,7 +149,9 @@ class Config:
     enable_motion: bool = field(default_factory=lambda: _flag("ENABLE_MOTION", True))
     enable_doa: bool = field(default_factory=lambda: _flag("ENABLE_DOA", True))
     emotions_dataset: str = field(default_factory=lambda: _env("EMOTIONS_DATASET", "pollen-robotics/reachy-mini-emotions-library"))
-    control_hz: int = field(default_factory=lambda: _int("CONTROL_HZ", 50))
+    # 30 Hz keeps set_target IPC light on the CM4 (each call competes with gstreamer +
+    # the daemon); the EMA smoothing keeps motion fluid at this rate. Raise on a laptop.
+    control_hz: int = field(default_factory=lambda: _int("CONTROL_HZ", 30))
 
     # -- Web UI --------------------------------------------------------------
     web_ui: bool = field(default_factory=lambda: _flag("WEB_UI", True))
