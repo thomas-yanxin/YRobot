@@ -125,14 +125,6 @@ class Config:
     omni_agc_dbfs: int = field(default_factory=lambda: _int("OMNI_AGC_DBFS", 0))
     omni_ns_level: int = field(default_factory=lambda: _int("OMNI_NS_LEVEL", 0))
     omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
-
-    # Software echo guard (duck + self-mute + hangover). OFF by default — the XVF3800 removes
-    # the echo in hardware, so we stream the mic continuously like the official app. Enable
-    # (OMNI_SW_ECHO_GUARD=1) only on hardware without XVF3800 AEC.
-    omni_sw_echo_guard: bool = field(default_factory=lambda: _flag("OMNI_SW_ECHO_GUARD", False))
-    # Guard-only: keep muting the uplink this long after the robot stops (swallow the speaker
-    # tail). Unused unless omni_sw_echo_guard is on.
-    omni_uplink_hangover_ms: int = field(default_factory=lambda: _int("OMNI_UPLINK_HANGOVER_MS", 400))
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
     # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real
     # time. The cushion absorbs CPU/scheduling jitter on the CM4 so speech doesn't stutter;
@@ -167,11 +159,6 @@ class Config:
     vad_threshold: float = field(default_factory=lambda: _float("VAD_THRESHOLD", 0.5))
     vad_silence_ms: int = field(default_factory=lambda: _int("VAD_SILENCE_MS", 320))
     vad_min_speech_ms: int = field(default_factory=lambda: _int("VAD_MIN_SPEECH_MS", 200))
-
-    # Echo control: the robot streams its mic continuously (so the model can hear a
-    # barge-in), so its own speech must be suppressed or the model hears itself.
-    enable_aec: bool = field(default_factory=lambda: _flag("ENABLE_AEC", False))
-    barge_in_energy: float = field(default_factory=lambda: _float("BARGE_IN_ENERGY", 0.02))
 
     # -- Motion --------------------------------------------------------------
     enable_motion: bool = field(default_factory=lambda: _flag("ENABLE_MOTION", True))

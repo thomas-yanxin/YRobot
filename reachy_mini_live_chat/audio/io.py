@@ -1,17 +1,17 @@
 """Audio transport: mic capture → 1 s chunks for the omni brain, and omni audio → speaker.
 
 Owns two threads:
-* **capture** — polls ``mini.media.get_audio_sample()``, downmixes to mono 16 kHz, runs
-  echo suppression, then (a) feeds a lightweight VAD that only drives ``user_speaking``
-  (→ DOA head-turn + attentive mood + barge-in), and (b) accumulates the cleaned signal
-  into fixed ~1 s chunks handed to ``on_audio_chunk`` — the continuous full-duplex uplink.
+* **capture** — polls ``mini.media.get_audio_sample()``, downmixes to mono 16 kHz, then
+  (a) feeds a lightweight VAD that only drives ``user_speaking`` (→ DOA head-turn +
+  attentive mood + barge-in), and (b) accumulates the signal into fixed ~1 s chunks handed
+  to ``on_audio_chunk`` — the continuous full-duplex uplink.
 * **playback** — drains ``bus.tts_audio`` (float32 @ 16 kHz) and pushes to
   ``mini.media.push_audio_sample()`` in 20 ms sub-chunks so a barge-in can cut the robot
   off mid-word. Stamps end-to-end latency on the first chunk after the user stops talking.
 
-We stream the mic **continuously** (even while the robot speaks) so the model can hear a
-barge-in — which is exactly why the capture path runs echo suppression first, so the model
-doesn't hear the robot's own voice.
+Echo cancellation is done in hardware by the ReSpeaker XVF3800 (see ``respeaker_config.py``),
+so the mic is already echo-free — we stream it **continuously** (even while the robot speaks)
+so the model can hear a barge-in, exactly like the official Reachy Mini app.
 """
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ import numpy as np
 
 from ..bus import Bus, ConvState
 from ..config import Config
-from .aec import EchoController
 from .denoise import MicPreprocessor
 from .respeaker_config import apply_startup_config
 from .vad import Endpointer, build_vad
@@ -70,7 +69,6 @@ class AudioEngine:
         self.bus = bus
         self._on_audio_chunk = on_audio_chunk
 
-        self.echo = EchoController(cfg.enable_aec, cfg.barge_in_energy)
         vad = build_vad(stub=cfg.stub, backend=cfg.vad_backend)
         self.endpointer = Endpointer(
             vad,
@@ -81,26 +79,14 @@ class AudioEngine:
             on_utterance=self._on_speech_end,
         )
 
-        # Mic front-end: WebRTC noise-suppression + auto-gain when available, else a plain
-        # fixed gain (omni_mic_gain). AGC is preferred over a fixed gain — it lifts quiet
-        # speech to a target level without the hard clipping a fixed multiplier causes.
+        # Optional software noise-suppression + auto-gain (webrtc-noise-gain). OFF by default
+        # (OMNI_AGC_DBFS/OMNI_NS_LEVEL = 0) — Reachy Mini's XVF3800 already does NS+AGC (and
+        # AEC) in hardware; this is a no-op passthrough unless enabled for non-XVF3800 boards.
         self._mic = MicPreprocessor(
-            agc_dbfs=getattr(cfg, "omni_agc_dbfs", 6),
-            ns_level=getattr(cfg, "omni_ns_level", 2),
+            agc_dbfs=getattr(cfg, "omni_agc_dbfs", 0),
+            ns_level=getattr(cfg, "omni_ns_level", 0),
             fallback_gain=getattr(cfg, "omni_mic_gain", 1.0),
         )
-        # Uplink self-echo guard. Muting only while `robot_speaking` isn't enough: after the
-        # last audio is pushed the speaker keeps physically ringing for a moment, and that
-        # tail leaks into the mic (AGC even amplifies it) → the model hears itself finish and
-        # replies again → a self-triggering turn loop. Keep muting for a short hangover after
-        # the robot stops so the tail is swallowed too. Barge-in still overrides.
-        self._uplink_hangover_s = max(0.0, getattr(cfg, "omni_uplink_hangover_ms", 400) / 1000.0)
-        self._last_spoke_t = 0.0
-        # Reachy Mini's XVF3800 mic board does AEC/NS/AGC in hardware (always on), so by
-        # default we trust it: stream the mic continuously, no software duck/mute/hangover
-        # (mirrors the official conversation app). The software echo guard is only for
-        # hardware that lacks the XVF3800 AEC — enable it with OMNI_SW_ECHO_GUARD=1.
-        self._sw_echo_guard = bool(getattr(cfg, "omni_sw_echo_guard", False))
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # playback pacing (set once out_sr is known in start())
@@ -111,7 +97,6 @@ class AudioEngine:
         # tts_audio carries raw omni output (float32 at the model's TTS rate); we resample
         # to the device rate here on the playback thread — once, and off the WS read path.
         self._tts_sr = int(cfg.omni_out_sr or TARGET_SR)
-        self._recent_loud = False
         self._chunk_samples = max(1, int(TARGET_SR * cfg.omni_chunk_ms / 1000))
         self._chunk_buf = np.zeros(0, dtype=np.float32)
         self._threads: list[threading.Thread] = []
@@ -157,32 +142,12 @@ class AudioEngine:
             if sample is not None and len(sample):
                 mono = _to_mono(sample)
                 mono = _resample(mono, self._in_sr, TARGET_SR)
-                robot_speaking = self.bus.robot_speaking.is_set()
-                # barge-in energy check on the mic (raw, before any software processing)
-                self._recent_loud = self.echo.is_barge_in(mono, robot_speaking)
-                # Optional software NS/auto-gain. Off by default — the XVF3800 does NS+AGC in
-                # hardware; this is a no-op passthrough unless OMNI_AGC_DBFS/OMNI_NS_LEVEL are set.
+                # The XVF3800 mic board already did AEC/NS/AGC in hardware, so the mic is
+                # echo-free: feed the VAD and stream the uplink continuously — same as the
+                # official app. (_mic is a no-op passthrough unless software NS/AGC is enabled.)
                 mic = self._mic.process(mono)
-
-                if self._sw_echo_guard:
-                    # Software echo path (only for hardware without XVF3800 AEC): duck residual
-                    # echo for the VAD, and mute the uplink while the robot speaks + a hangover
-                    # after (swallow the speaker tail) so the model never hears itself.
-                    clean = self.echo.process_capture(mic, robot_speaking)
-                    self.endpointer.process(clean)
-                    if robot_speaking:
-                        self._last_spoke_t = t0
-                    recently_spoke = robot_speaking or (t0 - self._last_spoke_t) < self._uplink_hangover_s
-                    if recently_spoke and not self.echo.enable_aec and not self._recent_loud:
-                        self._accumulate(np.zeros_like(clean))
-                    else:
-                        self._accumulate(clean)
-                else:
-                    # Hardware-AEC path (default): the mic is already echo-cancelled by the
-                    # XVF3800, so feed the VAD and stream the uplink continuously — same as the
-                    # official app. No duck, no self-mute.
-                    self.endpointer.process(mic)
-                    self._accumulate(mic)
+                self.endpointer.process(mic)
+                self._accumulate(mic)
             time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
 
     def _accumulate(self, clean: np.ndarray) -> None:
@@ -197,14 +162,9 @@ class AudioEngine:
 
     def _on_speech_start(self) -> None:
         if self.bus.robot_speaking.is_set():
-            # Human started while the robot spoke → barge-in.
-            # Hardware-AEC path: the mic is already echo-free, so a VAD speech-onset during
-            # playback IS a real human — trust the VAD (which already gates on threshold +
-            # min_speech_ms). The old raw-energy gate was tuned to reject the robot's own
-            # echo; with the XVF3800 removing it, that gate only blocked genuine barge-ins.
-            # Software-guard path keeps the energy gate to reject residual echo.
-            if self._sw_echo_guard and not self._recent_loud:
-                return
+            # Human started while the robot spoke → barge-in. The XVF3800 gives us an echo-
+            # free mic, so a VAD speech-onset during playback IS a real human — trust the VAD
+            # (it already gates on threshold + min_speech_ms).
             log.info("barge-in detected")
             self.bus.request_interrupt()
         self.bus.user_speaking.set()
@@ -264,7 +224,6 @@ class AudioEngine:
             if self.bus.interrupt_event.is_set():
                 break
             sub = chunk[i:i + n]
-            self.echo.note_playback(sub)
             try:
                 self.mini.media.push_audio_sample(sub.reshape(-1, 1))
             except Exception as e:
