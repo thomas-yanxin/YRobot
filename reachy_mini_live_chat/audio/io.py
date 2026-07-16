@@ -134,12 +134,22 @@ class AudioEngine:
         poll_dt = 0.01
         while not self.bus.stop_event.is_set():
             t0 = time.monotonic()
+            # Drain EVERYTHING the appsink has queued, not one buffer per poll.
+            # get_audio_sample() returns a single buffer; if we ever fall behind
+            # (CPU spike, pipeline pause), a one-per-poll reader can never catch
+            # up by more than ~2x, so the backlog — and with it a permanent mic
+            # delay that breaks barge-in — persists forever.
+            parts = []
             try:
-                sample = self.mini.media.get_audio_sample()
+                while True:
+                    sample = self.mini.media.get_audio_sample()
+                    if sample is None or not len(sample):
+                        break
+                    parts.append(sample)
             except Exception as e:
                 log.debug("get_audio_sample error: %s", e)
-                sample = None
-            if sample is not None and len(sample):
+            if parts:
+                sample = parts[0] if len(parts) == 1 else np.concatenate(parts)
                 mono = _to_mono(sample)
                 mono = _resample(mono, self._in_sr, TARGET_SR)
                 # The XVF3800 mic board already did AEC/NS/AGC in hardware, so the mic is
@@ -175,8 +185,13 @@ class AudioEngine:
             # free mic, so a VAD speech-onset during playback IS a real human — trust the VAD
             # (it already gates on threshold + min_speech_ms).
             log.info("barge-in detected")
+            # Only signal here. The device-buffer flush (clear_player) is done by
+            # the PLAYBACK thread when it observes the interrupt: clear_player
+            # cycles the shared GStreamer pipeline PAUSED->flush->PLAYING, and
+            # doing that from this (capture) thread while the playback thread is
+            # concurrently pushing buffers can wedge the pipeline for good
+            # (playback dead + mic backlog).
             self.bus.request_interrupt()
-            self._flush_device_playback()
         self.bus.user_speaking.set()
         self.bus.set_state(ConvState.LISTENING)
         self.bus.emit("system", {"text": "listening"})
@@ -217,7 +232,17 @@ class AudioEngine:
     # -- playback -----------------------------------------------------------
     def _playback_loop(self) -> None:
         idle_since = time.monotonic()
+        interrupt_flushed = False
         while not self.bus.stop_event.is_set():
+            # Barge-in: this thread owns every push into the playback appsrc, so
+            # it is the only place clear_player() can run without racing a
+            # concurrent push_buffer (which can wedge the shared pipeline).
+            if self.bus.interrupt_event.is_set():
+                if not interrupt_flushed and self.bus.robot_speaking.is_set():
+                    self._flush_device_playback()
+                    interrupt_flushed = True
+            else:
+                interrupt_flushed = False
             try:
                 item = self.bus.tts_audio.get(timeout=0.1)
             except Exception:
