@@ -81,6 +81,7 @@ class AudioEngine:
             on_utterance=self._on_speech_end,
         )
         self._hw_last = 0.0       # time of the last get_DoA USB read (throttle)
+        self._mic_gain = float(getattr(cfg, "omni_mic_gain", 1.0) or 1.0)
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # playback pacing (set once out_sr is known in start())
@@ -146,6 +147,8 @@ class AudioEngine:
                 sample = parts[0] if len(parts) == 1 else np.concatenate(parts)
                 mono = _to_mono(sample)
                 mic = _resample(mono, self._in_sr, TARGET_SR)
+                if self._mic_gain != 1.0:
+                    mic = np.clip(mic * self._mic_gain, -1.0, 1.0)
                 self._poll_hw_doa(t0)
                 # Barge-in fast path: shorten the onset gate while the robot talks.
                 # The energy source is safe for this — the AEC'd mic doesn't carry
