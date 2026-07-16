@@ -188,9 +188,12 @@ class OmniClient:
                     n, (s["up_rms"] / n if n else 0.0), s["drop"], s["barge"], s["text"], s["audio"], s["listen"], s["done"], playq,
                 )
                 if playq > 25:
-                    log.warning("omni: audio backlog (playq=%d) — the server is producing "
-                                "audio faster than real time OR playback is starved; try "
-                                "OMNI_GATEWAY_MODE=audio or raise OMNI_VIDEO_EVERY_N", playq)
+                    # Long replies stream in bursts (generation outruns real-time playback),
+                    # so a transient backlog is expected; it is dropped wholesale on a
+                    # barge-in. Only a backlog that keeps GROWING across windows would mean
+                    # playback is starved.
+                    log.info("omni: %d reply chunks queued ahead of playback (long reply "
+                             "streaming in a burst — normal; dropped instantly on barge-in)", playq)
             for k in s:
                 s[k] = 0
 
