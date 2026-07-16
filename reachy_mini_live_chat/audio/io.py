@@ -2,9 +2,9 @@
 
 Owns two threads:
 * **capture** — polls ``mini.media.get_audio_sample()``, downmixes to mono 16 kHz, then
-  (a) feeds a lightweight VAD that only drives ``user_speaking`` (→ DOA head-turn +
-  attentive mood + barge-in), and (b) accumulates the signal into fixed ~1 s chunks handed
-  to ``on_audio_chunk`` — the continuous full-duplex uplink.
+  (a) refreshes the XVF3800 firmware's post-AEC voice flag (~20 Hz USB poll) that drives
+  ``user_speaking`` (→ DOA head-turn + attentive mood + barge-in), and (b) accumulates the
+  signal into fixed chunks handed to ``on_audio_chunk`` — the continuous full-duplex uplink.
 * **playback** — drains ``bus.tts_audio`` (float32 @ 16 kHz) and pushes to
   ``mini.media.push_audio_sample()`` in 20 ms sub-chunks so a barge-in can cut the robot
   off mid-word. Stamps end-to-end latency on the first chunk after the user stops talking.
@@ -24,9 +24,8 @@ import numpy as np
 
 from ..bus import Bus, ConvState
 from ..config import Config
-from .denoise import MicPreprocessor
 from .respeaker_config import apply_startup_config
-from .vad import Endpointer, build_vad
+from .vad import Endpointer, HwVoiceFlag
 
 log = logging.getLogger("live_chat.audio")
 
@@ -69,24 +68,17 @@ class AudioEngine:
         self.bus = bus
         self._on_audio_chunk = on_audio_chunk
 
-        vad = build_vad(stub=cfg.stub, backend=cfg.vad_backend)
+        # Voice activity comes from the XVF3800 firmware's post-AEC voice flag,
+        # cached by the ~20 Hz USB poll in the capture loop (_poll_hw_voice).
         self.endpointer = Endpointer(
-            vad,
-            threshold=cfg.vad_threshold,
+            HwVoiceFlag(lambda: self._hw_speech),
             silence_ms=cfg.vad_silence_ms,
             min_speech_ms=cfg.vad_min_speech_ms,
             on_speech_start=self._on_speech_start,
             on_utterance=self._on_speech_end,
         )
-
-        # Optional software noise-suppression + auto-gain (webrtc-noise-gain). OFF by default
-        # (OMNI_AGC_DBFS/OMNI_NS_LEVEL = 0) — Reachy Mini's XVF3800 already does NS+AGC (and
-        # AEC) in hardware; this is a no-op passthrough unless enabled for non-XVF3800 boards.
-        self._mic = MicPreprocessor(
-            agc_dbfs=getattr(cfg, "omni_agc_dbfs", 0),
-            ns_level=getattr(cfg, "omni_ns_level", 0),
-            fallback_gain=getattr(cfg, "omni_mic_gain", 1.0),
-        )
+        self._hw_speech = False   # last firmware voice flag
+        self._hw_last = 0.0       # time of the last USB read (throttle)
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # playback pacing (set once out_sr is known in start())
@@ -99,7 +91,6 @@ class AudioEngine:
         self._tts_sr = int(cfg.omni_out_sr or TARGET_SR)
         self._chunk_samples = max(1, int(TARGET_SR * cfg.omni_chunk_ms / 1000))
         self._chunk_buf = np.zeros(0, dtype=np.float32)
-        self._barge_hw_last = 0.0  # last XVF3800 voice-flag read (barge confirm throttle)
         self._threads: list[threading.Thread] = []
 
     # -- lifecycle ----------------------------------------------------------
@@ -111,7 +102,7 @@ class AudioEngine:
             pass
         self._play_sub_n = max(1, int(self._out_sr * self.cfg.omni_playback_chunk_ms / 1000))
         # Tune the ReSpeaker XVF3800 (hardware AEC/NS/AGC) before we start streaming, the way
-        # the official app does. Best-effort: no-op on sim/older SDK.
+        # the official app does. Best-effort: no-op on an older SDK.
         if getattr(self.cfg, "omni_respeaker_config", True):
             apply_startup_config(self.mini)
         self.mini.media.start_recording()
@@ -152,24 +143,42 @@ class AudioEngine:
             if parts:
                 sample = parts[0] if len(parts) == 1 else np.concatenate(parts)
                 mono = _to_mono(sample)
-                mono = _resample(mono, self._in_sr, TARGET_SR)
-                # The XVF3800 mic board already did AEC/NS/AGC in hardware, so the mic is
-                # echo-free: feed the VAD and stream the uplink continuously — same as the
-                # official app. (_mic is a no-op passthrough unless software NS/AGC is enabled.)
-                mic = self._mic.process(mono)
-                # Barge-in fast path: while the robot talks the mic is echo-free
-                # (hardware AEC), so run the VAD with a lower bar to detect the
-                # human quickly; switch back to the stricter gate when it's quiet.
-                if self.bus.robot_speaking.is_set():
-                    self.endpointer.threshold = self.cfg.vad_barge_threshold
-                    self.endpointer.min_speech_ms = self.cfg.vad_barge_min_speech_ms
-                else:
-                    self.endpointer.threshold = self.cfg.vad_threshold
-                    self.endpointer.min_speech_ms = self.cfg.vad_min_speech_ms
+                mic = _resample(mono, self._in_sr, TARGET_SR)
+                self._poll_hw_voice(t0)
+                # Barge-in fast path: the voice flag is post-AEC (echo/servo-noise
+                # proof), so while the robot talks we only shorten the onset gate.
+                self.endpointer.min_speech_ms = (
+                    self.cfg.vad_barge_min_speech_ms
+                    if self.bus.robot_speaking.is_set()
+                    else self.cfg.vad_min_speech_ms
+                )
+                # The XVF3800 already did AEC/NS/AGC in hardware, so the mic is
+                # echo-free: stream the uplink continuously — same as the official app.
                 self.endpointer.process(mic)
                 self._maybe_barge()
                 self._accumulate(mic)
             time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
+
+    def _poll_hw_voice(self, now: float) -> None:
+        """Refresh the cached XVF3800 (voice, DOA) reading, at most every 50 ms.
+
+        This is the single owner of get_DoA() USB reads: the VAD, barge-in, and
+        the motion controller's head-turn all consume the cached result (motion
+        via bus.doa_angle), so no two threads ever hit the USB device at once.
+        """
+        if now - self._hw_last < 0.05:
+            return
+        self._hw_last = now
+        try:
+            res = self.mini.media.get_DoA()
+        except Exception:
+            res = None
+        if res is None:
+            return  # transient read failure: keep the previous flag
+        angle, speech = float(res[0]), bool(res[1])
+        self._hw_speech = speech
+        if speech:
+            self.bus.doa_angle = angle
 
     def _accumulate(self, clean: np.ndarray) -> None:
         self._chunk_buf = np.concatenate([self._chunk_buf, clean.astype(np.float32)])
@@ -182,32 +191,18 @@ class AudioEngine:
                 log.debug("on_audio_chunk error: %s", e)
 
     def _maybe_barge(self) -> None:
-        """Cut the robot off when a human talks over it — with confirmation.
+        """Cut the robot off when a human talks over it.
 
-        Runs every capture poll (level-triggered, not just on the VAD onset edge):
-        the energy VAD alone can't tell a human from residual echo or head-servo
-        noise while the robot is talking, so a barge candidate must also be
-        confirmed by the XVF3800's own post-AEC voice flag (via get_DoA). Level
-        triggering means a momentary hardware "no" only delays the cut by a poll
-        or two instead of eating the barge-in entirely. Only bus.request_interrupt
-        is signalled here — the device-buffer flush runs on the playback thread
-        (see _playback_loop), never from this thread.
+        Level-triggered each capture poll. The voice source is the XVF3800's
+        post-AEC firmware flag, so a candidate here IS a human — residual echo
+        and head-servo noise don't raise it. Only bus.request_interrupt is
+        signalled; the device-buffer flush runs on the playback thread (see
+        _playback_loop), never from this thread.
         """
         if not (self.bus.robot_speaking.is_set() and self.endpointer.in_speech):
             return
         if self.bus.interrupt_event.is_set():
             return  # already tearing this reply down
-        if self.cfg.vad_barge_hw_confirm:
-            now = time.monotonic()
-            if now - self._barge_hw_last < 0.05:
-                return  # throttle USB reads to ~20 Hz
-            self._barge_hw_last = now
-            try:
-                res = self.mini.media.get_DoA()
-            except Exception:
-                res = None
-            if res is not None and not res[1]:
-                return  # hardware says no human voice → echo/servo noise, hold fire
         log.info("barge-in detected")
         self.bus.request_interrupt()
 
@@ -236,7 +231,7 @@ class AudioEngine:
         # playback pipeline (~cushion + pipeline latency, up to >1 s) and would keep
         # playing after we stop pushing. clear_player() flushes the appsrc so the
         # robot goes quiet at once. MediaManager doesn't forward it, so reach for
-        # media.audio; best-effort — absent on sim/stub and older SDKs.
+        # media.audio; best-effort — absent on older SDKs.
         media = self.mini.media
         fn = getattr(media, "clear_player", None) or getattr(
             getattr(media, "audio", None), "clear_player", None

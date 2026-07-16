@@ -157,22 +157,19 @@ class MotionController:
             self._rate_n = 0
 
     def _poll_doa(self, now: float) -> None:
+        # The audio capture loop owns the get_DoA() USB reads (~20 Hz) and caches
+        # the voiced angle on the bus — consume that here instead of hitting the
+        # USB device from a second thread.
         if not (self.cfg.enable_doa and self.bus.user_speaking.is_set()):
             return
         if now - self._doa_last_poll < 0.1:
             return
         self._doa_last_poll = now
-        try:
-            res = self.mini.media.get_DoA()
-        except Exception:
-            res = None
-        if res:
-            angle, is_speech = res
-            if is_speech:
-                self.bus.doa_angle = angle
-                y = self._doa.update(angle)
-                if y is not None:
-                    self._doa_yaw = y
+        angle = self.bus.doa_angle
+        if angle is not None:
+            y = self._doa.update(angle)
+            if y is not None:
+                self._doa_yaw = y
 
     # -- pose synthesis -----------------------------------------------------
     def _compute(self, now: float) -> Tuple[np.ndarray, list, Optional[float]]:

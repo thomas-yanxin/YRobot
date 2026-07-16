@@ -34,7 +34,7 @@ source "${VENV}/bin/activate"
 
 echo "==> Installing app + CM4 stack (no local ML models — brain is remote)"
 pip_install -e ".[cm4,dev]" || {
-  echo "Full install failed — falling back to light install (sim/stub only)." >&2
+  echo "Full install failed — falling back to light install." >&2
   pip_install -e ".[dev]"
 }
 
@@ -54,10 +54,7 @@ Next:
   #      OMNI_WS_URL=wss://<server-host>:8006
   #    (the server is llama.cpp-omni's llama-omni-server; see its deploy docs)
 
-  # 2) Dev without any hardware or server (runs the real client against a fake omni server):
-  reachy-mini-live-chat --sim --stub
-
-  # 3) On the robot (daemon already running on the CM4):
+  # 2) On the robot (daemon already running on the CM4):
   reachy-mini-live-chat
   #    or let the Reachy Mini app launcher discover it (entry point: reachy_mini_apps).
 EOF

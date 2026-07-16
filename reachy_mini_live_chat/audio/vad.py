@@ -1,18 +1,15 @@
-"""Voice-activity detection + turn endpointing.
+"""Voice-activity detection + turn endpointing, driven by the ReSpeaker XVF3800.
 
-The VAD here is *only* a local trigger — it decides "is a human talking right now" to
-steer DOA, raise the listen mood, and detect barge-in. The remote omni model does the
-real turn-taking, so we don't need anything heavy.
+The mic board's firmware runs its own post-AEC voice detection (exposed together
+with the DOA angle via a USB control read). That flag is the *only* voice source
+here: unlike an energy gate it does not confuse residual echo or head-servo noise
+with a human, which is exactly what barge-in needs. The remote omni model still
+does the real turn-taking — this VAD only drives DOA head-turns, the listen mood,
+barge-in, and the e2e latency clock.
 
-Primary detector: **Silero VAD v5** run on CPU via **onnxruntime** (the model is
-vendored in ``assets/silero_vad_16k.onnx``). This deliberately avoids the ``silero-vad``
-pip package, which depends on ``torch`` and would drag in the CUDA/cuDNN runtime for a
-client that never touches a GPU. If ``onnxruntime`` isn't installed, we fall back to a
-robust pure-**numpy energy** VAD, so the whole pipeline still runs with zero extra deps.
-
-The :class:`Endpointer` turns a stream of 16 kHz mono chunks into discrete utterances
-via a start/silence-window state machine, and exposes a cheap ``speech_prob`` for
-barge-in detection while the robot is talking.
+:class:`HwVoiceFlag` adapts the cached firmware flag to the frame-based
+:class:`Endpointer`, which turns it into debounced speech-start / utterance-end
+callbacks via a min-speech / silence-window state machine.
 """
 from __future__ import annotations
 
@@ -23,125 +20,22 @@ import numpy as np
 
 log = logging.getLogger("live_chat.vad")
 
-FRAME = 512  # Silero v5 wants 512 samples @ 16 kHz == 32 ms
+FRAME = 512  # 32 ms @ 16 kHz — the endpointer's debounce granularity
 
 
-class _EnergyVad:
-    """Fallback VAD: adaptive RMS gate with a fast-drop / slow-rise noise-floor tracker."""
+class HwVoiceFlag:
+    """Adapt a cached XVF3800 voice flag to the Endpointer's speech_prob API.
 
-    def __init__(self) -> None:
-        # Start near a typical ambient level. The XVF3800's hardware AGC raises the mic's
-        # noise floor (rms ~0.05 even when quiet), so a tiny init would look like permanent
-        # speech until it adapts.
-        self._floor = 1e-2
+    ``get_flag`` returns the most recent firmware reading (refreshed by the
+    audio capture loop's ~20 Hz USB poll); audio frames are ignored — the
+    firmware already looked at the signal, post-AEC.
+    """
+
+    def __init__(self, get_flag: Callable[[], bool]) -> None:
+        self._get_flag = get_flag
 
     def speech_prob(self, frame: np.ndarray) -> float:
-        rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)) + 1e-9)
-        # Track the noise floor both ways: drop quickly toward quiet frames, rise slowly
-        # during sustained sound. This adapts to the real ambient level (including one raised
-        # by hardware AGC) instead of sticking at init and reporting speech forever — the bug
-        # that pinned user_speaking on and kept the model permanently in listen.
-        if rms < self._floor:
-            self._floor = 0.9 * self._floor + 0.1 * rms
-        else:
-            self._floor = 0.995 * self._floor + 0.005 * rms
-        snr = rms / (self._floor + 1e-9)
-        # map SNR -> pseudo-probability
-        return float(np.clip((snr - 2.5) / 6.0, 0.0, 1.0))
-
-
-def _silero_model_path() -> str:
-    """Filesystem path to the vendored Silero v5 onnx model."""
-    import os
-
-    return os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "silero_vad_16k.onnx")
-
-
-class _OnnxVad:
-    """Silero VAD v5 on CPU via onnxruntime (no torch). 512-sample frames @ 16 kHz.
-
-    Model I/O (op15 16k build): inputs ``input`` (batch, samples) float32,
-    ``state`` (2, batch, 128) float32, ``sr`` int64 scalar; outputs ``output``
-    (batch, 1) speech-prob and ``stateN`` (recurrent state to feed back).
-    """
-
-    def __init__(self) -> None:
-        import onnxruntime as ort  # lazy
-
-        opts = ort.SessionOptions()
-        opts.inter_op_num_threads = 1
-        opts.intra_op_num_threads = 1
-        self._sess = ort.InferenceSession(
-            _silero_model_path(), sess_options=opts, providers=["CPUExecutionProvider"]
-        )
-        self._sr = np.array(16000, dtype=np.int64)
-        self.reset()
-
-    def speech_prob(self, frame: np.ndarray) -> float:
-        x = np.asarray(frame, dtype=np.float32).reshape(1, -1)
-        try:
-            out, self._state = self._sess.run(
-                ["output", "stateN"], {"input": x, "state": self._state, "sr": self._sr}
-            )
-        except Exception:
-            return 0.0
-        return float(out[0, 0])
-
-    def reset(self) -> None:
-        self._state = np.zeros((2, 1, 128), dtype=np.float32)
-
-
-def build_vad(stub: bool = False, backend: str = "energy"):
-    """Build the VAD. ``backend``: ``energy`` (cheap, default) | ``onnx`` | ``auto``.
-
-    The VAD only triggers DOA / listen-mood / barge-in — the omni model does the real
-    turn-taking — so the ~free energy detector is the sensible default, especially on a
-    CM4 where running Silero ~31×/s competes for the GIL and makes the app stutter.
-    """
-    if stub or backend == "energy":
-        log.info("VAD: numpy energy")
-        return _EnergyVad()
-    # onnx / auto → try Silero, fall back to energy
-    try:
-        vad = _OnnxVad()
-        log.info("VAD: Silero v5 (onnxruntime, CPU)")
-        return vad
-    except Exception as e:
-        level = log.warning if backend == "onnx" else log.info
-        level("VAD: onnxruntime unavailable (%s); using numpy energy", e)
-        return _EnergyVad()
-
-
-class SemanticTurn:
-    """Optional wrapper around livekit/turn-detector to confirm end-of-turn.
-
-    Returns True if the transcript looks like a *complete* thought. When the model
-    is unavailable, a light heuristic (sentence-final punctuation / length) is used.
-    """
-
-    def __init__(self, enabled: bool) -> None:
-        self.enabled = enabled
-        self._model = None
-        if enabled:
-            try:
-                # The onnx model is loaded lazily on first use; import guarded.
-                import onnxruntime  # noqa: F401
-                log.info("SemanticTurn: onnxruntime available")
-            except Exception as e:
-                log.warning("SemanticTurn: disabled (%s)", e)
-                self.enabled = False
-
-    def is_complete(self, text: str) -> bool:
-        text = (text or "").strip()
-        if not text:
-            return False
-        if not self.enabled:
-            return True  # rely purely on the silence window
-        # Heuristic stand-in for the model: ends with terminal punctuation, or is
-        # long enough that further silence almost certainly means "done".
-        if text[-1] in "。！？.!?…":
-            return True
-        return len(text) >= 12
+        return 1.0 if self._get_flag() else 0.0
 
 
 class Endpointer:
@@ -211,10 +105,9 @@ class Endpointer:
                 if self._silence_ms_run >= self.silence_ms:
                     self._emit()
             else:
-                # Decay (not reset) the onset run: natural speech dips below the
-                # threshold for a frame or two, and a hard reset made the
-                # min_speech_ms gate take far longer than min_speech_ms — the
-                # main source of slow barge-in detection.
+                # Decay (not reset) the onset run: the firmware flag can dip for
+                # a beat mid-word, and a hard reset made the min_speech_ms gate
+                # take far longer than min_speech_ms — slow barge-in detection.
                 self._speech_ms_run = max(0.0, self._speech_ms_run - 2.0 * self._frame_ms)
 
     def _emit(self) -> None:

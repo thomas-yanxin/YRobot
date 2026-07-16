@@ -2,7 +2,7 @@
 
 All knobs live in one dataclass so every module can be handed a single ``Config``.
 Values come from environment variables (loaded from ``.env`` if present); the
-defaults match ``.env.example`` and are safe for a hardware-free ``--sim --stub`` run.
+defaults match ``.env.example``.
 
 The conversational brain is a **remote end-to-end omni model** (MiniCPM-o 4.5 served by
 ``llama.cpp-omni``'s ``llama-omni-server``) reached over a full-duplex WebSocket — there
@@ -116,15 +116,6 @@ class Config:
     # hardware without that board.
     omni_respeaker_config: bool = field(default_factory=lambda: _flag("OMNI_RESPEAKER_CONFIG", True))
 
-    # Software mic front-end (WebRTC noise-suppression + auto-gain, needs `webrtc-noise-gain`).
-    # OFF by default — the XVF3800 already does NS+AGC in hardware, and stacking software AGC
-    # on top causes pumping. Only enable on hardware that lacks the board.
-    #   omni_agc_dbfs: auto-gain target, 0–31 (0 disables; higher = more boost)
-    #   omni_ns_level: noise suppression, 0–4 (0 disables, 4 = max)
-    # omni_mic_gain is only the FALLBACK fixed gain used when webrtc-noise-gain is absent.
-    omni_agc_dbfs: int = field(default_factory=lambda: _int("OMNI_AGC_DBFS", 0))
-    omni_ns_level: int = field(default_factory=lambda: _int("OMNI_NS_LEVEL", 0))
-    omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
     # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real
     # time. The cushion absorbs CPU/scheduling jitter on the CM4 so speech doesn't stutter;
@@ -151,24 +142,13 @@ class Config:
     omni_max_speak_tokens_per_chunk: Optional[int] = field(default_factory=lambda: _opt_int("OMNI_MAX_SPEAK_TOKENS_PER_CHUNK"))
     omni_tts_temperature: Optional[float] = field(default_factory=lambda: _opt_float("OMNI_TTS_TEMPERATURE"))
 
-    # -- VAD (now only a local trigger for DOA / listen-mood / barge-in) -----
-    # Backend: energy (pure numpy, ~free — the default; plenty for "is someone talking")
-    # | onnx (Silero v5 on CPU, more accurate but ~31 inferences/s — heavier on a CM4)
-    # | auto (onnx if onnxruntime present, else energy).
-    vad_backend: str = field(default_factory=lambda: _env("VAD_BACKEND", "energy"))
-    vad_threshold: float = field(default_factory=lambda: _float("VAD_THRESHOLD", 0.5))
+    # -- VAD (XVF3800 firmware voice flag; drives DOA / listen-mood / barge-in) ----
+    # The mic board's post-AEC voice detection is the only voice source — it can't be
+    # fooled by residual echo or head-servo noise. These knobs only debounce it.
     vad_silence_ms: int = field(default_factory=lambda: _int("VAD_SILENCE_MS", 320))
     vad_min_speech_ms: int = field(default_factory=lambda: _int("VAD_MIN_SPEECH_MS", 200))
-    # Barge-in fast path: while the robot is speaking, the XVF3800's hardware AEC makes
-    # the mic echo-free, so any voice energy is a real human — we can afford a lower
-    # threshold and a shorter onset gate to cut the robot off quickly.
-    vad_barge_threshold: float = field(default_factory=lambda: _float("VAD_BARGE_THRESHOLD", 0.35))
+    # Shorter onset gate while the robot is speaking = how fast you can cut it off.
     vad_barge_min_speech_ms: int = field(default_factory=lambda: _int("VAD_BARGE_MIN_SPEECH_MS", 100))
-    # Confirm a barge-in with the XVF3800's own post-AEC voice flag (read via get_DoA)
-    # before cutting the robot off. The energy VAD alone can't tell a human from residual
-    # echo or head-servo noise while the robot talks; the hardware flag can. No-op when
-    # the ReSpeaker is absent (sim) — the energy decision then stands alone.
-    vad_barge_hw_confirm: bool = field(default_factory=lambda: _flag("VAD_BARGE_HW_CONFIRM", True))
 
     # -- Motion --------------------------------------------------------------
     enable_motion: bool = field(default_factory=lambda: _flag("ENABLE_MOTION", True))
@@ -181,10 +161,6 @@ class Config:
     # -- Web UI --------------------------------------------------------------
     web_ui: bool = field(default_factory=lambda: _flag("WEB_UI", True))
     web_port: int = field(default_factory=lambda: _int("WEB_PORT", 8042))
-
-    # Runtime flags (set from CLI, not env).
-    sim: bool = False
-    stub: bool = False
 
     # Audio format (Reachy media is 16 kHz float32); confirmed from device at runtime.
     sample_rate: int = 16000

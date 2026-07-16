@@ -3,8 +3,8 @@
 * :class:`LiveChatApp` — the ``ReachyMiniApp`` the daemon discovers (entry point
   ``reachy_mini_apps``). It attaches the web UI to the framework's ``settings_app`` and
   runs the :class:`~reachy_mini_live_chat.pipeline.Pipeline` until the daemon stops it.
-* :func:`cli` — a self-contained dev runner (``reachy-mini-live-chat --sim --stub``) that
-  works without the daemon and even without the SDK installed.
+* :func:`cli` — a standalone runner (``reachy-mini-live-chat``) that connects to the
+  Reachy Mini daemon directly, without the app framework.
 """
 from __future__ import annotations
 
@@ -15,26 +15,11 @@ import sys
 import threading
 import time
 
+from reachy_mini import ReachyMini, ReachyMiniApp
+
 from .config import Config
 
 log = logging.getLogger("live_chat")
-
-# The SDK base class is only needed when running under the daemon. Fall back to a shim
-# so this module (and `cli`) import fine on a machine without `reachy_mini`.
-try:
-    from reachy_mini import ReachyMini, ReachyMiniApp  # type: ignore
-    _HAS_SDK = True
-except Exception:  # pragma: no cover - depends on environment
-    _HAS_SDK = False
-
-    class ReachyMiniApp:  # minimal shim
-        custom_app_url = None
-        dont_start_webserver = False
-        request_media_backend = None
-        settings_app = None
-
-        def __init__(self, running_on_wireless: bool = False) -> None:
-            self.running_on_wireless = running_on_wireless
 
 
 def _setup_logging() -> None:
@@ -82,36 +67,8 @@ class LiveChatApp(ReachyMiniApp):
 
 
 # ---------------------------------------------------------------------------
-# Standalone dev runner
+# Standalone runner
 # ---------------------------------------------------------------------------
-def _make_mini(cfg: Config):
-    if cfg.sim:
-        from .sim import FakeMini
-
-        log.info("using FakeMini (sim)")
-        return FakeMini()
-    if not _HAS_SDK:
-        raise SystemExit("reachy_mini SDK not installed; use --sim for hardware-free dev.")
-    log.info("connecting to Reachy Mini daemon...")
-    return ReachyMini()
-
-
-def _maybe_start_fake_omni(cfg: Config):
-    """In --stub mode, run a local fake omni server and point the client at it.
-
-    Returns a stop callable (or None). Lets the *real* OmniClient path run end-to-end
-    with no GPU server.
-    """
-    if not cfg.stub:
-        return None
-    from .omni.fake_server import serve_in_thread
-
-    _thread, stop, port = serve_in_thread(out_sr=cfg.omni_out_sr)
-    cfg.omni_ws_url = f"ws://127.0.0.1:{port}/backend"
-    log.info("stub: fake omni server on %s", cfg.omni_ws_url)
-    return stop
-
-
 def _serve_web(pipeline, cfg: Config):
     """Start uvicorn in a daemon thread; return the Server (or None if unavailable)."""
     try:
@@ -142,16 +99,12 @@ def _stdin_loop(pipeline) -> None:
 def cli(argv=None) -> None:
     _setup_logging()
     parser = argparse.ArgumentParser(prog="reachy-mini-live-chat", description=LiveChatApp.__doc__)
-    parser.add_argument("--sim", action="store_true", help="use the mock robot (no hardware/daemon)")
-    parser.add_argument("--stub", action="store_true", help="stub engines (no ML models) — wiring/demo only")
     parser.add_argument("--no-web", action="store_true", help="disable the web UI (headless, stdin)")
     parser.add_argument("--lang", choices=["auto", "zh", "en"], help="force conversation language")
     parser.add_argument("--port", type=int, help="web UI port")
     args = parser.parse_args(argv)
 
     cfg = Config.load()
-    cfg.sim = args.sim
-    cfg.stub = args.stub
     if args.lang:
         cfg.lang = args.lang
     if args.port:
@@ -161,9 +114,8 @@ def cli(argv=None) -> None:
 
     from .pipeline import Pipeline
 
-    stop_fake = _maybe_start_fake_omni(cfg)
-    mini = _make_mini(cfg)
-    with mini:
+    log.info("connecting to Reachy Mini daemon...")
+    with ReachyMini() as mini:
         pipeline = Pipeline(mini, cfg)
         server = _serve_web(pipeline, cfg) if cfg.web_ui else None
         pipeline.start()
@@ -178,17 +130,12 @@ def cli(argv=None) -> None:
         finally:
             log.info("shutting down...")
             pipeline.shutdown()
-            if stop_fake:
-                stop_fake()
 
 
 if __name__ == "__main__":
     # When launched by the daemon: `python -u -m reachy_mini_live_chat.main`
-    if _HAS_SDK and "--sim" not in sys.argv and "--stub" not in sys.argv:
-        app = LiveChatApp()
-        try:
-            app.wrapped_run()
-        except KeyboardInterrupt:
-            app.stop()
-    else:
-        cli()
+    app = LiveChatApp()
+    try:
+        app.wrapped_run()
+    except KeyboardInterrupt:
+        app.stop()

@@ -6,7 +6,6 @@
   thread that streams 1 s audio chunks (+ a video frame) up and dispatches text /
   audio / listen / done events to a sink.
 * :mod:`.video` — :class:`VideoGrabber`, camera frame → downscaled base64 JPEG.
-* :mod:`.fake_server` — a tiny local omni server for ``--stub`` / tests.
 """
 from .protocol import (
     OmniEvent,
