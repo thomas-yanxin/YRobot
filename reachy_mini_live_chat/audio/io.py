@@ -305,10 +305,18 @@ class AudioEngine:
                     self.bus.speech_level = 0.0
                     self.bus.emit("system", {"text": "spoke"})
                     self._turn_start = None  # reset pacing for the next spoken turn
-                # Safety net: never let a barge-in interrupt persist into an idle gap —
-                # otherwise the next reply's audio would be dropped by _play_chunk.
+                # Safety net for a STALE interrupt only. The interrupt must stay up for
+                # the user's whole barge utterance (it gates force_listen + downlink
+                # discard); clearing it just because playback drained — as this net
+                # once did — re-opened the door for the old reply ~0.35 s after the
+                # cut ("pauses, then keeps talking"). Normal clearing is the VAD's
+                # speech-end hook; this only catches a wedged VAD via a 10 s cap.
                 if self.bus.interrupt_event.is_set() and not self.bus.robot_speaking.is_set():
-                    self.bus.clear_interrupt()
+                    if not self.bus.user_speaking.is_set():
+                        self.bus.clear_interrupt()
+                    elif time.monotonic() - self.bus.interrupt_since > 10.0:
+                        log.warning("barge-in interrupt active >10 s (VAD wedged?) — clearing")
+                        self.bus.clear_interrupt()
                 continue
             if item is None:  # end-of-turn sentinel
                 idle_since = time.monotonic()

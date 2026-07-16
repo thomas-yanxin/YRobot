@@ -110,8 +110,8 @@ class Pipeline:
         self._end_turn(reset_state=True)
 
     def on_text(self, text: str) -> None:
-        if self._discard_turn:
-            return  # remainder of a barge-interrupted reply — drop it
+        if self._discard_turn or self.bus.interrupt_event.is_set():
+            return  # barge-interrupted reply (or barge still in progress) — drop it
         self._begin_speaking()
         shown = clean_spoken(text)
         if shown:
@@ -122,21 +122,31 @@ class Pipeline:
         # Queue raw omni audio (float32 at omni_out_sr); the playback thread resamples to
         # the device rate. Keeping the WS receive thread free of resampling avoids choppy
         # speech on the CM4.
-        if self._discard_turn:
-            return  # remainder of a barge-interrupted reply — drop it
+        if self._discard_turn or self.bus.interrupt_event.is_set():
+            return  # barge-interrupted reply (or barge still in progress) — drop it
         self._begin_speaking()
         arr = np.asarray(pcm, dtype=np.float32)
         if len(arr):
             self.bus.tts_audio.put(arr)
 
     def on_listen(self) -> None:
-        # Model chose to listen this step: a turn boundary — any barge-interrupted
-        # reply is over, so stop discarding and end the spoken turn.
+        # This omni server emits listen/done at its ~1 Hz step cadence, NOT once per
+        # conversational turn (verified on hardware: done≈1/s while speaking). During
+        # an active barge-in every force_listen chunk produces a listen step — if those
+        # cleared the discard latch, the old reply's still-streaming audio would resume
+        # the moment one slipped in ("pauses, then keeps talking"). Only a boundary
+        # seen AFTER the user finished their barge utterance ends the discard.
+        if self.bus.interrupt_event.is_set():
+            return
         self._discard_turn = False
         if self._speaking:
             self._end_turn()
 
     def on_turn_done(self, full_text: str) -> None:
+        if self.bus.interrupt_event.is_set():
+            # step boundary in the middle of a barge-in: keep discarding
+            self._end_turn()
+            return
         discarded = self._discard_turn
         self._discard_turn = False
         if discarded:
@@ -153,13 +163,13 @@ class Pipeline:
 
     # -- state helpers ------------------------------------------------------
     def _begin_speaking(self) -> None:
+        # Only reached with interrupt_event clear (on_text/on_audio gate on it), so a
+        # new reply never has to clear the flag itself — clearing here would race a
+        # barge-in that fired between the gate and this call. Stale-flag recovery
+        # lives in the playback loop's safety net + the VAD's speech-end hook.
         if not self._speaking:
             self._speaking = True
             self._turn_text = ""
-            # A new reply is starting, so any earlier barge-in is over. Drop a stale
-            # interrupt flag here or the playback path would silently discard this
-            # reply's audio ("occasionally no reply").
-            self.bus.clear_interrupt()
             self.bus.set_state(ConvState.SPEAKING)
 
     def _end_turn(self, reset_state: bool = False) -> None:

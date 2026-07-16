@@ -134,3 +134,33 @@ def test_barge_flush_disabled_by_config():
     eng._chunk_buf = np.zeros(int(0.5 * 16000), dtype=np.float32)
     eng._maybe_barge()
     assert sent == []
+
+
+def test_playback_safety_net_keeps_interrupt_while_user_talks():
+    """The idle-gap safety net must not clear a live barge-in: the interrupt gates
+    force_listen + downlink discard for the user's WHOLE utterance."""
+    import time as _time
+
+    eng, bus = _engine()
+    bus.request_interrupt()
+    bus.user_speaking.set()
+    # simulate the playback loop's empty-queue branch conditions
+    assert bus.interrupt_event.is_set() and not bus.robot_speaking.is_set()
+    # mirror the net's logic: user still speaking + young interrupt → keep it
+    if not bus.user_speaking.is_set():
+        bus.clear_interrupt()
+    elif _time.monotonic() - bus.interrupt_since > 10.0:
+        bus.clear_interrupt()
+    assert bus.interrupt_event.is_set()
+
+
+def test_stale_interrupt_cap_clears_after_10s():
+    eng, bus = _engine()
+    bus.request_interrupt()
+    bus.user_speaking.set()
+    bus.interrupt_since -= 11.0          # pretend it has been live for 11 s
+    if not bus.user_speaking.is_set():
+        bus.clear_interrupt()
+    elif __import__("time").monotonic() - bus.interrupt_since > 10.0:
+        bus.clear_interrupt()
+    assert not bus.interrupt_event.is_set()

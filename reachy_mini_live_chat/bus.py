@@ -56,6 +56,7 @@ class Bus:
         # --- lifecycle events ----------------------------------------------
         self.stop_event = threading.Event()      # global shutdown
         self.interrupt_event = threading.Event()  # abort current reply (barge-in)
+        self.interrupt_since: float = 0.0         # monotonic time the interrupt was raised
         self.user_speaking = threading.Event()    # VAD says a human is talking now
         self.robot_speaking = threading.Event()   # TTS/audio-out is active now
 
@@ -112,6 +113,7 @@ class Bus:
     # -- barge-in -----------------------------------------------------------
     def request_interrupt(self) -> None:
         """Signal every producer to abandon the current reply immediately."""
+        self.interrupt_since = time.monotonic()
         self.interrupt_event.set()
         self.set_state(ConvState.INTERRUPTED)
         # drop anything queued for the mouth (and still the talking wobble)
