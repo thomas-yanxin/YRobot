@@ -117,6 +117,9 @@ class Config:
     omni_respeaker_config: bool = field(default_factory=lambda: _flag("OMNI_RESPEAKER_CONFIG", True))
 
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
+    # Diagnostics: when set to a file path, every uplink chunk (exactly what the model
+    # hears) is appended as raw s16le mono 16 kHz. Play: ffplay -f s16le -ar 16000 -i <path>
+    omni_dump_uplink: str = field(default_factory=lambda: _env("OMNI_DUMP_UPLINK", ""))
     # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real
     # time. The cushion absorbs CPU/scheduling jitter on the CM4 so speech doesn't stutter;
     # pacing to the cushion keeps latency bounded if the server produces audio fast.

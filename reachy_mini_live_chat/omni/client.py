@@ -45,9 +45,20 @@ class OmniClient:
         self._turn_text: dict[str, str] = {}
         # rolling 5 s telemetry so "no response" is diagnosable from one run:
         # is the mic reaching us (uplink rms), and what is the server sending back?
-        self._stats = {"up": 0, "up_rms": 0.0, "drop": 0, "text": 0, "audio": 0, "listen": 0, "done": 0, "barge": 0}
+        self._stats = {"up": 0, "up_rms": 0.0, "up_rms_max": 0.0, "drop": 0, "text": 0, "audio": 0, "listen": 0, "done": 0, "barge": 0}
         self._seen_other: set = set()  # unrecognized event (type, kind) — logged once each
         self._clean_close = False      # last session ended via a server session.closed
+        # Diagnostics: dump exactly what we send to the model (raw s16le mono 16 kHz)
+        # so "the robot doesn't reply" can be split into server-side vs our-audio-side.
+        self._dump_f = None
+        if getattr(cfg, "omni_dump_uplink", ""):
+            try:
+                self._dump_f = open(cfg.omni_dump_uplink, "ab")
+                log.info("omni: dumping uplink audio to %s — play with: "
+                         "ffplay -f s16le -ar 16000 -i %s",
+                         cfg.omni_dump_uplink, cfg.omni_dump_uplink)
+            except Exception as e:
+                log.warning("omni: cannot open OMNI_DUMP_UPLINK file: %s", e)
 
     # -- public API (called from other threads) -----------------------------
     def set_frame_source(self, fn: FrameSource) -> None:
@@ -55,6 +66,14 @@ class OmniClient:
 
     def submit_audio_chunk(self, pcm: np.ndarray) -> None:
         """Enqueue a ~1 s mono float32 16 kHz chunk (drops oldest if backed up)."""
+        if self._dump_f is not None:
+            try:
+                self._dump_f.write(
+                    (np.clip(np.asarray(pcm, dtype=np.float32), -1.0, 1.0) * 32767.0)
+                    .astype("<i2").tobytes()
+                )
+            except Exception:
+                pass
         try:
             self._audio_q.put_nowait(pcm)
         except queue.Full:
@@ -184,8 +203,8 @@ class OmniClient:
             playq = self.bus.tts_audio.qsize()  # unplayed audio backlog (→ choppy if it grows)
             if n or s["text"] or s["audio"] or s["listen"] or s["done"]:
                 log.info(
-                    "omni 5s: uplink=%d chunks (mic rms~%.4f, dropped=%d, force_listen=%d) | downlink text=%d audio=%d listen=%d done=%d | playq=%d",
-                    n, (s["up_rms"] / n if n else 0.0), s["drop"], s["barge"], s["text"], s["audio"], s["listen"], s["done"], playq,
+                    "omni 5s: uplink=%d chunks (mic rms~%.4f peak~%.4f, dropped=%d, force_listen=%d) | downlink text=%d audio=%d listen=%d done=%d | playq=%d",
+                    n, (s["up_rms"] / n if n else 0.0), s["up_rms_max"], s["drop"], s["barge"], s["text"], s["audio"], s["listen"], s["done"], playq,
                 )
                 if playq > 25:
                     # Long replies stream in bursts (generation outruns real-time playback),
@@ -236,7 +255,9 @@ class OmniClient:
             if force_listen:
                 self._stats["barge"] += 1
             if len(chunk):
-                self._stats["up_rms"] += float(np.sqrt(np.mean(np.asarray(chunk, dtype=np.float64) ** 2)))
+                rms = float(np.sqrt(np.mean(np.asarray(chunk, dtype=np.float64) ** 2)))
+                self._stats["up_rms"] += rms
+                self._stats["up_rms_max"] = max(self._stats["up_rms_max"], rms)
 
     async def _next_chunk(self):
         """Await the next audio chunk, coalescing a backlog to stay real-time."""
