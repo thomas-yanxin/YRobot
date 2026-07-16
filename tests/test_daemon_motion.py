@@ -47,7 +47,9 @@ class _OldMini:
 
 
 def test_modern_sdk_enables_daemon_features():
-    ctl = MotionController(_ModernMini(), Config(), Bus())
+    cfg = Config()
+    cfg.enable_face_tracking = True  # off by default (CPU/camera cost on the CM4)
+    ctl = MotionController(_ModernMini(), cfg, Bus())
     ctl.start()
     assert ctl._daemon_wobble is True
     assert ctl._face_tracking is True

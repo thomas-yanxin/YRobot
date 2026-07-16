@@ -121,7 +121,7 @@ Open the web UI at <http://localhost:8042> for the live transcript, camera view,
 | `OMNI_BARGE_FLUSH` | ship the partial chunk + `force_listen` the instant a barge-in fires | `1` |
 | `VAD_SILENCE_MS` | silence marking end of human speech (DOA/barge-in) | `320` |
 | `ENABLE_MOTION` / `ENABLE_DOA` / `OMNI_RESPEAKER_CONFIG` | feature toggles | `1` / `1` / `1` |
-| `ENABLE_DAEMON_WOBBLE` / `ENABLE_FACE_TRACKING` | daemon-native wobble / face tracking (auto-detect) | `1` / `1` |
+| `ENABLE_DAEMON_WOBBLE` / `ENABLE_FACE_TRACKING` | daemon-native wobble / face tracking (tracking is CPU+camera heavy on the CM4) | `1` / `0` |
 | `LANG` | `auto` \| `zh` \| `en` | `auto` |
 
 ## Architecture

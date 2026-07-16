@@ -111,16 +111,21 @@ class AudioEngine:
         except Exception:
             pass
         self._play_sub_n = max(1, int(self._out_sr * self.cfg.omni_playback_chunk_ms / 1000))
+        # Tune the ReSpeaker XVF3800 (hardware AEC/NS/AGC) twice: once BEFORE the media
+        # pipelines start (the known-good order on this hardware) and once ~1 s AFTER
+        # (the official app's timing — (re)opening the audio device can reset the chip).
+        # Writes are idempotent; the post-start pass retries because a busy chip right
+        # after pipeline start can fail a parameter (seen on hardware: "1 failed
+        # parameter(s)" → mic level/NS off → the model hears background and never
+        # replies). Done synchronously, before the capture thread's DoA USB polling.
+        tune = getattr(self.cfg, "omni_respeaker_config", True)
+        if tune:
+            apply_startup_config(self.mini)
         self.mini.media.start_recording()
         self.mini.media.start_playing()
-        # Tune the ReSpeaker XVF3800 (hardware AEC/NS/AGC) AFTER the media pipelines are
-        # up — the official app writes it ~1 s after pipeline start, because (re)opening
-        # the audio device can reset the chip to defaults. Writing before start_recording
-        # risks the tuning being clobbered, leaving echo/AGC at chip defaults. Done here
-        # synchronously (before the capture thread's DoA polling touches USB).
-        if getattr(self.cfg, "omni_respeaker_config", True):
-            time.sleep(0.5)  # let the pipelines settle, mirroring the official app
-            apply_startup_config(self.mini)
+        if tune:
+            time.sleep(1.0)  # let the pipelines settle, mirroring the official app
+            apply_startup_config(self.mini, attempts=3)
         for target in (self._capture_loop, self._playback_loop):
             t = threading.Thread(target=target, name=target.__name__, daemon=True)
             t.start()
@@ -305,10 +310,18 @@ class AudioEngine:
                     self.bus.speech_level = 0.0
                     self.bus.emit("system", {"text": "spoke"})
                     self._turn_start = None  # reset pacing for the next spoken turn
-                # Safety net: never let a barge-in interrupt persist into an idle gap —
-                # otherwise the next reply's audio would be dropped by _play_chunk.
+                # Safety net for a STALE interrupt only. The interrupt must stay up for
+                # the user's whole barge utterance (it gates force_listen + downlink
+                # discard); clearing it just because playback drained — as this net
+                # once did — re-opened the door for the old reply ~0.35 s after the
+                # cut ("pauses, then keeps talking"). Normal clearing is the VAD's
+                # speech-end hook; this only catches a wedged VAD via a 10 s cap.
                 if self.bus.interrupt_event.is_set() and not self.bus.robot_speaking.is_set():
-                    self.bus.clear_interrupt()
+                    if not self.bus.user_speaking.is_set():
+                        self.bus.clear_interrupt()
+                    elif time.monotonic() - self.bus.interrupt_since > 10.0:
+                        log.warning("barge-in interrupt active >10 s (VAD wedged?) — clearing")
+                        self.bus.clear_interrupt()
                 continue
             if item is None:  # end-of-turn sentinel
                 idle_since = time.monotonic()
