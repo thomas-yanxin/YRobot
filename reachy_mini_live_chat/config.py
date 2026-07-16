@@ -120,6 +120,12 @@ class Config:
     # force_listen) instead of waiting for the 1 s chunk boundary — the server learns
     # about the interruption up to ~1 s sooner, so it stops generating sooner.
     omni_barge_flush: bool = field(default_factory=lambda: _flag("OMNI_BARGE_FLUSH", True))
+    # While the robot speaks, scale the uplink by this factor UNLESS the local VAD says
+    # a human is talking (then full level + force_listen). The hardware AEC leaves a
+    # residual of the robot's own voice (~0.03-0.08 rms with the 2x mic gain); the omni
+    # model hears that as a faint user and yields the floor mid-sentence — the "stops
+    # talking halfway with nobody interrupting" symptom. 1.0 disables ducking.
+    omni_duck_while_speaking: float = field(default_factory=lambda: _float("OMNI_DUCK_WHILE_SPEAKING", 0.4))
 
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
     # Diagnostics: when set to a file path, every uplink chunk (exactly what the model

@@ -89,6 +89,7 @@ class AudioEngine:
             UplinkAgc(cfg.omni_mic_agc_target, cfg.omni_mic_agc_max_gain)
             if getattr(cfg, "omni_mic_agc", True) else None
         )
+        self._duck = float(getattr(cfg, "omni_duck_while_speaking", 1.0) or 1.0)
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # playback pacing (set once out_sr is known in start())
@@ -181,7 +182,11 @@ class AudioEngine:
                 if self._agc is not None:
                     self._agc.update(mic, self.endpointer.in_speech)
                     mic = self._agc.apply(mic)
-                self._accumulate(mic)
+                # Duck the uplink while the robot speaks: the AEC residual of its own
+                # voice otherwise reads as a faint user to the omni model, which then
+                # yields the floor mid-sentence. A confirmed human (VAD in_speech)
+                # goes up at full level — barge-in is unaffected (plus force_listen).
+                self._accumulate(mic * self._duck_factor())
             time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
 
     def _poll_hw_doa(self, now: float) -> None:
@@ -235,6 +240,14 @@ class AudioEngine:
         # message of its own — the next full chunk is imminent.
         if getattr(self.cfg, "omni_barge_flush", True):
             self._flush_uplink(min_ms=120)
+
+    def _duck_factor(self) -> float:
+        """Uplink attenuation for this capture batch (1.0 = none)."""
+        if self._duck >= 1.0:
+            return 1.0
+        if self.bus.robot_speaking.is_set() and not self.endpointer.in_speech:
+            return self._duck
+        return 1.0
 
     def _flush_uplink(self, min_ms: int = 120) -> None:
         """Send the partially-accumulated uplink chunk immediately (barge-in path)."""

@@ -179,3 +179,23 @@ def test_speech_end_flushes_uplink_tail():
     assert not bus.user_speaking.is_set()
     assert len(sent) == 1 and len(sent[0]) == int(0.4 * 16000)
     assert bus.lat.get("t_end") == bus.pending_t_end
+
+
+def test_uplink_ducked_while_robot_speaks():
+    """The AEC residual of the robot's own voice must not reach the model at full
+    level — it reads as a faint user and the model stops talking mid-sentence."""
+    eng, bus = _engine()
+    assert eng._duck_factor() == 1.0            # idle: no ducking
+    bus.robot_speaking.set()
+    assert eng._duck_factor() == eng._duck < 1.0  # robot talking, nobody else: duck
+    eng.endpointer._in_speech = True
+    assert eng._duck_factor() == 1.0            # confirmed human: full level (barge)
+
+
+def test_duck_disabled_by_config():
+    cfg = Config()
+    cfg.omni_duck_while_speaking = 1.0
+    bus = Bus()
+    eng = AudioEngine(_Mini((1.57, True)), cfg, bus, on_audio_chunk=lambda c: None)
+    bus.robot_speaking.set()
+    assert eng._duck_factor() == 1.0
