@@ -102,7 +102,7 @@ class Pipeline:
     def on_connected(self) -> None:
         self.bus.emit("system", {"text": "omni connected"})
         # a small welcoming gesture (no spoken greeting: TTS is the model's job)
-        self._enqueue_emotion("welcoming1")
+        self._enqueue_emotion("greeting")
 
     def on_disconnected(self, reason: str) -> None:
         self.bus.emit("system", {"text": f"omni disconnected: {reason}"})

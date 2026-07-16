@@ -177,6 +177,15 @@ class Config:
     # -- Motion --------------------------------------------------------------
     enable_motion: bool = field(default_factory=lambda: _flag("ENABLE_MOTION", True))
     enable_doa: bool = field(default_factory=lambda: _flag("ENABLE_DOA", True))
+    # Daemon-native speech wobble (mini.enable_wobbling): the daemon taps the playback
+    # pipeline and composes head offsets synced to the *actual* audio clock — better
+    # than our app-level approximation. Auto-detected; falls back to the app-level
+    # oscillators when the SDK doesn't have it.
+    enable_daemon_wobble: bool = field(default_factory=lambda: _flag("ENABLE_DAEMON_WOBBLE", True))
+    # Daemon-native visual face tracking (mini.start_head_tracking): the robot looks
+    # at the person even when nobody is talking. Paused (weight 0) while the robot
+    # speaks so the speech wobble owns the head, like the official app. Auto-detected.
+    enable_face_tracking: bool = field(default_factory=lambda: _flag("ENABLE_FACE_TRACKING", True))
     emotions_dataset: str = field(default_factory=lambda: _env("EMOTIONS_DATASET", "pollen-robotics/reachy-mini-emotions-library"))
     # 30 Hz keeps set_target IPC light on the CM4 (each call competes with gstreamer +
     # the daemon); the EMA smoothing keeps motion fluid at this rate. Raise on a laptop.

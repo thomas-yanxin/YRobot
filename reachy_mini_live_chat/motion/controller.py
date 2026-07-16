@@ -80,6 +80,12 @@ class MotionController:
         # subtle emotion locally (the official app runs the same LLM-free idle policy).
         self._last_active = self._t0
         self._idle_emo_next: Optional[float] = None
+        # Daemon-native features (detected in start()). When the daemon wobbles the
+        # head for us we keep only the antenna motion; when it face-tracks, tracking
+        # is paused (weight 0) while the robot speaks so the wobble owns the head.
+        self._daemon_wobble = False
+        self._face_tracking = False
+        self._tracking_paused = False
         # effective-rate telemetry
         self._rate_t0 = self._t0
         self._rate_n = 0
@@ -93,10 +99,38 @@ class MotionController:
             self.mini.enable_motors()
         except Exception:
             pass
+        self._daemon_wobble = self._try_daemon("enable_wobbling", self.cfg.enable_daemon_wobble)
+        self._face_tracking = self._try_daemon(
+            "start_head_tracking", self.cfg.enable_face_tracking, 1.0
+        )
+        if self._daemon_wobble:
+            log.info("motion: daemon head wobbler active (app-level speech wobble off)")
+        if self._face_tracking:
+            log.info("motion: daemon face tracking active")
         self._thread = threading.Thread(target=self._loop, name="motion", daemon=True)
         self._thread.start()
 
+    def _try_daemon(self, method: str, enabled: bool, *args) -> bool:
+        """Call an optional daemon-side feature; False when absent or failing."""
+        if not enabled:
+            return False
+        fn = getattr(self.mini, method, None)
+        if not callable(fn):
+            log.info("motion: SDK has no %s — using app-level fallback", method)
+            return False
+        try:
+            fn(*args)
+            return True
+        except Exception as e:
+            log.warning("motion: %s failed (%s) — using app-level fallback", method, e)
+            return False
+
     def join(self) -> None:
+        # Best-effort teardown of the daemon-side features we turned on.
+        if self._daemon_wobble:
+            self._try_daemon("disable_wobbling", True)
+        if self._face_tracking:
+            self._try_daemon("stop_head_tracking", True)
         if self._thread:
             self._thread.join(timeout=1.0)
 
@@ -117,10 +151,13 @@ class MotionController:
                     self._doa_yaw = y
 
     def _begin_emotion(self, name: str, intensity: float) -> None:
-        move = self.emotions.get(name)
-        dur = float(getattr(move, "duration", 0.0) or 0.0) if move is not None else _PROC_DUR.get(name, 0.9)
-        self._active_move = (move, name, time.monotonic(), max(0.3, dur), intensity)
-        self.bus.emit("emotion", {"name": name})
+        # `name` may be an intent ("happy") or a concrete clip ("laughing2"): resolve
+        # picks randomly among the intent's available clips so gestures vary.
+        clip = self.emotions.resolve(name)
+        move = self.emotions.get(clip)
+        dur = float(getattr(move, "duration", 0.0) or 0.0) if move is not None else _PROC_DUR.get(_base(clip), 0.9)
+        self._active_move = (move, clip, time.monotonic(), max(0.3, dur), intensity)
+        self.bus.emit("emotion", {"name": clip})
 
     # -- main loop ----------------------------------------------------------
     def _loop(self) -> None:
@@ -129,6 +166,7 @@ class MotionController:
             tick = time.monotonic()
             try:
                 self._drain_intents()
+                self._update_tracking_pause()
                 self._poll_doa(tick)
                 head, antennas, body_yaw = self._compute(tick)
                 head = self._smooth_head(safety.clamp_head_pose(head))
@@ -141,6 +179,24 @@ class MotionController:
                 log.debug("motion tick error: %s", e)
             elapsed = time.monotonic() - tick
             time.sleep(max(0.0, dt - elapsed))
+
+    def _update_tracking_pause(self) -> None:
+        """Pause face tracking (weight 0) while the robot speaks, resume after.
+
+        At weight 1 the daemon's tracker owns the head orientation, which would
+        suppress the speech wobble; the official app makes the same speak-time
+        handoff. Our DOA yaw (held during the reply) keeps facing the person.
+        """
+        if not self._face_tracking:
+            return
+        speaking = self.bus.robot_speaking.is_set()
+        if speaking == self._tracking_paused:
+            return
+        try:
+            self.mini.start_head_tracking(0.0 if speaking else 1.0)
+            self._tracking_paused = speaking
+        except Exception as e:
+            log.debug("start_head_tracking toggle failed: %s", e)
 
     # -- output smoothing ---------------------------------------------------
     def _smooth_antennas(self, antennas) -> list:
@@ -308,18 +364,23 @@ class MotionController:
         return (roll, pitch, yaw, 0.0), ant
 
     def _speaking(self, t: float):
-        # Voice-synced wobble, matching the official head-wobbler oscillator bank:
+        # Voice-synced wobble. When the daemon's head wobbler is active it composes
+        # PTS-accurate head offsets on top of whatever we command, so we hold the head
+        # still (DOA yaw is blended in by _compute) and animate only the antennas.
+        lvl = self._speech_lvl
+        w = 2 * math.pi
+        wig = math.radians((2.0 + 10.0 * lvl) * math.sin(w * 2.0 * t + self._ph[4]))
+        ant = [wig, -wig]
+        if self._daemon_wobble:
+            return (0.0, 0.0, 0.0, 0.0), ant
+        # App-level fallback, matching the official head-wobbler oscillator bank:
         # slow independent sinusoids per axis (random per-session phases), amplitude
         # scaled by the played speech envelope — the head moves WITH the words and
         # stills in the silence between sentences. A small base keeps a pulse of life.
-        lvl = self._speech_lvl
-        w = 2 * math.pi
         pitch = (0.6 + 4.5 * lvl) * math.sin(w * 2.2 * t + self._ph[0])
         yaw = (0.8 + 7.5 * lvl) * math.sin(w * 0.6 * t + self._ph[1])
         roll = (0.4 + 2.25 * lvl) * math.sin(w * 1.3 * t + self._ph[2])
         z = 0.00225 * lvl * math.sin(w * 0.25 * t + self._ph[3])
-        wig = math.radians((2.0 + 10.0 * lvl) * math.sin(w * 2.0 * t + self._ph[4]))
-        ant = [wig, -wig]
         return (roll, pitch, yaw, z), ant
 
     def _emotion_pose(self, move, name: str, t: float, dur: float, intensity: float):
@@ -337,33 +398,46 @@ class MotionController:
         return _head_pose(roll, pitch, yaw), ant, None
 
 
-# Subtle gestures suitable for unprompted long-idle "signs of life".
-_IDLE_EMOTIONS = ["curious1", "thoughtful1", "attentive1", "calming1"]
+# Subtle gestures suitable for unprompted long-idle "signs of life" (intents).
+_IDLE_EMOTIONS = ["thinking", "attentive", "calming", "bored"]
+
+
+def _base(name: str) -> str:
+    """Clip name → intent family ("laughing2" → "laughing") for procedural matching."""
+    return (name or "").rstrip("0123456789")
+
 
 # ---- procedural gestures (used when the emotion library isn't available) ----
+# Keyed by intent family (see _base); duration in seconds.
 _PROC_DUR = {
-    "yes1": 1.0, "no1": 1.1, "curious1": 1.2, "confused1": 1.2, "surprised1": 0.9,
-    "cheerful1": 1.2, "laughing1": 1.4, "welcoming1": 1.3, "thoughtful1": 1.4,
+    "yes": 1.0, "no": 1.1, "confused": 1.2, "thoughtful": 1.4, "surprised": 0.9,
+    "laughing": 1.4, "welcoming": 1.3, "sad": 1.3, "grateful": 1.2,
 }
+
+_TILT = ("confused", "thoughtful", "uncertain", "thinking", "attentive", "boredom", "bored")
+_BOUNCY = ("laughing", "happy", "dance", "excited", "success")
+_DROOP = ("sad", "downcast", "lonely", "exhausted", "sleep", "tired")
+_WARM = ("welcoming", "grateful", "loving", "greeting", "calming", "helpful", "relief")
 
 
 def _procedural(name: str, t: float, dur: float, k: float):
+    fam = _base(name)
     p = t / dur  # 0..1
     env = math.sin(math.pi * min(1.0, p))  # ease in/out
-    if name == "yes1":  # nod
+    if fam == "yes" or fam == "understanding":  # nod
         return (0.0, 22 * env * math.sin(2 * math.pi * 2 * t) * k, 0.0), [math.radians(30 * env), math.radians(30 * env)]
-    if name == "no1":   # shake
+    if fam.startswith("no"):   # shake (no, no_sad, no_excited)
         return (0.0, 0.0, 30 * env * math.sin(2 * math.pi * 2 * t) * k), [math.radians(-20 * env), math.radians(20 * env)]
-    if name in ("curious1", "confused1", "thoughtful1", "uncertain1"):  # tilt
+    if fam in _TILT:  # pondering tilt
         return (25 * env * k, -6 * env, 10 * env * math.sin(2 * math.pi * 0.8 * t)), [math.radians(-15 * env), math.radians(20 * env)]
-    if name in ("surprised1",):  # quick pull-back up
+    if fam in ("surprised", "amazed", "scared", "fear", "anxiety"):  # quick pull-back up
         return (0.0, -25 * env * k, 0.0), [math.radians(35 * env), math.radians(35 * env)]
-    if name in ("laughing1", "cheerful1", "enthusiastic1"):  # bouncy
+    if fam in _BOUNCY:  # bouncy
         return (6 * env * math.sin(2 * math.pi * 3 * t) * k, 10 * env * math.sin(2 * math.pi * 3 * t) * k, 0.0), \
                [math.radians(30 * env * math.sin(2 * math.pi * 4 * t)), math.radians(-30 * env * math.sin(2 * math.pi * 4 * t))]
-    if name in ("sad1", "sad2"):  # droop
+    if fam in _DROOP:  # droop
         return (0.0, 18 * env * k, 8 * env), [math.radians(-25 * env), math.radians(-25 * env)]
-    if name in ("welcoming1", "welcoming2", "grateful1"):  # warm sway
+    if fam in _WARM:  # warm sway
         return (10 * env * math.sin(2 * math.pi * 1.2 * t) * k, -4 * env, 12 * env * math.sin(2 * math.pi * 0.8 * t)), \
                [math.radians(25 * env), math.radians(25 * env)]
     # default: gentle acknowledging nod

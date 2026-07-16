@@ -31,13 +31,17 @@ local ML models. Design & rationale: see [`plan.md`](plan.md).
   `force_listen`, so the model stops generating up to ~1 s sooner than waiting for the chunk boundary.
 - **Uplink auto-gain** — speech is normalized toward a target level before it reaches the model
   (`OMNI_MIC_AGC`); too-quiet speech is the classic cause of "the robot hears me but never answers".
-- **DOA** — while you speak, the head (and body, past ±45°) turns toward your direction, using the
-  robot's mic-array `get_DoA()`, EMA-smoothed and clamped — and it *stays* on you for the whole reply.
-- **Speech-synced motion** — the talking wobble is driven by the played voice's loudness envelope
-  (dB-normalized, timestamp-aligned to actual playback, same oscillator bank as the official app's
-  head wobbler), so the head moves with the words and stills between sentences. Plus listening
-  backchannel nods, idle glances/breathing, and emotion gestures inferred from the transcript
-  (nod on "好的/yes", tilt on questions, …). **Every** command is clamped in `motion/safety.py`.
+- **Face tracking + DOA** — with a recent SDK the daemon's visual tracker keeps the head on the
+  person even in silence (paused while the robot replies, like the official app); mic-array
+  `get_DoA()` still turns head/body toward whoever speaks, and the orientation *stays* on you
+  for the whole reply.
+- **Speech-synced motion** — with a recent SDK the daemon's own head wobbler moves the head in
+  sync with the actual audio clock (`enable_wobbling()`, exactly the official mechanism); otherwise
+  an app-level fallback drives the same oscillator bank from the played voice's dB-normalized
+  loudness envelope, timestamp-aligned to playback. Plus listening backchannel nods, idle
+  glances/breathing, and emotion gestures inferred from the transcript using the official
+  42-intent → clip mapping (random clip per intent, so gestures vary). **Every** command is
+  clamped in `motion/safety.py`.
 - **Continuous vision** — one downscaled JPEG frame is attached to each audio chunk (~1 fps), so the
   model always has current visual context.
 
@@ -117,6 +121,7 @@ Open the web UI at <http://localhost:8042> for the live transcript, camera view,
 | `OMNI_BARGE_FLUSH` | ship the partial chunk + `force_listen` the instant a barge-in fires | `1` |
 | `VAD_SILENCE_MS` | silence marking end of human speech (DOA/barge-in) | `320` |
 | `ENABLE_MOTION` / `ENABLE_DOA` / `OMNI_RESPEAKER_CONFIG` | feature toggles | `1` / `1` / `1` |
+| `ENABLE_DAEMON_WOBBLE` / `ENABLE_FACE_TRACKING` | daemon-native wobble / face tracking (auto-detect) | `1` / `1` |
 | `LANG` | `auto` \| `zh` \| `en` | `auto` |
 
 ## Architecture
