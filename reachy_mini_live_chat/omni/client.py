@@ -220,13 +220,12 @@ class OmniClient:
             # the server past real time (→ backlog / choppy speech). Never in audio mode.
             want_frame = self._frame_source and send_video and (sent % every_n == 0)
             frame_b64 = self._frame_source() if want_frame else None
-            # Tell the SERVER to listen (stop any current turn) for the WHOLE time the human is
-            # talking — keyed on user_speaking, not interrupt_event. interrupt_event is cleared
-            # early (the playback safety-net drops it ~0.25 s after the local queue drains, often
-            # while the user is still mid-barge-in), so force_listen used to stop too soon and the
-            # server resumed its old turn → the reply arrived late. user_speaking stays set for
-            # the entire utterance, so the server yields promptly and replies as soon as you stop.
-            force_listen = self.bus.user_speaking.is_set()
+            # Barge-in: tell the SERVER to stop its current turn and listen. Keyed on
+            # interrupt_event (set only on a real barge-in, never at idle) so it can NEVER
+            # stick on — keying it on user_speaking made force_listen permanent whenever the
+            # local VAD got stuck "in speech", which forced the model to listen forever and it
+            # never replied.
+            force_listen = self.bus.interrupt_event.is_set()
             msg = protocol.build_input_append(chunk, frame_b64=frame_b64, force_listen=force_listen)
             await ws.send(json.dumps(msg))
             sent += 1
