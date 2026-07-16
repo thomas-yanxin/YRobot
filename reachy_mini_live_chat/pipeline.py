@@ -18,6 +18,7 @@ the **omni events** (text/audio → SPEAKING; listen/done → IDLE).
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import numpy as np
@@ -125,6 +126,9 @@ class Pipeline:
         if self._discard_turn or self.bus.interrupt_event.is_set():
             return  # barge-interrupted reply (or barge still in progress) — drop it
         self._begin_speaking()
+        lat = self.bus.lat
+        if "t_end" in lat and "recv" not in lat:
+            lat["recv"] = time.monotonic()  # first reply audio back from the server
         arr = np.asarray(pcm, dtype=np.float32)
         if len(arr):
             self.bus.tts_audio.put(arr)

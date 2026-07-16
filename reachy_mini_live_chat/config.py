@@ -126,10 +126,12 @@ class Config:
     # hears) is appended as raw s16le mono 16 kHz. Play: ffplay -f s16le -ar 16000 -i <path>
     omni_dump_uplink: str = field(default_factory=lambda: _env("OMNI_DUMP_UPLINK", ""))
     # Fixed software gain applied to the mic before the VAD + uplink (clipped to ±1).
-    # The XVF3800 does AGC in hardware, but if speech still reaches the model too quiet
-    # (uplink rms peak <~0.08 while talking → the model treats it as background and only
-    # listens), raise this to 2.0–4.0. Ratio-based VAD is unaffected by a constant gain.
-    omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
+    # The XVF3800 does AGC in hardware, but with the tuned PP_AGCMAXGAIN=10 speech
+    # reaches the model around ~0.1 rms peak — audibly quiet ("it mishears me").
+    # A constant 2x restores the level the model transcribed well at, and — unlike an
+    # adaptive AGC — cannot change the SNR or lock onto noise. Raise to 3–4 for a big
+    # room, set 1.0 to disable. The ratio-based VAD is unaffected by a constant gain.
+    omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 2.0))
     # Software AGC on the uplink only: measure the RMS of frames the VAD marks as speech
     # and scale the audio sent to the model so speech lands near OMNI_MIC_AGC_TARGET.
     # OFF by default: the XVF3800 already does AGC in hardware, and a software stage on

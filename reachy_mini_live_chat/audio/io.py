@@ -260,6 +260,11 @@ class AudioEngine:
         self.bus.user_speaking.clear()
         self.bus.pending_t_end = time.monotonic()
         self.bus.pending_measured = False
+        self.bus.lat = {"t_end": self.bus.pending_t_end}
+        # Ship the utterance tail NOW instead of letting it sit in the accumulator
+        # until the 1 s chunk boundary — that wait added ~0.5 s (mean) of pure
+        # dead time to every reply. Same mechanism as the barge-in flush.
+        self._flush_uplink(min_ms=200)
         # If we cut the robot off (barge-in), recover: allow future audio to play and
         # leave the INTERRUPTED state so motion stops the speaking wobble.
         if self.bus.interrupt_event.is_set() or self.bus.state == ConvState.INTERRUPTED:
@@ -332,11 +337,18 @@ class AudioEngine:
     def _play_chunk(self, chunk: np.ndarray) -> None:
         if self.bus.interrupt_event.is_set():
             return  # dropped: belongs to an interrupted turn
-        # first audio after the user stopped → stamp end-to-end latency
+        # first audio after the user stopped → stamp end-to-end latency + breakdown
         if not self.bus.pending_measured and self.bus.pending_t_end is not None:
             ms = self.bus.measure_e2e(self.bus.pending_t_end)
             self.bus.pending_measured = True
-            log.info("e2e latency (user stop → first audio): %.0f ms", ms)
+            lat, t0 = self.bus.lat, self.bus.pending_t_end
+            sent = (lat.get("sent", t0) - t0) * 1000.0
+            recv = (lat.get("recv", t0) - t0) * 1000.0
+            log.info(
+                "e2e latency (user stop → first audio): %.0f ms "
+                "[tail sent +%.0f | server replied +%.0f | playback +%.0f]",
+                ms, sent, max(0.0, recv - sent), max(0.0, ms - recv),
+            )
         self.bus.robot_speaking.set()
         chunk = _resample(chunk.astype(np.float32), self._tts_sr, self._out_sr)
         if self._turn_start is None:

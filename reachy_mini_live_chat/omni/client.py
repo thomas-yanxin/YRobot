@@ -17,6 +17,7 @@ import logging
 import queue
 import ssl
 import threading
+import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -261,6 +262,9 @@ class OmniClient:
             force_listen = self.bus.interrupt_event.is_set()
             msg = protocol.build_input_append(chunk, frame_b64=frame_b64, force_listen=force_listen)
             await ws.send(json.dumps(msg))
+            lat = self.bus.lat
+            if "t_end" in lat and "sent" not in lat:
+                lat["sent"] = time.monotonic()  # utterance tail is on the wire
             sent += 1
             self._stats["up"] += 1
             if force_listen:

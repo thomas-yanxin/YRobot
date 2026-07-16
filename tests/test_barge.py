@@ -164,3 +164,18 @@ def test_stale_interrupt_cap_clears_after_10s():
     elif __import__("time").monotonic() - bus.interrupt_since > 10.0:
         bus.clear_interrupt()
     assert not bus.interrupt_event.is_set()
+
+
+def test_speech_end_flushes_uplink_tail():
+    """End of user speech ships the partial chunk immediately — waiting for the 1 s
+    boundary added ~0.5 s of dead time to every reply."""
+    sent = []
+    cfg = Config()
+    bus = Bus()
+    eng = AudioEngine(_Mini((1.57, True)), cfg, bus, on_audio_chunk=sent.append)
+    bus.user_speaking.set()
+    eng._chunk_buf = np.zeros(int(0.4 * 16000), dtype=np.float32)  # 400 ms tail
+    eng._on_speech_end(np.zeros(1600, dtype=np.float32))
+    assert not bus.user_speaking.is_set()
+    assert len(sent) == 1 and len(sent[0]) == int(0.4 * 16000)
+    assert bus.lat.get("t_end") == bus.pending_t_end

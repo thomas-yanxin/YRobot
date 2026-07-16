@@ -54,12 +54,18 @@ class MotionController:
         self._t0 = time.monotonic()
 
         # Output smoothing: EMA the commanded antennas (and head rpy) so state changes
-        # and any control-loop jitter don't show up as jerky steps. Time constant is a
-        # few tens of ms at 100 Hz — smooth to the eye, still responsive for gestures.
+        # and any control-loop jitter don't show up as jerky steps. The alphas are
+        # derived each tick from the MEASURED tick interval (alpha = 1 - exp(-dt/tau)):
+        # on the CM4 the loop often runs below its target rate (set_target IPC under
+        # load), and a fixed alpha there turns irregular tick timing straight into
+        # irregular step sizes — visible jitter. Time-based smoothing keeps the
+        # commanded velocity consistent no matter the effective rate.
         self._ant_cmd = [0.0, 0.0]
         self._head_rpy_cmd = None     # (roll, pitch, yaw) degrees, smoothed
-        self._ant_alpha = 0.25
-        self._head_alpha = 0.35
+        self._ant_tau = 0.12          # seconds
+        self._head_tau = 0.09
+        self._tick_dt = 1.0 / max(20, cfg.control_hz)  # measured each loop iteration
+        self._last_tick: Optional[float] = None
         # Speech envelope (EMA of bus.speech_level): the talking wobble follows the
         # actual voice instead of a fixed metronome sine — silence between sentences
         # stills the head, stressed words move it. This is what makes it look alive.
@@ -86,9 +92,10 @@ class MotionController:
         self._daemon_wobble = False
         self._face_tracking = False
         self._tracking_paused = False
-        # effective-rate telemetry
+        # effective-rate telemetry (+ EMA of set_target IPC duration for attribution)
         self._rate_t0 = self._t0
         self._rate_n = 0
+        self._cmd_ms = 0.0
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -164,6 +171,10 @@ class MotionController:
         dt = 1.0 / max(20, self.cfg.control_hz)
         while not self.bus.stop_event.is_set():
             tick = time.monotonic()
+            if self._last_tick is not None:
+                # smooth the measured interval a little so one slow tick doesn't spike alpha
+                self._tick_dt += 0.3 * (min(0.25, tick - self._last_tick) - self._tick_dt)
+            self._last_tick = tick
             try:
                 self._drain_intents()
                 self._update_tracking_pause()
@@ -173,7 +184,9 @@ class MotionController:
                 antennas = self._smooth_antennas(safety.clamp_antennas(antennas))
                 if body_yaw is not None:
                     body_yaw = safety.clamp_body_yaw(body_yaw, safety.head_yaw_deg(head) * math.pi / 180.0)
+                t_cmd = time.monotonic()
                 self.mini.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
+                self._cmd_ms += ((time.monotonic() - t_cmd) * 1000.0 - self._cmd_ms) * 0.1
                 self._tick_rate(tick)
             except Exception as e:
                 log.debug("motion tick error: %s", e)
@@ -199,8 +212,12 @@ class MotionController:
             log.debug("start_head_tracking toggle failed: %s", e)
 
     # -- output smoothing ---------------------------------------------------
+    def _alpha(self, tau: float) -> float:
+        """EMA coefficient for the measured tick interval (rate-independent smoothing)."""
+        return 1.0 - math.exp(-self._tick_dt / max(1e-3, tau))
+
     def _smooth_antennas(self, antennas) -> list:
-        a = self._ant_alpha
+        a = self._alpha(self._ant_tau)
         for i in range(min(2, len(antennas))):
             self._ant_cmd[i] += a * (float(antennas[i]) - self._ant_cmd[i])
         return list(self._ant_cmd)
@@ -211,7 +228,7 @@ class MotionController:
         if self._head_rpy_cmd is None:
             self._head_rpy_cmd = [roll, pitch, yaw]
         else:
-            a = self._head_alpha
+            a = self._alpha(self._head_tau)
             cur = self._head_rpy_cmd
             cur[0] += a * (roll - cur[0])
             cur[1] += a * (pitch - cur[1])
@@ -227,7 +244,8 @@ class MotionController:
         if tick - self._rate_t0 >= 5.0:
             hz = self._rate_n / (tick - self._rate_t0)
             if hz < 0.8 * max(20, self.cfg.control_hz):
-                log.info("motion: effective control rate %.0f Hz (target %d Hz)", hz, self.cfg.control_hz)
+                log.info("motion: effective control rate %.0f Hz (target %d Hz, set_target ~%.0f ms/call)",
+                         hz, self.cfg.control_hz, self._cmd_ms)
             else:
                 log.debug("motion: effective control rate %.0f Hz", hz)
             self._rate_t0 = tick
@@ -273,7 +291,8 @@ class MotionController:
             env.popleft()
             self.bus.speech_level = lvl
         target_lvl = self.bus.speech_level if self.bus.robot_speaking.is_set() else 0.0
-        a = 0.5 if target_lvl > self._speech_lvl else 0.12
+        # fast attack (~50 ms), slow release (~250 ms) — rate-independent
+        a = self._alpha(0.05 if target_lvl > self._speech_lvl else 0.25)
         self._speech_lvl += a * (target_lvl - self._speech_lvl)
 
         state = self.bus.state

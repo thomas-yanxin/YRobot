@@ -81,6 +81,10 @@ class Bus:
         # thread reads this the moment it plays the first chunk to compute e2e latency.
         self.pending_t_end: Optional[float] = None
         self.pending_measured: bool = True
+        # Per-turn latency breakdown: t_end (VAD end of speech) → sent (tail chunk on
+        # the wire) → recv (first reply audio from the server) → played (first sample
+        # pushed). Each stage writes its own key once; reset at every speech end.
+        self.lat: dict = {}
 
         # --- UI event fan-out (SSE / logging) ------------------------------
         self._subscribers: list[Callable[[dict], None]] = []
