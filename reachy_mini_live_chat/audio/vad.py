@@ -171,6 +171,11 @@ class Endpointer:
         self._speech_ms_run = 0.0
         self._frame_ms = FRAME / 16000 * 1000.0
 
+    @property
+    def in_speech(self) -> bool:
+        """True while the detector currently believes a human is talking."""
+        return self._in_speech
+
     def reset(self) -> None:
         self._buf = np.zeros(0, dtype=np.float32)
         self._speech.clear()

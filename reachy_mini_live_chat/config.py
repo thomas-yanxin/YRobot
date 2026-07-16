@@ -164,6 +164,11 @@ class Config:
     # threshold and a shorter onset gate to cut the robot off quickly.
     vad_barge_threshold: float = field(default_factory=lambda: _float("VAD_BARGE_THRESHOLD", 0.35))
     vad_barge_min_speech_ms: int = field(default_factory=lambda: _int("VAD_BARGE_MIN_SPEECH_MS", 100))
+    # Confirm a barge-in with the XVF3800's own post-AEC voice flag (read via get_DoA)
+    # before cutting the robot off. The energy VAD alone can't tell a human from residual
+    # echo or head-servo noise while the robot talks; the hardware flag can. No-op when
+    # the ReSpeaker is absent (sim) — the energy decision then stands alone.
+    vad_barge_hw_confirm: bool = field(default_factory=lambda: _flag("VAD_BARGE_HW_CONFIRM", True))
 
     # -- Motion --------------------------------------------------------------
     enable_motion: bool = field(default_factory=lambda: _flag("ENABLE_MOTION", True))
