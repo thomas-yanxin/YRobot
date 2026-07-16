@@ -167,6 +167,7 @@ class AudioEngine:
             # (it already gates on threshold + min_speech_ms).
             log.info("barge-in detected")
             self.bus.request_interrupt()
+            self._flush_device_playback()
         self.bus.user_speaking.set()
         self.bus.set_state(ConvState.LISTENING)
         self.bus.emit("system", {"text": "listening"})
@@ -183,6 +184,23 @@ class AudioEngine:
             self.bus.clear_interrupt()
             if self.bus.state == ConvState.INTERRUPTED:
                 self.bus.set_state(ConvState.IDLE)
+
+    def _flush_device_playback(self) -> None:
+        # Audio already handed to push_audio_sample sits in the device's GStreamer
+        # playback pipeline (~cushion + pipeline latency, up to >1 s) and would keep
+        # playing after we stop pushing. clear_player() flushes the appsrc so the
+        # robot goes quiet at once. MediaManager doesn't forward it, so reach for
+        # media.audio; best-effort — absent on sim/stub and older SDKs.
+        media = self.mini.media
+        fn = getattr(media, "clear_player", None) or getattr(
+            getattr(media, "audio", None), "clear_player", None
+        )
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception as e:
+            log.debug("clear_player error: %s", e)
 
     # -- playback -----------------------------------------------------------
     def _playback_loop(self) -> None:
