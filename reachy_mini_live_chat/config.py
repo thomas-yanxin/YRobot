@@ -148,12 +148,13 @@ class Config:
     omni_playback_chunk_ms: int = field(default_factory=lambda: _int("OMNI_PLAYBACK_CHUNK_MS", 60))
     omni_playback_cushion_ms: int = field(default_factory=lambda: _int("OMNI_PLAYBACK_CUSHION_MS", 200))
 
-    # Video → omni: attach a current frame to input.append. Sending a frame every chunk
-    # makes the server run its vision encoder ~1×/s; if its GPU can't sustain vision+audio
-    # at real time, a backlog builds (laggy/choppy speech). Raise OMNI_VIDEO_EVERY_N (e.g.
-    # 3) to attach a frame only every Nth chunk — cheaper on the server, still grounded.
+    # Video → omni: attach a current frame to input.append. Every frame costs the server
+    # a vision-encoder pass AND permanently grows the session context — the reason replies
+    # get slower turn after turn until the model feels dead (observed: server reply time
+    # 0.6 s on round one → 8.4 s a minute later). A frame every 2nd chunk halves that
+    # growth and the model stays visually grounded; raise to 3-4 on a struggling GPU.
     omni_send_video: bool = field(default_factory=lambda: _flag("OMNI_SEND_VIDEO", True))
-    omni_video_every_n: int = field(default_factory=lambda: max(1, _int("OMNI_VIDEO_EVERY_N", 1)))
+    omni_video_every_n: int = field(default_factory=lambda: max(1, _int("OMNI_VIDEO_EVERY_N", 2)))
     omni_video_fps: float = field(default_factory=lambda: _float("OMNI_VIDEO_FPS", 1.0))
     omni_video_max_edge: int = field(default_factory=lambda: _int("OMNI_VIDEO_MAX_EDGE", 448))
     omni_video_jpeg_quality: int = field(default_factory=lambda: _int("OMNI_VIDEO_JPEG_QUALITY", 70))
@@ -194,9 +195,10 @@ class Config:
     # official app also treats it as an on-demand tool, not always-on.
     enable_face_tracking: bool = field(default_factory=lambda: _flag("ENABLE_FACE_TRACKING", False))
     emotions_dataset: str = field(default_factory=lambda: _env("EMOTIONS_DATASET", "pollen-robotics/reachy-mini-emotions-library"))
-    # 30 Hz keeps set_target IPC light on the CM4 (each call competes with gstreamer +
-    # the daemon); the EMA smoothing keeps motion fluid at this rate. Raise on a laptop.
-    control_hz: int = field(default_factory=lambda: _int("CONTROL_HZ", 30))
+    # On the CM4 a set_target IPC round-trip measures ~40 ms under load, so 30 Hz is
+    # unreachable and the loop just churns; 20 Hz matches what the transport delivers
+    # and the dt-based EMA smoothing keeps motion fluid. Raise on a laptop.
+    control_hz: int = field(default_factory=lambda: _int("CONTROL_HZ", 20))
 
     # -- Web UI --------------------------------------------------------------
     web_ui: bool = field(default_factory=lambda: _flag("WEB_UI", True))
