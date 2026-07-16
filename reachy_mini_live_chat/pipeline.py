@@ -48,6 +48,16 @@ class Pipeline:
 
         self._speaking = False          # is the robot mid-turn (speaking)?
         self._turn_text = ""            # transcript of the current spoken turn
+        # Barge-in cancels the WHOLE reply, not just "audio while the user talks":
+        # the omni server streams long replies in bursts (often 10+ s in flight), and
+        # interrupt_event clears as soon as the user stops talking — without this
+        # latch the rest of the old reply would resume playing a beat later.
+        self._discard_turn = False
+        self.bus.subscribe(self._on_bus_event)
+
+    def _on_bus_event(self, evt: dict) -> None:
+        if evt.get("kind") == "interrupt":
+            self._discard_turn = True
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -96,9 +106,12 @@ class Pipeline:
 
     def on_disconnected(self, reason: str) -> None:
         self.bus.emit("system", {"text": f"omni disconnected: {reason}"})
+        self._discard_turn = False
         self._end_turn(reset_state=True)
 
     def on_text(self, text: str) -> None:
+        if self._discard_turn:
+            return  # remainder of a barge-interrupted reply — drop it
         self._begin_speaking()
         shown = clean_spoken(text)
         if shown:
@@ -109,17 +122,27 @@ class Pipeline:
         # Queue raw omni audio (float32 at omni_out_sr); the playback thread resamples to
         # the device rate. Keeping the WS receive thread free of resampling avoids choppy
         # speech on the CM4.
+        if self._discard_turn:
+            return  # remainder of a barge-interrupted reply — drop it
         self._begin_speaking()
         arr = np.asarray(pcm, dtype=np.float32)
         if len(arr):
             self.bus.tts_audio.put(arr)
 
     def on_listen(self) -> None:
-        # Model chose to listen this step: end any current spoken turn.
+        # Model chose to listen this step: a turn boundary — any barge-interrupted
+        # reply is over, so stop discarding and end the spoken turn.
+        self._discard_turn = False
         if self._speaking:
             self._end_turn()
 
     def on_turn_done(self, full_text: str) -> None:
+        discarded = self._discard_turn
+        self._discard_turn = False
+        if discarded:
+            # The turn was barge-interrupted: no gesture for words never spoken.
+            self._end_turn()
+            return
         # Match a body gesture to what was just said (bilingual keyword cues).
         text = (full_text or self._turn_text).strip()
         if text:
