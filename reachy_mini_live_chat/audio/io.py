@@ -146,6 +146,15 @@ class AudioEngine:
                 # echo-free: feed the VAD and stream the uplink continuously — same as the
                 # official app. (_mic is a no-op passthrough unless software NS/AGC is enabled.)
                 mic = self._mic.process(mono)
+                # Barge-in fast path: while the robot talks the mic is echo-free
+                # (hardware AEC), so run the VAD with a lower bar to detect the
+                # human quickly; switch back to the stricter gate when it's quiet.
+                if self.bus.robot_speaking.is_set():
+                    self.endpointer.threshold = self.cfg.vad_barge_threshold
+                    self.endpointer.min_speech_ms = self.cfg.vad_barge_min_speech_ms
+                else:
+                    self.endpointer.threshold = self.cfg.vad_threshold
+                    self.endpointer.min_speech_ms = self.cfg.vad_min_speech_ms
                 self.endpointer.process(mic)
                 self._accumulate(mic)
             time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
@@ -196,11 +205,14 @@ class AudioEngine:
             getattr(media, "audio", None), "clear_player", None
         )
         if fn is None:
+            log.warning("barge-in: clear_player unavailable on this media backend — "
+                        "device-buffered audio (~0.3-1 s) will play out")
             return
         try:
             fn()
+            log.info("barge-in: flushed device playback buffer")
         except Exception as e:
-            log.debug("clear_player error: %s", e)
+            log.warning("barge-in: clear_player failed: %s", e)
 
     # -- playback -----------------------------------------------------------
     def _playback_loop(self) -> None:

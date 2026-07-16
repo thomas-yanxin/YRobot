@@ -46,3 +46,32 @@ def test_build_vad_onnx_when_requested():
     pytest.importorskip("onnxruntime")
     assert isinstance(vad.build_vad(stub=False, backend="onnx"), vad._OnnxVad)
     assert isinstance(vad.build_vad(stub=False, backend="auto"), vad._OnnxVad)
+
+
+class _ScriptedVad:
+    """speech_prob returns the scripted values in order (1.0 = voiced, 0.0 = not)."""
+
+    def __init__(self, probs):
+        self._probs = list(probs)
+
+    def speech_prob(self, frame):
+        return self._probs.pop(0) if self._probs else 0.0
+
+
+def test_endpointer_onset_survives_brief_dip():
+    # 3 voiced frames (~96 ms), 1 dip, then more voiced: the dip must only decay the
+    # onset run, not reset it — with min_speech_ms=200 the start should fire on the
+    # 8th voiced frame (~224 ms of accumulated speech), not restart from zero.
+    started = []
+    probs = [1, 1, 1, 0, 1, 1, 1, 1, 1, 1]
+    ep = vad.Endpointer(
+        _ScriptedVad(probs),
+        threshold=0.5,
+        silence_ms=320,
+        min_speech_ms=200,
+        on_speech_start=lambda: started.append(True),
+    )
+    frame = np.zeros(FRAME, dtype=np.float32)
+    for _ in probs:
+        ep._step(frame)
+    assert started, "a single sub-threshold frame must not restart onset detection"
