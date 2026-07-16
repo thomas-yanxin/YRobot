@@ -206,7 +206,11 @@ class Endpointer:
                 if self._silence_ms_run >= self.silence_ms:
                     self._emit()
             else:
-                self._speech_ms_run = 0.0
+                # Decay (not reset) the onset run: natural speech dips below the
+                # threshold for a frame or two, and a hard reset made the
+                # min_speech_ms gate take far longer than min_speech_ms — the
+                # main source of slow barge-in detection.
+                self._speech_ms_run = max(0.0, self._speech_ms_run - 2.0 * self._frame_ms)
 
     def _emit(self) -> None:
         if self._speech and self.on_utterance:

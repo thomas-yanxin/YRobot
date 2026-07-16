@@ -159,6 +159,11 @@ class Config:
     vad_threshold: float = field(default_factory=lambda: _float("VAD_THRESHOLD", 0.5))
     vad_silence_ms: int = field(default_factory=lambda: _int("VAD_SILENCE_MS", 320))
     vad_min_speech_ms: int = field(default_factory=lambda: _int("VAD_MIN_SPEECH_MS", 200))
+    # Barge-in fast path: while the robot is speaking, the XVF3800's hardware AEC makes
+    # the mic echo-free, so any voice energy is a real human — we can afford a lower
+    # threshold and a shorter onset gate to cut the robot off quickly.
+    vad_barge_threshold: float = field(default_factory=lambda: _float("VAD_BARGE_THRESHOLD", 0.35))
+    vad_barge_min_speech_ms: int = field(default_factory=lambda: _int("VAD_BARGE_MIN_SPEECH_MS", 100))
 
     # -- Motion --------------------------------------------------------------
     enable_motion: bool = field(default_factory=lambda: _flag("ENABLE_MOTION", True))
