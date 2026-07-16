@@ -27,13 +27,25 @@ def _endpointer(probs, **kw):
     return ep, events
 
 
-def test_hw_voice_flag_maps_bool_to_prob():
-    flag = {"v": False}
-    src = vad.HwVoiceFlag(lambda: flag["v"])
-    frame = np.zeros(FRAME, dtype=np.float32)
-    assert src.speech_prob(frame) == 0.0
-    flag["v"] = True
-    assert src.speech_prob(frame) == 1.0
+def test_energy_vad_prob_range_and_ordering():
+    v = vad.EnergyVad()
+    silence = np.zeros(FRAME, dtype=np.float32)
+    loud = (np.random.default_rng(0).standard_normal(FRAME) * 0.3).astype(np.float32)
+    assert 0.0 <= v.speech_prob(silence) <= 1.0
+    assert v.speech_prob(loud) >= v.speech_prob(silence)
+
+
+def test_energy_vad_adapts_floor_back_down():
+    # Sustained sound raises the floor slowly; silence drops it fast — the gate must
+    # recover so it doesn't report speech forever after a loud stretch.
+    v = vad.EnergyVad()
+    loud = (np.random.default_rng(1).standard_normal(FRAME) * 0.3).astype(np.float32)
+    for _ in range(50):
+        v.speech_prob(loud)
+    silence = np.zeros(FRAME, dtype=np.float32)
+    for _ in range(50):
+        v.speech_prob(silence)
+    assert v.speech_prob(silence) < 0.5
 
 
 def test_endpointer_start_and_end():

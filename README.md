@@ -112,8 +112,10 @@ Open the web UI at <http://localhost:8042> for the live transcript, camera view,
 
 ## Architecture
 
-Voice activity comes from the XVF3800 firmware's post-AEC voice flag (polled over USB at ~20 Hz;
-it drives `user_speaking` → DOA + listen mood + barge-in); the mic feeds a continuous chunker. `OmniClient` runs the full-duplex WebSocket on its own asyncio
+Voice activity is an adaptive energy gate on the **AEC'd** mic stream — the only signal free of the
+robot's own voice, which is what makes barge-in work (it drives `user_speaking` → listen mood +
+barge-in; the XVF3800's own speech flag is pre-AEC and only supplies the DOA angle). The mic also
+feeds a continuous chunker. `OmniClient` runs the full-duplex WebSocket on its own asyncio
 thread: a sender streams `{audio, frame}` up; a receiver dispatches `text`/`audio`/`listen`/`done`
 events. A single 100 Hz control-loop thread owns `set_target` (per the SDK guidance); every other
 thread only enqueues motion *intents*. See [`plan.md`](plan.md) for the diagram and safety table.
