@@ -99,6 +99,7 @@ class AudioEngine:
         self._tts_sr = int(cfg.omni_out_sr or TARGET_SR)
         self._chunk_samples = max(1, int(TARGET_SR * cfg.omni_chunk_ms / 1000))
         self._chunk_buf = np.zeros(0, dtype=np.float32)
+        self._barge_hw_last = 0.0  # last XVF3800 voice-flag read (barge confirm throttle)
         self._threads: list[threading.Thread] = []
 
     # -- lifecycle ----------------------------------------------------------
@@ -166,6 +167,7 @@ class AudioEngine:
                     self.endpointer.threshold = self.cfg.vad_threshold
                     self.endpointer.min_speech_ms = self.cfg.vad_min_speech_ms
                 self.endpointer.process(mic)
+                self._maybe_barge()
                 self._accumulate(mic)
             time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
 
@@ -179,19 +181,39 @@ class AudioEngine:
             except Exception as e:
                 log.debug("on_audio_chunk error: %s", e)
 
+    def _maybe_barge(self) -> None:
+        """Cut the robot off when a human talks over it — with confirmation.
+
+        Runs every capture poll (level-triggered, not just on the VAD onset edge):
+        the energy VAD alone can't tell a human from residual echo or head-servo
+        noise while the robot is talking, so a barge candidate must also be
+        confirmed by the XVF3800's own post-AEC voice flag (via get_DoA). Level
+        triggering means a momentary hardware "no" only delays the cut by a poll
+        or two instead of eating the barge-in entirely. Only bus.request_interrupt
+        is signalled here — the device-buffer flush runs on the playback thread
+        (see _playback_loop), never from this thread.
+        """
+        if not (self.bus.robot_speaking.is_set() and self.endpointer.in_speech):
+            return
+        if self.bus.interrupt_event.is_set():
+            return  # already tearing this reply down
+        if self.cfg.vad_barge_hw_confirm:
+            now = time.monotonic()
+            if now - self._barge_hw_last < 0.05:
+                return  # throttle USB reads to ~20 Hz
+            self._barge_hw_last = now
+            try:
+                res = self.mini.media.get_DoA()
+            except Exception:
+                res = None
+            if res is not None and not res[1]:
+                return  # hardware says no human voice → echo/servo noise, hold fire
+        log.info("barge-in detected")
+        self.bus.request_interrupt()
+
     def _on_speech_start(self) -> None:
-        if self.bus.robot_speaking.is_set():
-            # Human started while the robot spoke → barge-in. The XVF3800 gives us an echo-
-            # free mic, so a VAD speech-onset during playback IS a real human — trust the VAD
-            # (it already gates on threshold + min_speech_ms).
-            log.info("barge-in detected")
-            # Only signal here. The device-buffer flush (clear_player) is done by
-            # the PLAYBACK thread when it observes the interrupt: clear_player
-            # cycles the shared GStreamer pipeline PAUSED->flush->PLAYING, and
-            # doing that from this (capture) thread while the playback thread is
-            # concurrently pushing buffers can wedge the pipeline for good
-            # (playback dead + mic backlog).
-            self.bus.request_interrupt()
+        # NOTE: barge-in is NOT decided here — this edge callback also fires for
+        # noise that fools the energy VAD. See _maybe_barge for the confirmed cut.
         self.bus.user_speaking.set()
         self.bus.set_state(ConvState.LISTENING)
         self.bus.emit("system", {"text": "listening"})
