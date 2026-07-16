@@ -63,11 +63,19 @@ class UplinkAgc:
     uplink makes that failure mode impossible regardless of mic distance.
     """
 
+    # The EnergyVad's noise floor needs a few seconds to adapt to the real ambient
+    # level; before that, plain room noise scores as "speech". Learning from those
+    # frames locks in a gain that permanently amplifies the noise floor (seen on
+    # hardware: uplink ambient ~2x up, model listen-only), so adaptation only starts
+    # after this much audio has been observed.
+    WARMUP_S = 8.0
+
     def __init__(self, target_rms: float = 0.12, max_gain: float = 8.0) -> None:
         self.target = float(target_rms)
         self.max_gain = max(1.0, float(max_gain))
         self._speech_rms: Optional[float] = None
         self._gain = 1.0
+        self._seen_s = 0.0
 
     @property
     def gain(self) -> float:
@@ -75,6 +83,9 @@ class UplinkAgc:
 
     def update(self, chunk: np.ndarray, voiced: bool) -> float:
         """Feed one mic chunk + the VAD's current speech verdict; returns the gain."""
+        self._seen_s += len(chunk) / 16000.0
+        if self._seen_s < self.WARMUP_S:
+            return self._gain
         if voiced and len(chunk):
             rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
             if rms > 1e-4:  # ignore silence mislabelled as speech

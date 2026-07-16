@@ -132,11 +132,12 @@ class Config:
     omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
     # Software AGC on the uplink only: measure the RMS of frames the VAD marks as speech
     # and scale the audio sent to the model so speech lands near OMNI_MIC_AGC_TARGET.
-    # This is the robust fix for "I talk but the robot never answers" — too-quiet speech
-    # makes the omni model treat the user as background noise and emit listen forever.
-    # Never attenuates (gain >= 1; the hardware AGC handles "too loud") and is applied
-    # AFTER the VAD, so the adaptive noise floor never sees a changing gain.
-    omni_mic_agc: bool = field(default_factory=lambda: _flag("OMNI_MIC_AGC", True))
+    # OFF by default: the XVF3800 already does AGC in hardware, and a software stage on
+    # top amplifies noise together with speech — it can raise the model's noise floor
+    # without improving intelligibility (observed on hardware: uplink ambient ~2x up,
+    # model listen-only). Turn on only for a genuinely quiet mic chain, and prefer a
+    # fixed OMNI_MIC_GAIN first.
+    omni_mic_agc: bool = field(default_factory=lambda: _flag("OMNI_MIC_AGC", False))
     omni_mic_agc_target: float = field(default_factory=lambda: _float("OMNI_MIC_AGC_TARGET", 0.12))
     omni_mic_agc_max_gain: float = field(default_factory=lambda: _float("OMNI_MIC_AGC_MAX_GAIN", 8.0))
     # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real

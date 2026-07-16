@@ -29,8 +29,8 @@ local ML models. Design & rationale: see [`plan.md`](plan.md).
 - **Fast barge-in** — a local energy VAD on the hardware-AEC'd mic cuts playback (device buffer
   flushed) within ~200 ms, and the partial mic chunk ships to the server immediately with
   `force_listen`, so the model stops generating up to ~1 s sooner than waiting for the chunk boundary.
-- **Uplink auto-gain** — speech is normalized toward a target level before it reaches the model
-  (`OMNI_MIC_AGC`); too-quiet speech is the classic cause of "the robot hears me but never answers".
+- **Uplink gain controls** — hardware AGC on the XVF3800 (tuned at startup) plus an optional
+  fixed `OMNI_MIC_GAIN` and an opt-in software AGC (`OMNI_MIC_AGC`) for quiet mic chains.
 - **Face tracking + DOA** — with a recent SDK the daemon's visual tracker keeps the head on the
   person even in silence (paused while the robot replies, like the official app); mic-array
   `get_DoA()` still turns head/body toward whoever speaks, and the orientation *stays* on you
@@ -117,7 +117,7 @@ Open the web UI at <http://localhost:8042> for the live transcript, camera view,
 | `OMNI_OUT_SR` | server TTS output rate (set `16000` if voice sounds sped up) | `24000` |
 | `OMNI_CHUNK_MS` | mic audio per `input.append` | `1000` |
 | `OMNI_SEND_VIDEO` / `OMNI_VIDEO_*` | attach a frame per chunk; size/quality | `1` / 448px q70 |
-| `OMNI_MIC_AGC` / `OMNI_MIC_AGC_TARGET` | uplink software AGC toward target speech rms | `1` / `0.12` |
+| `OMNI_MIC_AGC` / `OMNI_MIC_AGC_TARGET` | uplink software AGC (opt-in; hardware AGC is already on) | `0` / `0.12` |
 | `OMNI_BARGE_FLUSH` | ship the partial chunk + `force_listen` the instant a barge-in fires | `1` |
 | `VAD_SILENCE_MS` | silence marking end of human speech (DOA/barge-in) | `320` |
 | `ENABLE_MOTION` / `ENABLE_DOA` / `OMNI_RESPEAKER_CONFIG` | feature toggles | `1` / `1` / `1` |
