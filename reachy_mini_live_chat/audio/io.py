@@ -16,6 +16,7 @@ so the model can hear a barge-in, exactly like the official Reachy Mini app.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Callable
@@ -25,7 +26,7 @@ import numpy as np
 from ..bus import Bus, ConvState
 from ..config import Config
 from .respeaker_config import apply_startup_config
-from .vad import EnergyVad, Endpointer
+from .vad import EnergyVad, Endpointer, UplinkAgc
 
 log = logging.getLogger("live_chat.audio")
 
@@ -82,6 +83,12 @@ class AudioEngine:
         )
         self._hw_last = 0.0       # time of the last get_DoA USB read (throttle)
         self._mic_gain = float(getattr(cfg, "omni_mic_gain", 1.0) or 1.0)
+        # Uplink-only software AGC (fixes "too quiet → model never answers"). The VAD
+        # always sees the un-AGC'd signal so its adaptive floor never chases our gain.
+        self._agc = (
+            UplinkAgc(cfg.omni_mic_agc_target, cfg.omni_mic_agc_max_gain)
+            if getattr(cfg, "omni_mic_agc", True) else None
+        )
         self._in_sr = TARGET_SR
         self._out_sr = TARGET_SR
         # playback pacing (set once out_sr is known in start())
@@ -104,12 +111,16 @@ class AudioEngine:
         except Exception:
             pass
         self._play_sub_n = max(1, int(self._out_sr * self.cfg.omni_playback_chunk_ms / 1000))
-        # Tune the ReSpeaker XVF3800 (hardware AEC/NS/AGC) before we start streaming, the way
-        # the official app does. Best-effort: no-op on an older SDK.
-        if getattr(self.cfg, "omni_respeaker_config", True):
-            apply_startup_config(self.mini)
         self.mini.media.start_recording()
         self.mini.media.start_playing()
+        # Tune the ReSpeaker XVF3800 (hardware AEC/NS/AGC) AFTER the media pipelines are
+        # up — the official app writes it ~1 s after pipeline start, because (re)opening
+        # the audio device can reset the chip to defaults. Writing before start_recording
+        # risks the tuning being clobbered, leaving echo/AGC at chip defaults. Done here
+        # synchronously (before the capture thread's DoA polling touches USB).
+        if getattr(self.cfg, "omni_respeaker_config", True):
+            time.sleep(0.5)  # let the pipelines settle, mirroring the official app
+            apply_startup_config(self.mini)
         for target in (self._capture_loop, self._playback_loop):
             t = threading.Thread(target=target, name=target.__name__, daemon=True)
             t.start()
@@ -162,6 +173,9 @@ class AudioEngine:
                 # echo-free: stream the uplink continuously — same as the official app.
                 self.endpointer.process(mic)
                 self._maybe_barge()
+                if self._agc is not None:
+                    self._agc.update(mic, self.endpointer.in_speech)
+                    mic = self._agc.apply(mic)
                 self._accumulate(mic)
             time.sleep(max(0.0, poll_dt - (time.monotonic() - t0)))
 
@@ -209,6 +223,24 @@ class AudioEngine:
             return  # already tearing this reply down
         log.info("barge-in detected")
         self.bus.request_interrupt()
+        # Tell the SERVER as fast as we tell the speaker: ship the partial capture
+        # buffer right now instead of waiting for the 1 s chunk boundary. The sender
+        # stamps force_listen on it (interrupt_event is set), so the model stops
+        # generating up to ~1 s sooner. Anything shorter than ~120 ms isn't worth a
+        # message of its own — the next full chunk is imminent.
+        if getattr(self.cfg, "omni_barge_flush", True):
+            self._flush_uplink(min_ms=120)
+
+    def _flush_uplink(self, min_ms: int = 120) -> None:
+        """Send the partially-accumulated uplink chunk immediately (barge-in path)."""
+        n = len(self._chunk_buf)
+        if n < int(TARGET_SR * min_ms / 1000):
+            return
+        chunk, self._chunk_buf = self._chunk_buf, np.zeros(0, dtype=np.float32)
+        try:
+            self._on_audio_chunk(chunk)
+        except Exception as e:
+            log.debug("on_audio_chunk error (barge flush): %s", e)
 
     def _on_speech_start(self) -> None:
         # NOTE: barge-in is NOT decided here — this edge callback also fires for
@@ -269,6 +301,8 @@ class AudioEngine:
             except Exception:
                 if self.bus.robot_speaking.is_set() and time.monotonic() - idle_since > 0.25:
                     self.bus.robot_speaking.clear()
+                    self.bus.speech_env.clear()
+                    self.bus.speech_level = 0.0
                     self.bus.emit("system", {"text": "spoke"})
                     self._turn_start = None  # reset pacing for the next spoken turn
                 # Safety net: never let a barge-in interrupt persist into an idle gap —
@@ -298,8 +332,21 @@ class AudioEngine:
         n = self._play_sub_n
         for i in range(0, len(chunk), n):
             if self.bus.interrupt_event.is_set():
+                self.bus.speech_env.clear()
+                self.bus.speech_level = 0.0
                 break
             sub = chunk[i:i + n]
+            # Voice envelope for the speech-synced wobble, stamped with the time this
+            # sub-chunk will actually PLAY (we push up to a cushion ahead of real time,
+            # so publishing at push time would move the head before the sound). Loudness
+            # mapping follows the official head-wobbler DSP: dBFS normalized over
+            # [-46, -18] dB with gamma 0.9 — perceptually much closer than linear RMS.
+            due = self._turn_start + self._turn_played
+            if len(sub):
+                rms = float(np.sqrt(np.mean(sub.astype(np.float64) ** 2)))
+                dbfs = 20.0 * math.log10(rms + 1e-9)
+                lvl = min(1.0, max(0.0, (dbfs + 46.0) / 28.0)) ** 0.9
+                self.bus.speech_env.append((due, lvl))
             try:
                 self.mini.media.push_audio_sample(sub.reshape(-1, 1))
             except Exception as e:

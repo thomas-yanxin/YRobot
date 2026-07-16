@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import threading
 import time
 from typing import Optional, Tuple
@@ -59,6 +60,26 @@ class MotionController:
         self._head_rpy_cmd = None     # (roll, pitch, yaw) degrees, smoothed
         self._ant_alpha = 0.25
         self._head_alpha = 0.35
+        # Speech envelope (EMA of bus.speech_level): the talking wobble follows the
+        # actual voice instead of a fixed metronome sine — silence between sentences
+        # stills the head, stressed words move it. This is what makes it look alive.
+        self._speech_lvl = 0.0
+        # Random per-session phases for the speaking oscillators (the official head
+        # wobbler does the same) so the axes never lock into one repeating figure.
+        self._ph = [random.uniform(0.0, 2.0 * math.pi) for _ in range(5)]
+        # Idle "glance" gesture: every few seconds pick a nearby point and look at it
+        # briefly, like someone waiting. (t_next, t_end, yaw_deg, pitch_deg)
+        self._glance_next = self._t0 + random.uniform(4.0, 9.0)
+        self._glance_end = 0.0
+        self._glance_yaw = 0.0
+        self._glance_pitch = 0.0
+        # Listening backchannel: an occasional small nod while the user talks.
+        self._nod_next = 0.0
+        self._nod_end = 0.0
+        # Long-idle life signs: after ~3 min with no conversation, occasionally play a
+        # subtle emotion locally (the official app runs the same LLM-free idle policy).
+        self._last_active = self._t0
+        self._idle_emo_next: Optional[float] = None
         # effective-rate telemetry
         self._rate_t0 = self._t0
         self._rate_n = 0
@@ -182,55 +203,124 @@ class MotionController:
             else:
                 return self._emotion_pose(move, name, t, dur, intensity)
 
+        # Track the played voice envelope: consume samples whose play time has arrived
+        # (the playback thread stamps them with their due time — see AudioEngine), then
+        # smooth with fast attack / slow release, like the official wobbler DSP.
+        env = self.bus.speech_env
+        while env:
+            try:
+                due, lvl = env[0]
+            except IndexError:  # raced the playback thread's clear()
+                break
+            if due > now:
+                break
+            env.popleft()
+            self.bus.speech_level = lvl
+        target_lvl = self.bus.speech_level if self.bus.robot_speaking.is_set() else 0.0
+        a = 0.5 if target_lvl > self._speech_lvl else 0.12
+        self._speech_lvl += a * (target_lvl - self._speech_lvl)
+
         state = self.bus.state
         t = now - self._t0
         if state == ConvState.LISTENING:
-            head, ant = self._listening(t)
+            head, ant = self._listening(t, now)
         elif state == ConvState.THINKING:
             head, ant = self._thinking(t)
         elif state in (ConvState.SPEAKING, ConvState.INTERRUPTED) or self.bus.robot_speaking.is_set():
             head, ant = self._speaking(t)
         else:
-            head, ant = self._idle(t)
+            head, ant = self._idle(t, now)
 
-        # blend DOA yaw into the head, decaying back toward center when not tracking
+        self._maybe_idle_emotion(state, now)
+
+        # Blend DOA yaw into the head. Hold the orientation while EITHER side is talking
+        # — the official app anchors the head toward the person for the whole reply;
+        # decaying mid-reply made the robot slowly turn away from the user it was
+        # answering. Only drift back to center once the conversation goes quiet.
         yaw = math.degrees(self._doa_yaw)
-        if not self.bus.user_speaking.is_set():
+        if not (self.bus.user_speaking.is_set() or self.bus.robot_speaking.is_set()):
             self._doa_yaw *= 0.96
-        roll, pitch, base_yaw = head
-        head_pose = _head_pose(roll, pitch, base_yaw + yaw)
+        roll, pitch, base_yaw, z = head
+        head_pose = _head_pose(roll, pitch, base_yaw + yaw, z)
         body_yaw = self._doa_yaw * 0.5 if abs(yaw) > 45 else None
         return head_pose, ant, body_yaw
 
-    # mood generators return ((roll,pitch,yaw)deg, [ant_r,ant_l]rad)
-    def _idle(self, t: float):
-        pitch = 2.0 * math.sin(2 * math.pi * 0.15 * t)          # slow breathing
-        roll = 1.0 * math.sin(2 * math.pi * 0.11 * t + 1.0)
-        yaw = 4.0 * math.sin(2 * math.pi * 0.05 * t)            # occasional glance
-        ant = [math.radians(8 * math.sin(2 * math.pi * 0.2 * t)),
-               math.radians(8 * math.sin(2 * math.pi * 0.2 * t + 0.4))]
-        return (roll, pitch, yaw), ant
+    def _maybe_idle_emotion(self, state: ConvState, now: float) -> None:
+        """After ~3 min of no conversation, occasionally play a subtle gesture."""
+        busy = (
+            state != ConvState.IDLE
+            or self.bus.robot_speaking.is_set()
+            or self.bus.user_speaking.is_set()
+            or self._active_move is not None
+        )
+        if busy:
+            self._last_active = now
+            self._idle_emo_next = None
+            return
+        if now - self._last_active < 180.0:
+            return
+        if self._idle_emo_next is None:
+            self._idle_emo_next = now + random.uniform(0.0, 30.0)
+            return
+        if now >= self._idle_emo_next:
+            self._idle_emo_next = now + random.uniform(120.0, 240.0)
+            self._begin_emotion(random.choice(_IDLE_EMOTIONS), 0.7)
 
-    def _listening(self, t: float):
+    # mood generators return ((roll,pitch,yaw)deg + z(m), [ant_r,ant_l]rad)
+    def _idle(self, t: float, now: float):
+        pitch = 2.0 * math.sin(2 * math.pi * 0.15 * t)
+        roll = 1.0 * math.sin(2 * math.pi * 0.11 * t + 1.0)
+        yaw = 4.0 * math.sin(2 * math.pi * 0.05 * t)
+        z = 0.005 * math.sin(2 * math.pi * 0.1 * t)             # official breathing: 5 mm @ 0.1 Hz
+        # Occasional glance at a nearby point — a robot that never shifts its gaze
+        # reads as frozen. Eased in/out; the EMA smoothing rounds the edges further.
+        if now >= self._glance_next:
+            self._glance_end = now + random.uniform(1.2, 2.6)
+            self._glance_next = self._glance_end + random.uniform(4.0, 10.0)
+            self._glance_yaw = random.uniform(-28.0, 28.0)
+            self._glance_pitch = random.uniform(-10.0, 6.0)
+        if now < self._glance_end:
+            yaw += self._glance_yaw
+            pitch += self._glance_pitch
+        ant = [math.radians(10 + 8 * math.sin(2 * math.pi * 0.2 * t)),
+               math.radians(10 + 8 * math.sin(2 * math.pi * 0.2 * t + math.pi))]
+        return (roll, pitch, yaw, z), ant
+
+    def _listening(self, t: float, now: float):
         pitch = -6.0 + 1.5 * math.sin(2 * math.pi * 0.4 * t)    # slight forward/attentive
         roll = 2.0 * math.sin(2 * math.pi * 0.3 * t)
+        # Backchannel: a small nod every few seconds while the user talks ("I'm
+        # with you") — listeners that hold perfectly still look switched off.
+        if now >= self._nod_next:
+            self._nod_end = now + 0.7
+            self._nod_next = self._nod_end + random.uniform(2.5, 5.0)
+        if now < self._nod_end:
+            p = 1.0 - (self._nod_end - now) / 0.7
+            pitch += 6.0 * math.sin(math.pi * p) * math.sin(2 * math.pi * 2.0 * p)
         ant = [math.radians(25), math.radians(25)]              # antennas perked up
-        return (roll, pitch, 0.0), ant
+        return (roll, pitch, 0.0, 0.0), ant
 
     def _thinking(self, t: float):
         pitch = -10.0                                           # look up, pondering
         roll = 8.0 * math.sin(2 * math.pi * 0.5 * t)
         yaw = 8.0
         ant = [math.radians(-15), math.radians(15)]
-        return (roll, pitch, yaw), ant
+        return (roll, pitch, yaw, 0.0), ant
 
     def _speaking(self, t: float):
-        pitch = 3.0 * math.sin(2 * math.pi * 2.2 * t)           # gentle talking nod
-        roll = 2.0 * math.sin(2 * math.pi * 1.3 * t)
-        yaw = 3.0 * math.sin(2 * math.pi * 0.9 * t)
-        wig = math.radians(12 * math.sin(2 * math.pi * 3.0 * t))
+        # Voice-synced wobble, matching the official head-wobbler oscillator bank:
+        # slow independent sinusoids per axis (random per-session phases), amplitude
+        # scaled by the played speech envelope — the head moves WITH the words and
+        # stills in the silence between sentences. A small base keeps a pulse of life.
+        lvl = self._speech_lvl
+        w = 2 * math.pi
+        pitch = (0.6 + 4.5 * lvl) * math.sin(w * 2.2 * t + self._ph[0])
+        yaw = (0.8 + 7.5 * lvl) * math.sin(w * 0.6 * t + self._ph[1])
+        roll = (0.4 + 2.25 * lvl) * math.sin(w * 1.3 * t + self._ph[2])
+        z = 0.00225 * lvl * math.sin(w * 0.25 * t + self._ph[3])
+        wig = math.radians((2.0 + 10.0 * lvl) * math.sin(w * 2.0 * t + self._ph[4]))
         ant = [wig, -wig]
-        return (roll, pitch, yaw), ant
+        return (roll, pitch, yaw, z), ant
 
     def _emotion_pose(self, move, name: str, t: float, dur: float, intensity: float):
         if move is not None:
@@ -246,6 +336,9 @@ class MotionController:
         (roll, pitch, yaw), ant = _procedural(name, t, dur, intensity)
         return _head_pose(roll, pitch, yaw), ant, None
 
+
+# Subtle gestures suitable for unprompted long-idle "signs of life".
+_IDLE_EMOTIONS = ["curious1", "thoughtful1", "attentive1", "calming1"]
 
 # ---- procedural gestures (used when the emotion library isn't available) ----
 _PROC_DUR = {

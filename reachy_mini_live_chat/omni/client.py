@@ -269,9 +269,12 @@ class OmniClient:
             except queue.Empty:
                 await asyncio.sleep(0.02)
                 continue
-            # If more than a couple are queued we're behind: keep only the newest.
+            # A short backlog (a couple of seconds) is sent as-is: dropping here
+            # removes words from the middle of the user's sentence, and a garbled
+            # utterance is exactly the "robot never answers" failure mode. Only a
+            # runaway backlog (stalled server / dead link) skips to newer audio.
             dropped = 0
-            while self._audio_q.qsize() > 1:
+            while self._audio_q.qsize() > 3:
                 try:
                     chunk = self._audio_q.get_nowait()
                     dropped += 1

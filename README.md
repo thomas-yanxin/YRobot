@@ -26,11 +26,18 @@ local ML models. Design & rationale: see [`plan.md`](plan.md).
 
 - **End-to-end omni, full duplex** — the model itself decides *listen* vs *speak* at ~1 Hz;
   audio plays incrementally as it streams back. Talk over the robot and it can barge-in.
+- **Fast barge-in** — a local energy VAD on the hardware-AEC'd mic cuts playback (device buffer
+  flushed) within ~200 ms, and the partial mic chunk ships to the server immediately with
+  `force_listen`, so the model stops generating up to ~1 s sooner than waiting for the chunk boundary.
+- **Uplink auto-gain** — speech is normalized toward a target level before it reaches the model
+  (`OMNI_MIC_AGC`); too-quiet speech is the classic cause of "the robot hears me but never answers".
 - **DOA** — while you speak, the head (and body, past ±45°) turns toward your direction, using the
-  robot's mic-array `get_DoA()`, EMA-smoothed and clamped.
-- **Expressive, safe motion** — conversation-state moods (idle / listening / speaking) plus emotion
-  gestures inferred from the model's transcript (nod on "好的/yes", tilt on questions, …). **Every**
-  command is clamped to the documented joint range in `motion/safety.py`.
+  robot's mic-array `get_DoA()`, EMA-smoothed and clamped — and it *stays* on you for the whole reply.
+- **Speech-synced motion** — the talking wobble is driven by the played voice's loudness envelope
+  (dB-normalized, timestamp-aligned to actual playback, same oscillator bank as the official app's
+  head wobbler), so the head moves with the words and stills between sentences. Plus listening
+  backchannel nods, idle glances/breathing, and emotion gestures inferred from the transcript
+  (nod on "好的/yes", tilt on questions, …). **Every** command is clamped in `motion/safety.py`.
 - **Continuous vision** — one downscaled JPEG frame is attached to each audio chunk (~1 fps), so the
   model always has current visual context.
 
@@ -106,8 +113,10 @@ Open the web UI at <http://localhost:8042> for the live transcript, camera view,
 | `OMNI_OUT_SR` | server TTS output rate (set `16000` if voice sounds sped up) | `24000` |
 | `OMNI_CHUNK_MS` | mic audio per `input.append` | `1000` |
 | `OMNI_SEND_VIDEO` / `OMNI_VIDEO_*` | attach a frame per chunk; size/quality | `1` / 448px q70 |
+| `OMNI_MIC_AGC` / `OMNI_MIC_AGC_TARGET` | uplink software AGC toward target speech rms | `1` / `0.12` |
+| `OMNI_BARGE_FLUSH` | ship the partial chunk + `force_listen` the instant a barge-in fires | `1` |
 | `VAD_SILENCE_MS` | silence marking end of human speech (DOA/barge-in) | `320` |
-| `ENABLE_MOTION` / `ENABLE_DOA` / `ENABLE_AEC` | feature toggles | `1` / `1` / `0` |
+| `ENABLE_MOTION` / `ENABLE_DOA` / `OMNI_RESPEAKER_CONFIG` | feature toggles | `1` / `1` / `1` |
 | `LANG` | `auto` \| `zh` \| `en` | `auto` |
 
 ## Architecture
@@ -117,8 +126,8 @@ robot's own voice, which is what makes barge-in work (it drives `user_speaking` 
 barge-in; the XVF3800's own speech flag is pre-AEC and only supplies the DOA angle). The mic also
 feeds a continuous chunker. `OmniClient` runs the full-duplex WebSocket on its own asyncio
 thread: a sender streams `{audio, frame}` up; a receiver dispatches `text`/`audio`/`listen`/`done`
-events. A single 100 Hz control-loop thread owns `set_target` (per the SDK guidance); every other
-thread only enqueues motion *intents*. See [`plan.md`](plan.md) for the diagram and safety table.
+events. A single control-loop thread (`CONTROL_HZ`, 30 Hz on the CM4) owns `set_target` (per the
+SDK guidance); every other thread only enqueues motion *intents*. See [`plan.md`](plan.md) for the diagram and safety table.
 
 ## Safety
 

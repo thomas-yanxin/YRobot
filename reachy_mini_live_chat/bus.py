@@ -65,6 +65,13 @@ class Bus:
         self._turn_id = 0
         self.doa_angle: Optional[float] = None     # last DOA reading (radians)
         self.latest_frame_jpeg: Optional[bytes] = None  # for web UI preview
+        # Voice envelope for speech-synced motion. The playback thread runs ahead of
+        # the speaker (pacing cushion), so it appends (due_time, level) samples and the
+        # motion loop consumes them when their play time arrives — the wobble then
+        # matches what is *heard*, not what was pushed. speech_level is the last level
+        # whose due time has passed (plain float store/load is atomic under the GIL).
+        self.speech_env: Deque[tuple] = deque(maxlen=256)
+        self.speech_level: float = 0.0
 
         # --- latency instrumentation ---------------------------------------
         self._marks: dict[str, float] = {}
@@ -107,9 +114,11 @@ class Bus:
         """Signal every producer to abandon the current reply immediately."""
         self.interrupt_event.set()
         self.set_state(ConvState.INTERRUPTED)
-        # drop anything queued for the mouth
+        # drop anything queued for the mouth (and still the talking wobble)
         _drain(self.tts_in)
         _drain(self.tts_audio)
+        self.speech_env.clear()
+        self.speech_level = 0.0
         self.motion_intents.put(MotionIntent(kind="cancel"))
         self.emit("interrupt", {})
 

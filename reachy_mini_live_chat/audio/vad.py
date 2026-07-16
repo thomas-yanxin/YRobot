@@ -49,6 +49,52 @@ class EnergyVad:
         return float(np.clip((snr - 2.5) / 6.0, 0.0, 1.0))
 
 
+class UplinkAgc:
+    """Software auto-gain for the model uplink: hold *speech* near a target RMS.
+
+    Tracks an EMA of the RMS of chunks the VAD marks as speech and derives one
+    slowly-moving gain ``target / speech_rms``. The gain only ever boosts
+    (>= 1.0 — the hardware AGC already prevents clipping-loud speech) and is
+    capped so a whisper across the room can't become full-scale noise.
+
+    Why: the omni model does its own turn-taking from the audio; speech that
+    arrives too quiet is treated as background and the model just keeps
+    listening — the classic "I talk but it never answers". Normalizing the
+    uplink makes that failure mode impossible regardless of mic distance.
+    """
+
+    def __init__(self, target_rms: float = 0.12, max_gain: float = 8.0) -> None:
+        self.target = float(target_rms)
+        self.max_gain = max(1.0, float(max_gain))
+        self._speech_rms: Optional[float] = None
+        self._gain = 1.0
+
+    @property
+    def gain(self) -> float:
+        return self._gain
+
+    def update(self, chunk: np.ndarray, voiced: bool) -> float:
+        """Feed one mic chunk + the VAD's current speech verdict; returns the gain."""
+        if voiced and len(chunk):
+            rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+            if rms > 1e-4:  # ignore silence mislabelled as speech
+                if self._speech_rms is None:
+                    self._speech_rms = rms
+                else:
+                    # fast-ish EMA: adapts within ~2 s of speech at 10 Hz updates
+                    self._speech_rms = 0.9 * self._speech_rms + 0.1 * rms
+                raw = self.target / max(self._speech_rms, 1e-4)
+                target_gain = float(np.clip(raw, 1.0, self.max_gain))
+                # smooth the applied gain so the uplink level never steps audibly
+                self._gain += 0.2 * (target_gain - self._gain)
+        return self._gain
+
+    def apply(self, chunk: np.ndarray) -> np.ndarray:
+        if self._gain <= 1.0 + 1e-3:
+            return chunk
+        return np.clip(chunk * self._gain, -1.0, 1.0).astype(np.float32)
+
+
 class Endpointer:
     """Stream 16 kHz mono chunks in; get utterance callbacks out."""
 
