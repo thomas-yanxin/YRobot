@@ -28,26 +28,21 @@ robot = ["reachy-mini"]
 # --- optional quality/feature add-ons (each has a fallback if absent) ---------
 config = ["python-dotenv>=1.0"]          # read a .env file (else use real env vars)
 hifi = ["scipy>=1.10"]                    # polyphase resampling (else numpy linear interp)
-vad = ["onnxruntime"]                     # Silero v5 VAD on CPU via onnx (else numpy energy VAD). No torch.
 vision = ["pillow"]                       # downscale frames (else the SDK's full-res get_frame_jpeg)
 web = ["fastapi", "uvicorn"]              # control/monitor web UI (headless works without it)
-denoise = ["webrtc-noise-gain"]           # optional software NS+AGC for non-XVF3800 boards (hardware does it otherwise)
-simcam = ["opencv-python", "sounddevice", "soundfile"]  # laptop --sim: Mac mic/speaker/webcam
 
 # On-robot (Wireless CM4, ARM64 Linux): minimal client. reachy-mini is usually already in the
 # robot image, so in practice `pip install .` (numpy + websockets) is enough. dotenv is a nicety.
 cm4 = ["reachy-mini", "python-dotenv>=1.0"]
 
-# A comfortable dev-laptop bridge to the robot (smaller frames, neural VAD, web UI, hi-fi audio).
+# A comfortable dev-laptop bridge to the robot (smaller frames, web UI, hi-fi audio).
 laptop = [
     "reachy-mini", "python-dotenv>=1.0",
-    "scipy>=1.10", "onnxruntime", "pillow",
+    "scipy>=1.10", "pillow",
     "fastapi", "uvicorn",
-    "opencv-python", "sounddevice", "soundfile",
-    "webrtc-noise-gain",
 ]
 
-dev = ["pytest>=7", "ruff", "numpy>=1.24", "pillow", "python-dotenv>=1.0", "onnxruntime"]
+dev = ["pytest>=7", "ruff", "numpy>=1.24", "pillow", "python-dotenv>=1.0"]
 
 [project.entry-points."reachy_mini_apps"]
 # The Reachy Mini daemon discovers the app through this entry point.

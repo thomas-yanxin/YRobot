@@ -33,8 +33,6 @@ local ML models. Design & rationale: see [`plan.md`](plan.md).
   command is clamped to the documented joint range in `motion/safety.py`.
 - **Continuous vision** — one downscaled JPEG frame is attached to each audio chunk (~1 fps), so the
   model always has current visual context.
-- **Runs without hardware or a server** — `--sim --stub` drives the *real* WebSocket client against a
-  built-in fake omni server, using the Mac's mic/speaker/webcam when available.
 
 ## Protocol (verified against the source)
 
@@ -72,31 +70,22 @@ pure-numpy/stdlib fallback, so you add only what you want:
 
 | Extra | Adds | Fallback if absent |
 |-------|------|--------------------|
-| `vad` | Silero v5 VAD on CPU via **onnxruntime** (model vendored; no torch) — opt in with `VAD_BACKEND=onnx` | pure-numpy energy VAD (default) |
 | `vision` | `pillow` (downscale frames) | the SDK's full-res `get_frame_jpeg()` |
 | `hifi` | `scipy` polyphase resampling | numpy linear-interp resampling |
 | `web` | `fastapi`/`uvicorn` control UI | headless (state via logs) |
-| `aec` | WebRTC echo cancellation | duck-and-gate |
-| `simcam` | `opencv`/`sounddevice` for laptop `--sim` | synthetic frames/silence |
 
-Dev on a laptop (bridged to the robot, or `--sim`):
+Dev on a laptop (bridged to the robot):
 
 ```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate
-uv pip install -e ".[laptop,dev]"   # or ".[dev]" for sim/stub only
+uv pip install -e ".[laptop,dev]"
 cp .env.example .env
 ```
 
 ## Run
 
 ```bash
-# 1) hardware-free dev — real WS client against a built-in fake omni server:
-reachy-mini-live-chat --sim --stub
-
-# 2) sim robot against your REAL omni server (set OMNI_WS_URL in .env first):
-reachy-mini-live-chat --sim
-
-# 3) on the robot (daemon running on the CM4):
+# on the robot (daemon running on the CM4):
 reachy-mini-live-chat                # connects to the daemon, opens web UI on :8042
 #    or let the Reachy Mini app launcher discover it (entry point: reachy_mini_apps).
 ```
@@ -123,8 +112,8 @@ Open the web UI at <http://localhost:8042> for the live transcript, camera view,
 
 ## Architecture
 
-The mic feeds a lightweight local VAD (only to set `user_speaking` → DOA + listen mood + barge-in)
-and a continuous 1-second chunker. `OmniClient` runs the full-duplex WebSocket on its own asyncio
+Voice activity comes from the XVF3800 firmware's post-AEC voice flag (polled over USB at ~20 Hz;
+it drives `user_speaking` → DOA + listen mood + barge-in); the mic feeds a continuous chunker. `OmniClient` runs the full-duplex WebSocket on its own asyncio
 thread: a sender streams `{audio, frame}` up; a receiver dispatches `text`/`audio`/`listen`/`done`
 events. A single 100 Hz control-loop thread owns `set_target` (per the SDK guidance); every other
 thread only enqueues motion *intents*. See [`plan.md`](plan.md) for the diagram and safety table.

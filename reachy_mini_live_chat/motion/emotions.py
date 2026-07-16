@@ -6,7 +6,7 @@ in the model's *transcript* (zh + en), so the robot's body language still matche
 just said, in either language.
 
 Moves come from ``pollen-robotics/reachy-mini-emotions-library`` (authored within the safe
-range). If the library can't load (offline / stub), the controller falls back to a small
+range). If the library can't load (offline), the controller falls back to a small
 procedural gesture instead.
 """
 from __future__ import annotations
@@ -59,8 +59,7 @@ class EmotionLibrary:
         self._lib = None
         self._cache: dict = {}
         self._names: list[str] = list(ALLOWED_EMOTIONS)
-        if not cfg.stub:
-            self._load()
+        self._load()
 
     def _load(self) -> None:
         try:

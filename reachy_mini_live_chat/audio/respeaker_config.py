@@ -14,7 +14,7 @@ residual-echo suppression (the leftover tail that a fixed AEC lets through — t
 was making our robot hear itself and cut its own speech), and ``PP_AGCMAXGAIN`` is the
 hardware auto-gain, so no software gain is needed.
 
-Best-effort: if the board or the SDK API isn't present (e.g. a sim run, or an older SDK),
+Best-effort: if the board or the SDK API isn't present (e.g. an older SDK),
 we log and carry on — the app still works, just without the tuning.
 """
 from __future__ import annotations
@@ -38,11 +38,11 @@ AUDIO_STARTUP_CONFIG = (
 def apply_startup_config(mini, *, verify: bool = True) -> bool:
     """Write the tuned XVF3800 config to the ReSpeaker. Returns True on success.
 
-    Never raises: a missing board / SDK API / sim backend just logs and returns False.
+    Never raises: a missing board / SDK API just logs and returns False.
     """
     audio = getattr(getattr(mini, "media", None), "audio", None)
     if audio is None:
-        log.info("respeaker: no media.audio (sim/stub?) — skipping XVF3800 tuning")
+        log.info("respeaker: no media.audio — skipping XVF3800 tuning")
         return False
     apply = getattr(audio, "apply_audio_config", None)
     if not callable(apply):
