@@ -116,6 +116,11 @@ class Config:
     # hardware without that board.
     omni_respeaker_config: bool = field(default_factory=lambda: _flag("OMNI_RESPEAKER_CONFIG", True))
 
+    # On barge-in, immediately send the partially-filled capture buffer (with
+    # force_listen) instead of waiting for the 1 s chunk boundary — the server learns
+    # about the interruption up to ~1 s sooner, so it stops generating sooner.
+    omni_barge_flush: bool = field(default_factory=lambda: _flag("OMNI_BARGE_FLUSH", True))
+
     omni_reconnect_s: float = field(default_factory=lambda: _float("OMNI_RECONNECT_S", 1.5))
     # Diagnostics: when set to a file path, every uplink chunk (exactly what the model
     # hears) is appended as raw s16le mono 16 kHz. Play: ffplay -f s16le -ar 16000 -i <path>
@@ -125,6 +130,15 @@ class Config:
     # (uplink rms peak <~0.08 while talking → the model treats it as background and only
     # listens), raise this to 2.0–4.0. Ratio-based VAD is unaffected by a constant gain.
     omni_mic_gain: float = field(default_factory=lambda: _float("OMNI_MIC_GAIN", 1.0))
+    # Software AGC on the uplink only: measure the RMS of frames the VAD marks as speech
+    # and scale the audio sent to the model so speech lands near OMNI_MIC_AGC_TARGET.
+    # This is the robust fix for "I talk but the robot never answers" — too-quiet speech
+    # makes the omni model treat the user as background noise and emit listen forever.
+    # Never attenuates (gain >= 1; the hardware AGC handles "too loud") and is applied
+    # AFTER the VAD, so the adaptive noise floor never sees a changing gain.
+    omni_mic_agc: bool = field(default_factory=lambda: _flag("OMNI_MIC_AGC", True))
+    omni_mic_agc_target: float = field(default_factory=lambda: _float("OMNI_MIC_AGC_TARGET", 0.12))
+    omni_mic_agc_max_gain: float = field(default_factory=lambda: _float("OMNI_MIC_AGC_MAX_GAIN", 8.0))
     # Playback pacing: feed the speaker in ~60 ms buffers and stay ~200 ms ahead of real
     # time. The cushion absorbs CPU/scheduling jitter on the CM4 so speech doesn't stutter;
     # pacing to the cushion keeps latency bounded if the server produces audio fast.
@@ -163,6 +177,15 @@ class Config:
     # -- Motion --------------------------------------------------------------
     enable_motion: bool = field(default_factory=lambda: _flag("ENABLE_MOTION", True))
     enable_doa: bool = field(default_factory=lambda: _flag("ENABLE_DOA", True))
+    # Daemon-native speech wobble (mini.enable_wobbling): the daemon taps the playback
+    # pipeline and composes head offsets synced to the *actual* audio clock — better
+    # than our app-level approximation. Auto-detected; falls back to the app-level
+    # oscillators when the SDK doesn't have it.
+    enable_daemon_wobble: bool = field(default_factory=lambda: _flag("ENABLE_DAEMON_WOBBLE", True))
+    # Daemon-native visual face tracking (mini.start_head_tracking): the robot looks
+    # at the person even when nobody is talking. Paused (weight 0) while the robot
+    # speaks so the speech wobble owns the head, like the official app. Auto-detected.
+    enable_face_tracking: bool = field(default_factory=lambda: _flag("ENABLE_FACE_TRACKING", True))
     emotions_dataset: str = field(default_factory=lambda: _env("EMOTIONS_DATASET", "pollen-robotics/reachy-mini-emotions-library"))
     # 30 Hz keeps set_target IPC light on the CM4 (each call competes with gstreamer +
     # the daemon); the EMA smoothing keeps motion fluid at this rate. Raise on a laptop.

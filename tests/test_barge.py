@@ -92,3 +92,45 @@ def test_energy_endpointer_reaches_in_speech():
         eng.endpointer.process(quiet)
     eng.endpointer.process(loud)
     assert eng.endpointer.in_speech
+
+
+def test_barge_flushes_partial_uplink_chunk():
+    """On barge-in the partial capture buffer ships immediately (with force_listen
+    coming from interrupt_event) instead of waiting for the 1 s boundary."""
+    sent = []
+    cfg = Config()
+    bus = Bus()
+    eng = AudioEngine(_Mini((1.57, True)), cfg, bus, on_audio_chunk=sent.append)
+    bus.robot_speaking.set()
+    eng.endpointer._in_speech = True
+    eng._chunk_buf = np.zeros(int(0.5 * 16000), dtype=np.float32)  # 500 ms pending
+    eng._maybe_barge()
+    assert bus.interrupt_event.is_set()
+    assert len(sent) == 1 and len(sent[0]) == int(0.5 * 16000)
+    assert len(eng._chunk_buf) == 0
+
+
+def test_barge_flush_skips_tiny_buffer():
+    sent = []
+    cfg = Config()
+    bus = Bus()
+    eng = AudioEngine(_Mini((1.57, True)), cfg, bus, on_audio_chunk=sent.append)
+    bus.robot_speaking.set()
+    eng.endpointer._in_speech = True
+    eng._chunk_buf = np.zeros(int(0.05 * 16000), dtype=np.float32)  # 50 ms < gate
+    eng._maybe_barge()
+    assert bus.interrupt_event.is_set()
+    assert sent == []  # not worth its own message; next chunk is imminent
+
+
+def test_barge_flush_disabled_by_config():
+    sent = []
+    cfg = Config()
+    cfg.omni_barge_flush = False
+    bus = Bus()
+    eng = AudioEngine(_Mini((1.57, True)), cfg, bus, on_audio_chunk=sent.append)
+    bus.robot_speaking.set()
+    eng.endpointer._in_speech = True
+    eng._chunk_buf = np.zeros(int(0.5 * 16000), dtype=np.float32)
+    eng._maybe_barge()
+    assert sent == []
