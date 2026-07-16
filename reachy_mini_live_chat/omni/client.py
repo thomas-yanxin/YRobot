@@ -45,7 +45,7 @@ class OmniClient:
         self._turn_text: dict[str, str] = {}
         # rolling 5 s telemetry so "no response" is diagnosable from one run:
         # is the mic reaching us (uplink rms), and what is the server sending back?
-        self._stats = {"up": 0, "up_rms": 0.0, "up_rms_max": 0.0, "drop": 0, "text": 0, "audio": 0, "listen": 0, "done": 0, "barge": 0}
+        self._stats = {"up": 0, "up_rms": 0.0, "up_rms_max": 0.0, "drop": 0, "frames": 0, "no_frame": 0, "text": 0, "audio": 0, "listen": 0, "done": 0, "barge": 0}
         self._seen_other: set = set()  # unrecognized event (type, kind) — logged once each
         self._clean_close = False      # last session ended via a server session.closed
         # Diagnostics: dump exactly what we send to the model (raw s16le mono 16 kHz)
@@ -203,9 +203,15 @@ class OmniClient:
             playq = self.bus.tts_audio.qsize()  # unplayed audio backlog (→ choppy if it grows)
             if n or s["text"] or s["audio"] or s["listen"] or s["done"]:
                 log.info(
-                    "omni 5s: uplink=%d chunks (mic rms~%.4f peak~%.4f, dropped=%d, force_listen=%d) | downlink text=%d audio=%d listen=%d done=%d | playq=%d",
-                    n, (s["up_rms"] / n if n else 0.0), s["up_rms_max"], s["drop"], s["barge"], s["text"], s["audio"], s["listen"], s["done"], playq,
+                    "omni 5s: uplink=%d chunks (mic rms~%.4f peak~%.4f, dropped=%d, force_listen=%d, frames=%d/%d) | downlink text=%d audio=%d listen=%d done=%d | playq=%d",
+                    n, (s["up_rms"] / n if n else 0.0), s["up_rms_max"], s["drop"], s["barge"],
+                    s["frames"], s["frames"] + s["no_frame"], s["text"], s["audio"], s["listen"], s["done"], playq,
                 )
+                if s["no_frame"] and not s["frames"]:
+                    log.warning("omni: video-mode session but NO camera frames attached this "
+                                "window — camera busy? (face tracking or another consumer). "
+                                "The backend may stay silent without frames; try "
+                                "ENABLE_FACE_TRACKING=0 or OMNI_GATEWAY_MODE=audio.")
                 if playq > 25:
                     # Long replies stream in bursts (generation outruns real-time playback),
                     # so a transient backlog is expected; it is dropped wholesale on a
@@ -242,6 +248,11 @@ class OmniClient:
             # the server past real time (→ backlog / choppy speech). Never in audio mode.
             want_frame = self._frame_source and send_video and (sent % every_n == 0)
             frame_b64 = self._frame_source() if want_frame else None
+            if want_frame:
+                # A video-mode session that stops getting frames is a real failure
+                # mode (e.g. another consumer grabs the camera): count both sides
+                # so the 5 s stats show it instead of a silent "model never replies".
+                self._stats["frames" if frame_b64 else "no_frame"] += 1
             # Barge-in: tell the SERVER to stop its current turn and listen. Keyed on
             # interrupt_event (set only on a real barge-in, never at idle) so it can NEVER
             # stick on — keying it on user_speaking made force_listen permanent whenever the

@@ -35,11 +35,16 @@ AUDIO_STARTUP_CONFIG = (
 )
 
 
-def apply_startup_config(mini, *, verify: bool = True) -> bool:
+def apply_startup_config(mini, *, verify: bool = True, attempts: int = 1) -> bool:
     """Write the tuned XVF3800 config to the ReSpeaker. Returns True on success.
 
+    A single parameter failing write/verify makes the SDK return False (it logs
+    which one); ``attempts`` > 1 rewrites the whole set — the writes are
+    idempotent and a busy chip (pipelines just started) often takes the retry.
     Never raises: a missing board / SDK API just logs and returns False.
     """
+    import time
+
     audio = getattr(getattr(mini, "media", None), "audio", None)
     if audio is None:
         log.info("respeaker: no media.audio — skipping XVF3800 tuning")
@@ -49,14 +54,20 @@ def apply_startup_config(mini, *, verify: bool = True) -> bool:
         log.warning("respeaker: SDK has no apply_audio_config — update reachy-mini to tune the "
                     "XVF3800 (echo/NS/AGC stay at chip defaults)")
         return False
-    try:
-        ok = bool(apply(AUDIO_STARTUP_CONFIG, verify=verify))
-    except Exception as e:
-        log.warning("respeaker: apply_audio_config failed (%s) — using chip defaults", e)
-        return False
-    if ok:
-        log.info("respeaker: XVF3800 tuned (hardware AEC+NS+AGC) — %s",
-                 ", ".join(f"{n}={' '.join(map(str, v))}" for n, v in AUDIO_STARTUP_CONFIG))
-    else:
-        log.warning("respeaker: XVF3800 config not applied (board unavailable?)")
-    return ok
+    for i in range(max(1, attempts)):
+        if i:
+            time.sleep(0.5)
+            log.info("respeaker: retrying XVF3800 config (%d/%d)", i + 1, attempts)
+        try:
+            ok = bool(apply(AUDIO_STARTUP_CONFIG, verify=verify))
+        except Exception as e:
+            log.warning("respeaker: apply_audio_config failed (%s)", e)
+            ok = False
+        if ok:
+            log.info("respeaker: XVF3800 tuned (hardware AEC+NS+AGC) — %s",
+                     ", ".join(f"{n}={' '.join(map(str, v))}" for n, v in AUDIO_STARTUP_CONFIG))
+            return True
+    log.warning("respeaker: XVF3800 config not fully applied after %d attempt(s) — "
+                "echo/NS/AGC may be at chip defaults (see SDK warnings above for the "
+                "failing parameter)", max(1, attempts))
+    return False

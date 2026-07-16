@@ -111,16 +111,21 @@ class AudioEngine:
         except Exception:
             pass
         self._play_sub_n = max(1, int(self._out_sr * self.cfg.omni_playback_chunk_ms / 1000))
+        # Tune the ReSpeaker XVF3800 (hardware AEC/NS/AGC) twice: once BEFORE the media
+        # pipelines start (the known-good order on this hardware) and once ~1 s AFTER
+        # (the official app's timing — (re)opening the audio device can reset the chip).
+        # Writes are idempotent; the post-start pass retries because a busy chip right
+        # after pipeline start can fail a parameter (seen on hardware: "1 failed
+        # parameter(s)" → mic level/NS off → the model hears background and never
+        # replies). Done synchronously, before the capture thread's DoA USB polling.
+        tune = getattr(self.cfg, "omni_respeaker_config", True)
+        if tune:
+            apply_startup_config(self.mini)
         self.mini.media.start_recording()
         self.mini.media.start_playing()
-        # Tune the ReSpeaker XVF3800 (hardware AEC/NS/AGC) AFTER the media pipelines are
-        # up — the official app writes it ~1 s after pipeline start, because (re)opening
-        # the audio device can reset the chip to defaults. Writing before start_recording
-        # risks the tuning being clobbered, leaving echo/AGC at chip defaults. Done here
-        # synchronously (before the capture thread's DoA polling touches USB).
-        if getattr(self.cfg, "omni_respeaker_config", True):
-            time.sleep(0.5)  # let the pipelines settle, mirroring the official app
-            apply_startup_config(self.mini)
+        if tune:
+            time.sleep(1.0)  # let the pipelines settle, mirroring the official app
+            apply_startup_config(self.mini, attempts=3)
         for target in (self._capture_loop, self._playback_loop):
             t = threading.Thread(target=target, name=target.__name__, daemon=True)
             t.start()

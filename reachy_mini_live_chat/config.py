@@ -184,8 +184,12 @@ class Config:
     enable_daemon_wobble: bool = field(default_factory=lambda: _flag("ENABLE_DAEMON_WOBBLE", True))
     # Daemon-native visual face tracking (mini.start_head_tracking): the robot looks
     # at the person even when nobody is talking. Paused (weight 0) while the robot
-    # speaks so the speech wobble owns the head, like the official app. Auto-detected.
-    enable_face_tracking: bool = field(default_factory=lambda: _flag("ENABLE_FACE_TRACKING", True))
+    # speaks so the speech wobble owns the head, like the official app. OFF by default:
+    # the tracker runs a vision model on the CM4 and contends for CPU + the camera
+    # with the omni video uplink (observed: motion 30→12 Hz and the model going
+    # silent right after it was enabled). Opt in on capable setups only — the
+    # official app also treats it as an on-demand tool, not always-on.
+    enable_face_tracking: bool = field(default_factory=lambda: _flag("ENABLE_FACE_TRACKING", False))
     emotions_dataset: str = field(default_factory=lambda: _env("EMOTIONS_DATASET", "pollen-robotics/reachy-mini-emotions-library"))
     # 30 Hz keeps set_target IPC light on the CM4 (each call competes with gstreamer +
     # the daemon); the EMA smoothing keeps motion fluid at this rate. Raise on a laptop.
