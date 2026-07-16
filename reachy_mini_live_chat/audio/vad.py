@@ -27,17 +27,24 @@ FRAME = 512  # Silero v5 wants 512 samples @ 16 kHz == 32 ms
 
 
 class _EnergyVad:
-    """Fallback VAD: adaptive RMS gate with a noise floor tracker."""
+    """Fallback VAD: adaptive RMS gate with a fast-drop / slow-rise noise-floor tracker."""
 
     def __init__(self) -> None:
-        self._floor = 1e-3
-        self._alpha = 0.98
+        # Start near a typical ambient level. The XVF3800's hardware AGC raises the mic's
+        # noise floor (rms ~0.05 even when quiet), so a tiny init would look like permanent
+        # speech until it adapts.
+        self._floor = 1e-2
 
     def speech_prob(self, frame: np.ndarray) -> float:
         rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)) + 1e-9)
-        # track the noise floor slowly, only when quiet
-        if rms < self._floor * 2:
-            self._floor = self._alpha * self._floor + (1 - self._alpha) * rms
+        # Track the noise floor both ways: drop quickly toward quiet frames, rise slowly
+        # during sustained sound. This adapts to the real ambient level (including one raised
+        # by hardware AGC) instead of sticking at init and reporting speech forever — the bug
+        # that pinned user_speaking on and kept the model permanently in listen.
+        if rms < self._floor:
+            self._floor = 0.9 * self._floor + 0.1 * rms
+        else:
+            self._floor = 0.995 * self._floor + 0.005 * rms
         snr = rms / (self._floor + 1e-9)
         # map SNR -> pseudo-probability
         return float(np.clip((snr - 2.5) / 6.0, 0.0, 1.0))
