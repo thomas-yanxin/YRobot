@@ -142,9 +142,11 @@ class Config:
     omni_max_speak_tokens_per_chunk: Optional[int] = field(default_factory=lambda: _opt_int("OMNI_MAX_SPEAK_TOKENS_PER_CHUNK"))
     omni_tts_temperature: Optional[float] = field(default_factory=lambda: _opt_float("OMNI_TTS_TEMPERATURE"))
 
-    # -- VAD (XVF3800 firmware voice flag; drives DOA / listen-mood / barge-in) ----
-    # The mic board's post-AEC voice detection is the only voice source — it can't be
-    # fooled by residual echo or head-servo noise. These knobs only debounce it.
+    # -- VAD (energy gate on the AEC'd mic; drives DOA / listen-mood / barge-in) ----
+    # The AEC'd mic is the only signal free of the robot's own voice, which is what
+    # makes barge-in work. (The XVF3800's own speech flag runs PRE-AEC — it hears the
+    # robot's speaker and servos — so it's only used for the DOA angle, never voice.)
+    vad_threshold: float = field(default_factory=lambda: _float("VAD_THRESHOLD", 0.5))
     vad_silence_ms: int = field(default_factory=lambda: _int("VAD_SILENCE_MS", 320))
     vad_min_speech_ms: int = field(default_factory=lambda: _int("VAD_MIN_SPEECH_MS", 200))
     # Shorter onset gate while the robot is speaking = how fast you can cut it off.

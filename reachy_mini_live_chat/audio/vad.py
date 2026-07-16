@@ -1,15 +1,18 @@
-"""Voice-activity detection + turn endpointing, driven by the ReSpeaker XVF3800.
+"""Voice-activity detection + turn endpointing on the AEC'd mic stream.
 
-The mic board's firmware runs its own post-AEC voice detection (exposed together
-with the DOA angle via a USB control read). That flag is the *only* voice source
-here: unlike an energy gate it does not confuse residual echo or head-servo noise
-with a human, which is exactly what barge-in needs. The remote omni model still
-does the real turn-taking — this VAD only drives DOA head-turns, the listen mood,
-barge-in, and the e2e latency clock.
+The voice source is an adaptive RMS gate over the *echo-cancelled* mic signal —
+the one signal in the system where the robot's own voice is absent (the XVF3800
+removes it in hardware before the samples reach us). That property is what makes
+barge-in possible: while the robot speaks, energy on this stream is a human.
 
-:class:`HwVoiceFlag` adapts the cached firmware flag to the frame-based
-:class:`Endpointer`, which turns it into debounced speech-start / utterance-end
-callbacks via a min-speech / silence-window state machine.
+The XVF3800 firmware also reports its own "speech detected" flag (with the DOA
+angle), but that detector runs on the RAW mic array — pre-AEC — so during
+playback it hears the robot's own speaker and servos and stays high (verified on
+hardware: barge-ins fired seconds into every reply at mic rms ~0.01). It is
+therefore only used for the DOA head-turn, never for voice/barge decisions.
+
+The remote omni model does the real turn-taking — this VAD only drives DOA,
+the listen mood, barge-in, and the e2e latency clock.
 """
 from __future__ import annotations
 
@@ -23,19 +26,27 @@ log = logging.getLogger("live_chat.vad")
 FRAME = 512  # 32 ms @ 16 kHz — the endpointer's debounce granularity
 
 
-class HwVoiceFlag:
-    """Adapt a cached XVF3800 voice flag to the Endpointer's speech_prob API.
+class EnergyVad:
+    """Adaptive RMS gate with a fast-drop / slow-rise noise-floor tracker."""
 
-    ``get_flag`` returns the most recent firmware reading (refreshed by the
-    audio capture loop's ~20 Hz USB poll); audio frames are ignored — the
-    firmware already looked at the signal, post-AEC.
-    """
-
-    def __init__(self, get_flag: Callable[[], bool]) -> None:
-        self._get_flag = get_flag
+    def __init__(self) -> None:
+        # Start near a typical ambient level. The XVF3800's hardware AGC raises the mic's
+        # noise floor (rms ~0.05 even when quiet), so a tiny init would look like permanent
+        # speech until it adapts.
+        self._floor = 1e-2
 
     def speech_prob(self, frame: np.ndarray) -> float:
-        return 1.0 if self._get_flag() else 0.0
+        rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)) + 1e-9)
+        # Track the noise floor both ways: drop quickly toward quiet frames, rise slowly
+        # during sustained sound. This adapts to the real ambient level (including one
+        # raised by hardware AGC) instead of sticking at init and reporting speech forever.
+        if rms < self._floor:
+            self._floor = 0.9 * self._floor + 0.1 * rms
+        else:
+            self._floor = 0.995 * self._floor + 0.005 * rms
+        snr = rms / (self._floor + 1e-9)
+        # map SNR -> pseudo-probability
+        return float(np.clip((snr - 2.5) / 6.0, 0.0, 1.0))
 
 
 class Endpointer:
