@@ -34,10 +34,11 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 - Uses MiniCPM's natural `listen/speak` decision first. As a reliability fallback, DoA can never
   interrupt alone: post-AEC speech must remain at least 6 dB above the learned far-end residual
   for a sustained 120 ms before playback is cleared and `force_listen` is sent.
-- Sends `force_listen` as a silent control slice and temporarily holds the real microphone slice;
-  after MiniCPM acknowledges `listen`, the user's interrupting words are forwarded normally instead
-  of being consumed by the control decision. Waiting for that acknowledgement is bounded, and a new
-  session clears any stale interruption state, so a lost acknowledgement can never mute the robot.
+- Ships the user's real interrupting words immediately with the `force_listen` flag (the partial
+  capture buffer is flushed at the moment of detection). Hardware testing showed a silent control
+  slice makes the model hear nobody, resume its own story after the acknowledgement, and then stall
+  in listen. Waiting for the acknowledgement is bounded, and a new session clears any stale
+  interruption state, so a lost acknowledgement can never mute the robot.
 - Discards the whole interrupted turn: the backend streams a turn in bursts that run many seconds
   ahead of playback, so its audio is dropped until the next `listen` boundary (the model actually
   stopped speaking) instead of resuming mid-sentence after a timeout. The GStreamer flush runs on

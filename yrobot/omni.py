@@ -15,7 +15,7 @@ import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from .config import CHUNK_SAMPLES, OUTPUT_SAMPLE_RATE, Config
+from .config import OUTPUT_SAMPLE_RATE, Config
 
 log = logging.getLogger(__name__)
 
@@ -192,43 +192,25 @@ class OmniClient:
         stop_event: threading.Event,
     ) -> None:
         last_send_at: float | None = None
-        force_control_sent_at: float | None = None
-        deferred_audio: np.ndarray | None = None
         last_send_cost = 0.0
         while not stop_event.is_set():
+            audio = await asyncio.to_thread(robot.next_audio_chunk, 0.25)
+            if audio is None:
+                continue
+            # An interruption ships the user's REAL words together with the
+            # force_listen flag (RobotIO emits the pending partial slice at the
+            # moment of detection). Hardware showed that a silent control slice
+            # makes the model hear nobody and simply resume its own story.
             force_listen = robot.force_listen_active()
-            if force_listen:
-                # A forced-listen time slice is a control boundary. Sending the
-                # user's interruption in the same slice can make the backend
-                # acknowledge `listen` without retaining that short utterance.
-                # Keep real microphone audio queued and use silence for control.
-                now = time.perf_counter()
-                if force_control_sent_at is not None and now - force_control_sent_at < 1.0:
-                    await asyncio.sleep(0.05)
-                    continue
-                audio = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
-                frame = None
-            else:
-                force_control_sent_at = None
-                if deferred_audio is not None:
-                    audio = deferred_audio
-                    deferred_audio = None
-                else:
-                    audio = await asyncio.to_thread(robot.next_audio_chunk, 0.25)
-                    if audio is None:
-                        continue
-                    # Double talk can be detected while next_audio_chunk blocks.
-                    # Defer this real chunk until the listen acknowledgement.
-                    if robot.force_listen_active():
-                        deferred_audio = audio
-                        continue
-                # Degrade the optional video before the audio cadence suffers:
-                # after one slow Wi-Fi send, the next slice travels audio-only.
-                frame = (
-                    robot.get_frame_jpeg()
-                    if self.config.send_video and last_send_cost <= SLOW_SEND_SECONDS
-                    else None
-                )
+            # Degrade the optional video before the audio cadence suffers:
+            # after one slow Wi-Fi send, the next slice travels audio-only.
+            frame = (
+                robot.get_frame_jpeg()
+                if self.config.send_video
+                and not force_listen
+                and last_send_cost <= SLOW_SEND_SECONDS
+                else None
+            )
             encode_started = time.perf_counter()
             message = await asyncio.to_thread(
                 serialize_input_append,
@@ -240,8 +222,6 @@ class OmniClient:
             send_started = time.perf_counter()
             await websocket.send(message)
             sent_at = time.perf_counter()
-            if force_listen:
-                force_control_sent_at = sent_at
             send_ms = (sent_at - send_started) * 1_000
             last_send_cost = (encode_ms + send_ms) / 1_000
             if last_send_at is not None and sent_at - last_send_at > 1.15:
@@ -279,6 +259,7 @@ class OmniClient:
         audio_stream_active = False
         last_event = "none"
         audio_samples = 0
+        listen_streak = 0
         try:
             while True:
                 event = self._parse_event(await websocket.recv())
@@ -288,6 +269,7 @@ class OmniClient:
                     kind = event.get("kind")
                     last_event = f"{event_type}:{kind}"
                     if kind == "audio" and event.get("audio"):
+                        listen_streak = 0
                         response_id = str(event.get("response_id") or "current")
                         arrived_at = time.perf_counter()
                         samples = decode_pcm(event["audio"])
@@ -323,6 +305,15 @@ class OmniClient:
                             event.get("text") or ""
                         )
                     elif kind == "listen":
+                        # One listen delta arrives per idle second. A very long
+                        # streak while the user is talking means the model is
+                        # not answering — surface it instead of staying silent.
+                        listen_streak += 1
+                        if listen_streak % 30 == 0:
+                            log.info(
+                                "Model has stayed listening for %d consecutive slices",
+                                listen_streak,
+                            )
                         if utterance_parts:
                             log.info("Reachy: %s", "".join(utterance_parts))
                             utterance_parts.clear()

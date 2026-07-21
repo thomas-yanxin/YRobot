@@ -167,7 +167,7 @@ def test_tts_gap_survives_response_done_and_response_id_change(
     assert robot.supply_gaps and robot.supply_gaps[0] > 0.05
 
 
-def test_sender_sends_silent_force_control_before_preserved_microphone() -> None:
+def test_sender_flags_real_interruption_audio_with_force_listen() -> None:
     stop_event = threading.Event()
     microphone = np.linspace(-0.5, 0.5, 16_000, dtype=np.float32)
 
@@ -205,10 +205,12 @@ def test_sender_sends_silent_force_control_before_preserved_microphone() -> None
     asyncio.run(client._send_loop(websocket, robot, stop_event))
 
     assert len(websocket.messages) == 2
-    control, speech = websocket.messages
-    assert control["type"] == "input.append"
-    assert control["input"]["force_listen"] is True
-    np.testing.assert_array_equal(decode_pcm(control["input"]["audio"]), np.zeros(16_000))
+    interruption, speech = websocket.messages
+    assert interruption["type"] == "input.append"
+    # The model must hear the user's actual words in the forced slice; a
+    # silent control slice made it resume its own story.
+    assert interruption["input"]["force_listen"] is True
+    np.testing.assert_array_equal(decode_pcm(interruption["input"]["audio"]), microphone)
     assert "force_listen" not in speech["input"]
     np.testing.assert_array_equal(decode_pcm(speech["input"]["audio"]), microphone)
 

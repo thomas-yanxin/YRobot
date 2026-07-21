@@ -405,6 +405,7 @@ class RobotIO:
         self._discard_turn_active = False
         self._player_clear_pending = False
         self._force_listen_event = threading.Event()
+        self._emit_partial_event = threading.Event()
         self._stop_event = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._camera_thread: threading.Thread | None = None
@@ -552,6 +553,7 @@ class RobotIO:
     def reset_interruption(self) -> None:
         """Drop interruption state that must not leak into a new Omni session."""
         self._force_listen_event.clear()
+        self._emit_partial_event.clear()
         with self._playback_lock:
             self._suppress_playback_until = 0.0
             self._discard_turn_active = False
@@ -604,6 +606,10 @@ class RobotIO:
 
         self._force_requested_at = now
         self._force_listen_event.set()
+        # Ship the user's words already sitting in the capture buffer right
+        # away so the model hears WHO interrupted it in the same forced slice
+        # instead of a second of silence (which made it resume its own story).
+        self._emit_partial_event.set()
         self._flush_playback_for_listen(now, suppress_until_listen=True)
         log.info(
             "Post-AEC double talk detected at %.1f dBFS (threshold %.1f); forcing listen",
@@ -664,10 +670,15 @@ class RobotIO:
                     continue
                 mono = to_mono(sample)
                 # The double-talk detector reads the raw post-AEC level; only
-                # the uploaded slice gets the AGC lift.
+                # the uploaded slice gets the AGC lift. Its estimate adapts
+                # only on frames DoA recently attributed to the user, so
+                # ambient noise cannot drag the speech level down and end up
+                # amplified eightfold.
+                now = time.monotonic()
                 with self._state_lock:
                     self._microphone_level_db = audio_level_db(mono)
-                    speaking = time.monotonic() < self._speaking_until
+                    speaking = now < self._speaking_until
+                    user_recent = now - self._last_user_speech_at <= 1.5
                 offset = 0
                 while offset < mono.size:
                     copied = min(CHUNK_SAMPLES - pending_size, mono.size - offset)
@@ -675,8 +686,16 @@ class RobotIO:
                     pending_size += copied
                     offset += copied
                     if pending_size == CHUNK_SAMPLES:
-                        self._put_latest(agc.process(pending.copy(), adapt=not speaking))
+                        self._put_latest(
+                            agc.process(pending.copy(), adapt=user_recent and not speaking)
+                        )
                         pending_size = 0
+                if self._emit_partial_event.is_set() and pending_size > 0:
+                    # A confirmed interruption must not wait for the slice to
+                    # fill: send the user's words to the model immediately.
+                    self._emit_partial_event.clear()
+                    self._put_latest(agc.process(pending[:pending_size].copy(), adapt=False))
+                    pending_size = 0
             except Exception as exc:
                 log.warning("Microphone read failed: %s", exc)
                 self._stop_event.wait(1.0)
@@ -804,7 +823,10 @@ class RobotIO:
                         resample_ms,
                         push_ms,
                     )
-                elif resample_ms > 10.0 or push_ms > 10.0:
+                elif resample_ms + push_ms > 100.0:
+                    # Only a stage cost that threatens the real-time budget of
+                    # a one-second slice is worth a warning; the CM4 routinely
+                    # spends a few tens of ms here under load.
                     log.warning(
                         "Slow playback stage for %s: resample=%.1f ms, push=%.1f ms",
                         response_id,

@@ -8,6 +8,7 @@ import pytest
 from reachy_mini.utils.interpolation import delta_angle_between_mat_rot
 from scipy.spatial.transform import Rotation
 
+from yrobot.config import CHUNK_SAMPLES
 from yrobot.robot import (
     ANTENNA_POSES,
     DOA_GAZE_ELEVATION,
@@ -272,6 +273,35 @@ def test_new_session_clears_stale_interruption_state() -> None:
 
     assert not robot.force_listen_active()
     assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r2") is True
+
+
+def test_interrupt_ships_the_partial_microphone_slice_immediately() -> None:
+    class Media:
+        def get_audio_sample(self) -> np.ndarray:
+            time.sleep(0.005)
+            return np.full(160, 0.05, dtype=np.float32)  # 10 ms of speech
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    robot = RobotIO(Mini())
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+
+    worker = threading.Thread(target=robot._capture_loop, daemon=True)
+    worker.start()
+    try:
+        time.sleep(0.1)
+        assert robot._request_user_interrupt(-24.0, -30.0)
+        chunk = robot.next_audio_chunk(0.5)
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
+
+    assert chunk is not None
+    assert 0 < chunk.size < CHUNK_SAMPLES
 
 
 def test_slice_boundaries_within_one_utterance_do_not_restart_playback() -> None:
