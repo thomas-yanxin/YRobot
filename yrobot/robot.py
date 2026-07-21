@@ -12,7 +12,9 @@ from collections.abc import Mapping
 from contextlib import suppress
 
 import numpy as np
+from reachy_mini.utils import create_head_pose
 from reachy_mini.utils.interpolation import (
+    compose_world_offset,
     delta_angle_between_mat_rot,
     linear_pose_interpolation,
     time_trajectory,
@@ -24,9 +26,9 @@ from .config import CHUNK_SAMPLES, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE
 log = logging.getLogger(__name__)
 
 ANTENNA_POSES: Mapping[str, tuple[float, float]] = {
-    "idle": (-10.0, 10.0),
-    "listening": (-22.0, 22.0),
-    "speaking": (-30.0, 30.0),
+    "idle": (-11.0, 11.0),
+    "listening": (-16.0, 16.0),
+    "speaking": (-20.0, 20.0),
 }
 
 # Tuned XVF3800 parameters from the official Reachy Mini conversation app.
@@ -40,9 +42,19 @@ AUDIO_STARTUP_CONFIG = (
     ("PP_MGSCALE", (4.0, 1.0, 1.0)),
 )
 
-MOTION_PERIOD = 0.05
+# The official conversation app uses a 60 Hz single-owner motion loop. 50 Hz
+# keeps the same smooth-control regime while leaving a little more CM4 margin.
+MOTION_PERIOD = 0.02
+DOA_PERIOD = 0.05
 CAMERA_PERIOD = 1.0
-PLAYBACK_PREROLL_SECONDS = 0.12
+# Reachy's GStreamer player reanchors its clock after a 200 ms input gap.
+# Keeping more than that buffered before the first push prevents a short TTS
+# delivery pause from being heard as a truncated/restarted utterance.
+PLAYBACK_PREROLL_SECONDS = 0.32
+FAR_END_UPLOAD_GUARD = 0.25
+# Microphone uploads are one second long. Keep a near-end detection valid until
+# the chunk containing its onset reaches the network sender.
+NEAR_END_UPLOAD_HOLD = CHUNK_SAMPLES / INPUT_SAMPLE_RATE + 0.1
 BARGE_IN_ARM_DELAY = 0.3
 BARGE_IN_CONFIRMATIONS = 3
 BARGE_IN_COOLDOWN = 1.0
@@ -51,7 +63,15 @@ BARGE_IN_RELEASE_SILENCE = 0.7
 BARGE_IN_POST_LISTEN_GUARD = 0.4
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
 MAX_HEAD_TRANSLATION_STEP = 0.003
-MAX_ANTENNA_STEP = math.radians(4.0)
+MAX_HEAD_ANGULAR_SPEED = math.radians(45.0)
+MAX_HEAD_TRANSLATION_SPEED = 0.04
+MAX_ANTENNA_SPEED = math.radians(100.0)
+HEAD_SERVO_TIME_CONSTANT = 0.22
+USER_SPEECH_HOLD = 0.25
+DOA_TURN_THRESHOLD = math.radians(4.0)
+DOA_TURN_COOLDOWN = 0.35
+LISTENING_NOD_DURATION = 0.72
+STATE_TRANSITION_DURATION = 0.9
 NATURAL_HEAD_PITCH_DEGREES = -4.0
 DOA_GAZE_ELEVATION = math.tan(math.radians(-NATURAL_HEAD_PITCH_DEGREES))
 
@@ -200,6 +220,114 @@ def step_pose(
     return linear_pose_interpolation(current_pose, target_pose, fraction)
 
 
+def smooth_pose_step(
+    current: np.ndarray,
+    target: np.ndarray,
+    elapsed: float,
+    *,
+    time_constant: float = HEAD_SERVO_TIME_CONSTANT,
+    max_angular_speed: float = MAX_HEAD_ANGULAR_SPEED,
+    max_translation_speed: float = MAX_HEAD_TRANSLATION_SPEED,
+) -> np.ndarray:
+    """Ease a reactive pose target while keeping speed independent of loop rate."""
+    if elapsed <= 0:
+        return np.asarray(current, dtype=np.float64).copy()
+    if time_constant <= 0:
+        raise ValueError("time_constant must be positive")
+    eased_fraction = 1.0 - math.exp(-elapsed / time_constant)
+    eased_target = linear_pose_interpolation(current, target, eased_fraction)
+    return step_pose(
+        current,
+        eased_target,
+        max_angular_step=max_angular_speed * elapsed,
+        max_translation_step=max_translation_speed * elapsed,
+    )
+
+
+def gesture_pulse(progress: float) -> float:
+    """Return a minimum-jerk 0→1→0 pulse for a normalized gesture."""
+    if progress < 0.0 or progress > 1.0:
+        return 0.0
+    leg = progress * 2.0 if progress <= 0.5 else (1.0 - progress) * 2.0
+    return time_trajectory(leg)
+
+
+def effective_conversation_state(model_state: str, speaking: bool) -> str:
+    """Use real playback as the source of truth for the speaking posture.
+
+    Token2Wav may emit a final audio delta after ``response.done``. That late
+    delta sets the model state to speaking without a following event to clear
+    it, so an expired playback deadline must settle back to listening.
+    """
+    if speaking:
+        return "speaking"
+    return "listening" if model_state == "speaking" else model_state
+
+
+def lifelike_motion_overlay(
+    elapsed: float,
+    state: str,
+    *,
+    user_speaking: bool,
+    transition_pulse: float = 0.0,
+    nod_pulse: float = 0.0,
+    glance_pulse: float = 0.0,
+    glance_yaw_degrees: float = 0.0,
+    glance_pitch_degrees: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a restrained additive head pose and non-repeating antenna pose.
+
+    The head values stay deliberately below the SDK's audio-reactive wobble;
+    this layer supplies continuity and conversational intent while the SDK
+    remains responsible for playback-synchronised speech motion.
+    """
+    if state not in ANTENNA_POSES:
+        raise ValueError(f"unknown conversation state: {state}")
+    t = max(0.0, elapsed)
+
+    # Slow mixed-frequency motion avoids a perfectly periodic "screensaver"
+    # look. Speech uses less base motion because the SDK wobbler is additive.
+    z_amplitude = {"idle": 0.0018, "listening": 0.0011, "speaking": 0.0005}[state]
+    roll_amplitude = {"idle": 0.45, "listening": 0.28, "speaking": 0.15}[state]
+    pitch_amplitude = {"idle": 0.28, "listening": 0.18, "speaking": 0.10}[state]
+    z = z_amplitude * (
+        0.72 * math.sin(2.0 * math.pi * 0.11 * t) + 0.28 * math.sin(2.0 * math.pi * 0.073 * t + 1.1)
+    )
+    roll = math.radians(roll_amplitude) * math.sin(2.0 * math.pi * 0.083 * t + 0.7)
+    pitch = math.radians(pitch_amplitude) * math.sin(2.0 * math.pi * 0.13 * t + 1.9)
+    yaw = 0.0
+
+    if state == "speaking":
+        pitch -= math.radians(1.1) * transition_pulse
+        z += 0.0007 * transition_pulse
+    pitch += math.radians(1.8) * nod_pulse
+    yaw += math.radians(glance_yaw_degrees) * glance_pulse
+    pitch += math.radians(glance_pitch_degrees) * glance_pulse
+
+    head_offset = create_head_pose(
+        z=z,
+        roll=roll,
+        pitch=pitch,
+        yaw=yaw,
+        degrees=False,
+    )
+
+    antennas = np.deg2rad(np.asarray(ANTENNA_POSES[state], dtype=np.float64))
+    if not user_speaking:
+        sway_amplitude = {"idle": 2.4, "listening": 1.3, "speaking": 1.8}[state]
+        symmetric_sway = math.radians(sway_amplitude) * (
+            0.65 * math.sin(2.0 * math.pi * 0.19 * t + 0.2)
+            + 0.35 * math.sin(2.0 * math.pi * 0.31 * t + 2.0)
+        )
+        asymmetry = math.radians(0.55) * math.sin(2.0 * math.pi * 0.127 * t + 1.4)
+        antennas = antennas + np.array(
+            [-symmetric_sway + asymmetry, symmetric_sway + 0.6 * asymmetry]
+        )
+    if state == "speaking":
+        antennas = antennas + np.deg2rad([-2.0, 2.0]) * transition_pulse
+    return head_offset, antennas
+
+
 class RobotIO:
     """Own Reachy media and serialize every application-level motion command."""
 
@@ -246,6 +374,7 @@ class RobotIO:
         self._recording = False
         self._playing = False
         self._wobbling = False
+        self._motion_rng = random.Random()
         self._command_head = np.eye(4, dtype=np.float64)
         self._target_head = self._command_head.copy()
         self._command_antennas = np.deg2rad(ANTENNA_POSES["idle"])
@@ -317,9 +446,24 @@ class RobotIO:
 
     def next_audio_chunk(self, timeout: float) -> np.ndarray | None:
         try:
-            return self._audio_chunks.get(timeout=timeout)
+            audio = self._audio_chunks.get(timeout=timeout)
         except queue.Empty:
             return None
+
+        now = time.monotonic()
+        with self._state_lock:
+            far_end_active = now < self._speaking_until + FAR_END_UPLOAD_GUARD
+            near_end_recent = now - self._last_near_end_speech_at <= NEAR_END_UPLOAD_HOLD
+
+        # The Mini's hardware AEC is useful but not strong enough to guarantee
+        # that loudspeaker audio never reaches the full-duplex server. Preserve
+        # the one-second input cadence (and therefore video cadence), but mask
+        # the microphone while Reachy is speaking unless the local DoA + energy
+        # detector has positively identified a person talking over it.
+        if far_end_active and not near_end_recent and not self._barge_in_event.is_set():
+            log.debug("Masked far-end microphone audio during Reachy playback")
+            return np.zeros_like(audio)
+        return audio
 
     def flush_audio_input(self) -> None:
         while True:
@@ -403,8 +547,18 @@ class RobotIO:
 
     def confirm_omni_listening(self, response_id: str) -> None:
         """Record a server listen event that follows a force_listen input."""
+        now = time.monotonic()
         with self._state_lock:
             expected = self._expected_listen_response_id
+            playback_remaining = max(0.0, self._speaking_until - now)
+        if not self._barge_in_event.is_set() and (
+            playback_remaining > 0.05 or not self._playback_chunks.empty()
+        ):
+            log.warning(
+                "Omni switched to listen with %.0f ms of local speech still buffered (response=%s)",
+                playback_remaining * 1_000,
+                response_id or "unknown",
+            )
         if (
             self._barge_in_event.is_set()
             and self._force_listen_sent.is_set()
@@ -414,11 +568,12 @@ class RobotIO:
             self._try_finish_barge_in()
 
     def _update_barge_in_release(self, near_end_speech: bool, now: float) -> None:
-        if not self._barge_in_event.is_set():
-            return
         if near_end_speech:
             with self._state_lock:
                 self._last_near_end_speech_at = now
+        if not self._barge_in_event.is_set():
+            return
+        if near_end_speech:
             self._barge_in_user_done.clear()
             return
         with self._state_lock:
@@ -609,77 +764,157 @@ class RobotIO:
         last_effective_state = ""
         last_doa: float | None = None
         last_turn = 0.0
-        next_idle_motion = time.monotonic() + random.uniform(5.0, 8.0)
         last_command_error = 0.0
         barge_in_frames = 0
         barge_in_cooldown_until = 0.0
+        started_at = time.monotonic()
+        state_entered_at = started_at
+        last_tick = started_at
+        next_tick = started_at
+        next_doa_read = started_at
+        latest_doa: tuple[float, bool] | None = None
+        last_user_speech_at = -math.inf
+        user_was_speaking = False
+        listening_antennas = self._command_antennas.copy()
+        nod_started_at: float | None = None
+        next_nod_at = math.inf
+        glance_started_at: float | None = None
+        glance_duration = 1.6
+        glance_yaw = 0.0
+        glance_pitch = 0.0
+        next_glance_at = started_at + self._motion_rng.uniform(12.0, 20.0)
 
         while not self._stop_event.is_set():
             now = time.monotonic()
+            elapsed = min(max(now - last_tick, 0.001), 0.1)
+            last_tick = now
             with self._state_lock:
                 speaking = now < self._speaking_until
                 state = self._model_state
                 barge_in_armed_at = self._barge_in_armed_at
                 microphone_level_db = self._microphone_level_db
-            effective_state = "speaking" if speaking else state
+            effective_state = effective_conversation_state(state, speaking)
 
             if effective_state != last_effective_state:
-                self._target_antennas = np.deg2rad(
-                    ANTENNA_POSES.get(effective_state, ANTENNA_POSES["idle"])
-                )
                 last_effective_state = effective_state
+                state_entered_at = now
+                if effective_state == "speaking":
+                    nod_started_at = None
+                    glance_started_at = None
+                    next_glance_at = now + self._motion_rng.uniform(12.0, 20.0)
 
             # DoA's hardware speech bit also sees Reachy's own speaker. It may
             # assist barge-in, but only post-AEC microphone PCM is allowed to
             # confirm that audible near-end speech remains.
-            doa = self._read_doa()
-            speech_detected = doa is not None and doa[1]
+            doa_sampled = now >= next_doa_read
+            if doa_sampled:
+                latest_doa = self._read_doa()
+                next_doa_read = max(next_doa_read + DOA_PERIOD, now + DOA_PERIOD)
+            speech_detected = latest_doa is not None and latest_doa[1]
             near_end_speech = is_near_end_speech(
                 speech_detected,
                 microphone_level_db,
             )
             self._update_barge_in_release(near_end_speech, now)
             if speaking:
-                if near_end_speech and now >= barge_in_armed_at and now >= barge_in_cooldown_until:
-                    barge_in_frames += 1
-                    if barge_in_frames >= BARGE_IN_CONFIRMATIONS:
-                        if self.interrupt_omni_audio():
-                            barge_in_cooldown_until = now + BARGE_IN_COOLDOWN
-                            log.info(
-                                "Near-end speech confirmed at %.1f dBFS",
-                                microphone_level_db,
-                            )
+                if doa_sampled:
+                    if (
+                        near_end_speech
+                        and now >= barge_in_armed_at
+                        and now >= barge_in_cooldown_until
+                    ):
+                        barge_in_frames += 1
+                        if barge_in_frames >= BARGE_IN_CONFIRMATIONS:
+                            if self.interrupt_omni_audio():
+                                barge_in_cooldown_until = now + BARGE_IN_COOLDOWN
+                                log.info(
+                                    "Near-end speech confirmed at %.1f dBFS",
+                                    microphone_level_db,
+                                )
+                            barge_in_frames = 0
+                    else:
                         barge_in_frames = 0
-                else:
-                    barge_in_frames = 0
             else:
                 barge_in_frames = 0
-                if doa is not None:
-                    angle = doa[0]
-                    moved_enough = last_doa is None or angular_distance(angle, last_doa) >= 0.12
-                    if speech_detected and moved_enough and now - last_turn >= 0.8:
+                if speech_detected:
+                    last_user_speech_at = now
+                if doa_sampled and latest_doa is not None:
+                    angle = latest_doa[0]
+                    moved_enough = (
+                        last_doa is None or angular_distance(angle, last_doa) >= DOA_TURN_THRESHOLD
+                    )
+                    if speech_detected and moved_enough and now - last_turn >= DOA_TURN_COOLDOWN:
                         target = self._head_target_towards(angle)
                         if target is not None:
                             self._target_head = target
                             last_doa = angle
                             last_turn = now
-                            next_idle_motion = last_turn + random.uniform(5.0, 8.0)
-                if not speech_detected and effective_state == "idle" and now >= next_idle_motion:
-                    target = self._idle_glance_target()
-                    if target is not None:
-                        self._target_head = target
-                    next_idle_motion = time.monotonic() + random.uniform(6.0, 10.0)
 
-            self._command_head = step_pose(self._command_head, self._target_head)
+            user_speaking = not speaking and now - last_user_speech_at <= USER_SPEECH_HOLD
+            if user_speaking and not user_was_speaking:
+                listening_antennas = self._command_antennas.copy()
+                next_nod_at = now + self._motion_rng.uniform(2.2, 4.0)
+                next_glance_at = now + self._motion_rng.uniform(12.0, 20.0)
+            elif not user_speaking and user_was_speaking:
+                next_nod_at = math.inf
+            user_was_speaking = user_speaking
+
+            if user_speaking and nod_started_at is None and now >= next_nod_at:
+                nod_started_at = now
+                next_nod_at = now + self._motion_rng.uniform(4.0, 7.0)
+            nod_pulse = 0.0
+            if nod_started_at is not None:
+                nod_progress = (now - nod_started_at) / LISTENING_NOD_DURATION
+                nod_pulse = gesture_pulse(nod_progress)
+                if nod_progress > 1.0:
+                    nod_started_at = None
+
+            can_glance = not speaking and not user_speaking
+            if can_glance and glance_started_at is None and now >= next_glance_at:
+                glance_started_at = now
+                glance_duration = self._motion_rng.uniform(1.4, 2.0)
+                glance_yaw = self._motion_rng.choice((-1.0, 1.0)) * self._motion_rng.uniform(
+                    3.0, 6.0
+                )
+                glance_pitch = self._motion_rng.uniform(-1.2, 1.4)
+            glance_pulse = 0.0
+            if glance_started_at is not None:
+                glance_progress = (now - glance_started_at) / glance_duration
+                glance_pulse = gesture_pulse(glance_progress)
+                if glance_progress > 1.0:
+                    glance_started_at = None
+                    next_glance_at = now + self._motion_rng.uniform(12.0, 24.0)
+
+            transition_pulse = gesture_pulse((now - state_entered_at) / STATE_TRANSITION_DURATION)
+            head_offset, animated_antennas = lifelike_motion_overlay(
+                now - started_at,
+                effective_state,
+                user_speaking=user_speaking,
+                transition_pulse=transition_pulse,
+                nod_pulse=nod_pulse,
+                glance_pulse=glance_pulse,
+                glance_yaw_degrees=glance_yaw,
+                glance_pitch_degrees=glance_pitch,
+            )
+            self._target_antennas = (
+                listening_antennas.copy() if user_speaking else animated_antennas
+            )
+
+            self._command_head = smooth_pose_step(
+                self._command_head,
+                self._target_head,
+                elapsed,
+            )
+            commanded_head = compose_world_offset(self._command_head, head_offset)
             antenna_delta = np.clip(
                 self._target_antennas - self._command_antennas,
-                -MAX_ANTENNA_STEP,
-                MAX_ANTENNA_STEP,
+                -MAX_ANTENNA_SPEED * elapsed,
+                MAX_ANTENNA_SPEED * elapsed,
             )
             self._command_antennas = self._command_antennas + antenna_delta
             try:
                 self.mini.set_target(
-                    head=self._command_head,
+                    head=commanded_head,
                     antennas=self._command_antennas,
                     body_yaw=None,
                 )
@@ -688,7 +923,12 @@ class RobotIO:
                     log.warning("Motion command failed: %s", exc)
                     last_command_error = now
 
-            self._stop_event.wait(MOTION_PERIOD)
+            next_tick += MOTION_PERIOD
+            remaining = next_tick - time.monotonic()
+            if remaining < 0.0:
+                next_tick = time.monotonic()
+                remaining = 0.0
+            self._stop_event.wait(remaining)
 
     def _read_doa(self) -> tuple[float, bool] | None:
         try:
@@ -707,23 +947,6 @@ class RobotIO:
             return self.mini.look_at_world(*world, perform_movement=False)
         except Exception as exc:
             log.warning("Could not calculate DoA target: %s", exc)
-            return None
-
-    def _idle_glance_target(self) -> np.ndarray | None:
-        try:
-            from reachy_mini.utils import create_head_pose
-
-            return create_head_pose(
-                roll=random.uniform(-2.0, 2.0),
-                pitch=random.uniform(
-                    NATURAL_HEAD_PITCH_DEGREES - 2.0,
-                    NATURAL_HEAD_PITCH_DEGREES + 2.0,
-                ),
-                yaw=random.uniform(-4.0, 4.0),
-                degrees=True,
-            )
-        except Exception as exc:
-            log.debug("Idle motion unavailable: %s", exc)
             return None
 
     def _clear_player(self) -> None:
@@ -767,8 +990,6 @@ class RobotIO:
             log.warning("Could not read initial antenna pose: %s", exc)
             self._command_antennas = np.deg2rad(ANTENNA_POSES["idle"])
         try:
-            from reachy_mini.utils import create_head_pose
-
             self._target_head = create_head_pose(
                 pitch=NATURAL_HEAD_PITCH_DEGREES,
                 degrees=True,

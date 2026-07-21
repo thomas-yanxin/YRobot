@@ -219,7 +219,12 @@ class OmniClient:
 
     async def _receive_loop(self, websocket: Any, robot: RobotPort) -> None:
         transcript: dict[str, str] = {}
-        audio_supply_until: dict[str, float] = {}
+        # The raw full-duplex backend may relabel asynchronous Token2Wav
+        # callbacks with a later response id, and response.done can precede the
+        # final audio delta. Track the physical stream globally so diagnostics
+        # cannot hide a real starvation gap at either boundary.
+        audio_supply_until: float | None = None
+        audio_stream_active = False
         last_event = "none"
         audio_samples = 0
         try:
@@ -236,9 +241,8 @@ class OmniClient:
                         samples = decode_pcm(event["audio"])
                         audio_samples += samples.size
                         duration = samples.size / OUTPUT_SAMPLE_RATE
-                        supplied_until = audio_supply_until.get(response_id)
-                        if supplied_until is not None:
-                            supply_gap = arrived_at - supplied_until
+                        if audio_stream_active and audio_supply_until is not None:
+                            supply_gap = arrived_at - audio_supply_until
                             if supply_gap > 0.05:
                                 log.warning(
                                     "TTS supply gap for %s: %.0f ms beyond buffered audio",
@@ -251,9 +255,11 @@ class OmniClient:
                                     response_id,
                                     -supply_gap * 1_000,
                                 )
-                        audio_supply_until[response_id] = (
-                            max(arrived_at, supplied_until or arrived_at) + duration
-                        )
+                        audio_supply_until = max(
+                            arrived_at,
+                            audio_supply_until or arrived_at,
+                        ) + duration
+                        audio_stream_active = True
                         # RobotIO only enqueues here; its dedicated playback
                         # worker preserves order and survives a reconnect.
                         if robot.play_omni_audio(samples, response_id):
@@ -266,12 +272,15 @@ class OmniClient:
                     elif kind == "listen":
                         robot.confirm_omni_listening(str(event.get("response_id") or ""))
                         robot.set_conversation_state("listening")
+                        # Silence after an explicit listen boundary is expected
+                        # and must not be reported as TTS starvation.
+                        audio_supply_until = None
+                        audio_stream_active = False
                 elif event_type == "response.done":
                     response_id = str(event.get("response_id") or "current")
                     # Text decoding can finish before Token2Wav's background
                     # callback emits its final audio delta.  Playback uses its
                     # real queue/drain state instead of resetting at this event.
-                    audio_supply_until.pop(response_id, None)
                     partial_text = transcript.pop(response_id, "")
                     text = str(event.get("text") or partial_text).strip()
                     if text and not robot.force_listen_active():

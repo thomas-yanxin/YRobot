@@ -8,18 +8,25 @@ from reachy_mini.utils.interpolation import delta_angle_between_mat_rot
 from scipy.spatial.transform import Rotation
 
 from yrobot.robot import (
+    ANTENNA_POSES,
     BARGE_IN_MIN_LEVEL_DB,
     BARGE_IN_RELEASE_SILENCE,
     DOA_GAZE_ELEVATION,
+    MAX_HEAD_ANGULAR_SPEED,
     MAX_HEAD_ANGULAR_STEP,
+    MAX_HEAD_TRANSLATION_SPEED,
     MAX_HEAD_TRANSLATION_STEP,
     RobotIO,
     StreamingAudioResampler,
     angular_distance,
     audio_level_db,
     doa_world_direction,
+    effective_conversation_state,
+    gesture_pulse,
     is_near_end_speech,
+    lifelike_motion_overlay,
     resample_audio,
+    smooth_pose_step,
     step_pose,
     to_mono,
 )
@@ -40,6 +47,34 @@ def test_doa_alone_cannot_trigger_barge_in() -> None:
     assert not is_near_end_speech(True, BARGE_IN_MIN_LEVEL_DB - 1.0)
     assert not is_near_end_speech(False, 0.0)
     assert is_near_end_speech(True, BARGE_IN_MIN_LEVEL_DB)
+
+
+def test_far_end_microphone_is_masked_without_losing_input_cadence() -> None:
+    robot = RobotIO(object())
+    microphone = np.linspace(-0.5, 0.5, 16_000, dtype=np.float32)
+    robot._audio_chunks.put(microphone)
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 1.0
+
+    uploaded = robot.next_audio_chunk(0.01)
+
+    assert uploaded is not None
+    np.testing.assert_array_equal(uploaded, np.zeros_like(microphone))
+
+
+def test_confirmed_near_end_microphone_passes_during_playback() -> None:
+    robot = RobotIO(object())
+    microphone = np.linspace(-0.5, 0.5, 16_000, dtype=np.float32)
+    robot._audio_chunks.put(microphone)
+    now = time.monotonic()
+    robot._update_barge_in_release(True, now)
+    with robot._state_lock:
+        robot._speaking_until = now + 1.0
+
+    uploaded = robot.next_audio_chunk(0.01)
+
+    assert uploaded is not None
+    np.testing.assert_array_equal(uploaded, microphone)
 
 
 def test_output_is_resampled_from_24k_to_16k() -> None:
@@ -116,6 +151,63 @@ def test_pose_step_reaches_nearby_target() -> None:
     target = np.eye(4)
     target[0, 3] = MAX_HEAD_TRANSLATION_STEP / 2
     np.testing.assert_allclose(step_pose(current, target), target)
+
+
+def test_reactive_pose_servo_is_rate_independent_and_eased() -> None:
+    current = np.eye(4)
+    target = np.eye(4)
+    target[:3, :3] = Rotation.from_euler("z", 90, degrees=True).as_matrix()
+    target[0, 3] = 0.1
+    elapsed = 0.02
+
+    stepped = smooth_pose_step(current, target, elapsed)
+
+    angular_step = delta_angle_between_mat_rot(current[:3, :3], stepped[:3, :3])
+    translation_step = np.linalg.norm(stepped[:3, 3] - current[:3, 3])
+    assert 0.0 < angular_step <= MAX_HEAD_ANGULAR_SPEED * elapsed + 1e-9
+    assert 0.0 < translation_step <= MAX_HEAD_TRANSLATION_SPEED * elapsed + 1e-9
+    np.testing.assert_allclose(smooth_pose_step(current, target, 0.0), current)
+
+
+def test_gesture_pulse_has_minimum_jerk_return_to_rest() -> None:
+    assert gesture_pulse(-0.1) == 0.0
+    assert gesture_pulse(0.0) == 0.0
+    assert gesture_pulse(0.25) == pytest.approx(0.5)
+    assert gesture_pulse(0.5) == 1.0
+    assert gesture_pulse(0.75) == pytest.approx(0.5)
+    assert gesture_pulse(1.0) == 0.0
+    assert gesture_pulse(1.1) == 0.0
+
+
+def test_lifelike_overlay_is_restrained_and_listening_antennas_can_hold() -> None:
+    base_listening = np.deg2rad(ANTENNA_POSES["listening"])
+    quiet_head, quiet_antennas = lifelike_motion_overlay(
+        3.7,
+        "listening",
+        user_speaking=False,
+        nod_pulse=1.0,
+        glance_pulse=1.0,
+        glance_yaw_degrees=6.0,
+        glance_pitch_degrees=1.4,
+    )
+    _, held_antennas = lifelike_motion_overlay(
+        3.7,
+        "listening",
+        user_speaking=True,
+    )
+
+    angular_offset = delta_angle_between_mat_rot(np.eye(3), quiet_head[:3, :3])
+    assert angular_offset < math.radians(10.0)
+    assert abs(quiet_head[2, 3]) < 0.002
+    assert np.max(np.abs(quiet_antennas)) < math.radians(25.0)
+    np.testing.assert_allclose(held_antennas, base_listening)
+
+
+def test_playback_deadline_clears_a_late_stale_speaking_state() -> None:
+    assert effective_conversation_state("speaking", speaking=True) == "speaking"
+    assert effective_conversation_state("listening", speaking=True) == "speaking"
+    assert effective_conversation_state("speaking", speaking=False) == "listening"
+    assert effective_conversation_state("idle", speaking=False) == "idle"
 
 
 def test_omni_audio_is_played_by_dedicated_worker() -> None:

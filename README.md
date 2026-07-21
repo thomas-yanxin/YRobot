@@ -22,19 +22,28 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 - Streams one-second 16 kHz microphone slices and current camera JPEGs to `/backend`.
 - Plays streamed 24 kHz speech through a stateful 24→16 kHz resampler, preserving
   filter/phase continuity across TTS deltas instead of creating audible block edges.
-- Uses a short 120 ms first-audio prebuffer to absorb Wi-Fi and Token2Wav delivery jitter.
-- Keeps listening while Reachy speaks, preserving MiniCPM-o's full-duplex behavior.
+- Uses a 320 ms first-audio prebuffer to stay beyond the player's 200 ms clock-reset window
+  and absorb Wi-Fi and Token2Wav delivery jitter.
+- Keeps the full-duplex microphone cadence while Reachy speaks, but uploads silence for
+  far-end-only audio; locally confirmed near-end speech is passed through for voice barge-in.
 - Supports voice barge-in: debounced DoA speech plus post-AEC microphone energy clears
   local/GStreamer playback and holds `force_listen` until the server acknowledges listening.
 - Applies the official conversation app's XVF3800 echo/noise/gain tuning at startup.
 - Turns toward a detected speaker with Reachy's DoA API.
 - Keeps a slightly raised natural gaze; DoA changes yaw without accumulating downward pitch.
-- Uses the SDK's native audio-reactive wobble and restrained antenna/idle poses.
+- Keeps the last speaker as an attention anchor instead of replacing it with permanent random poses.
+- Adds small mixed-frequency breathing, occasional minimum-jerk glances, listening nods, and
+  asymmetric antenna motion; antennas hold still while the user is speaking.
+- Uses the SDK's playback-synchronised audio-reactive wobble for speech, layered over a smaller
+  base motion so the voice remains expressive without looking mechanically repetitive.
 - Uses the CM4-local media backend, avoiding a WebRTC encode/decode loop on the robot.
 - Encodes camera JPEGs on a dedicated latest-frame worker so video cannot stall audio upload.
 - Disables WebSocket compression for already-dense PCM/JPEG payloads and serializes uploads
   away from the receive loop, keeping streamed TTS packets responsive on the CM4.
-- Sends all Phase-A motion through one bounded, non-blocking `set_target` control loop.
+- Sends all Phase-A motion through one phase-aligned 50 Hz `set_target` control loop with
+  time-based speed limits, so loop jitter cannot change movement speed.
+- Settles a late final TTS delta back to listening when real playback drains, avoiding a stuck
+  speaking pose.
 - Reconnects after network failures and returns to a neutral pose on shutdown.
 
 The first motion phase is deliberately bounded. MiniCPM-o's raw full-duplex protocol emits
@@ -89,9 +98,14 @@ The probe sends one second of silence with the protocol's `force_listen` hint. I
 session initialization, audio prefill, and the response channel without making the model speak.
 For local development checks, install `.[dev]` and run `python -m pytest` plus `ruff check .`.
 
-At runtime, warnings named `TTS supply gap`, `Slow playback stage`, and
-`Slow Omni input cadence` identify whether a remaining pause comes from the remote TTS,
-the CM4 audio path, or upload backpressure. If speech is still interrupted, first run
+The motion worker never runs on the microphone, WebSocket, camera, or playback workers. DoA is
+sampled at 20 Hz inside the motion worker while pose interpolation runs at 50 Hz, so the added
+animation does not delay the full-duplex conversation path.
+
+At runtime, warnings named `TTS supply gap`, `Slow playback stage`,
+`Slow Omni input cadence`, and `Omni switched to listen` identify whether a remaining pause
+comes from the remote TTS, the CM4 audio path, upload backpressure, or a server-side turn
+transition while local speech is still buffered. If speech is still interrupted, first run
 `yrobot --no-video` as an A/B check and inspect whether `User barge-in` appears without an
 actual interruption from the user.
 
@@ -115,3 +129,5 @@ See [plan.md](plan.md) for protocol findings and acceptance criteria.
 - [MiniCPM-o Realtime examples](https://github.com/OpenBMB/MiniCPM-o-Demo/tree/main/examples/realtime)
 - [Reachy Mini Python SDK](https://huggingface.co/docs/reachy_mini/SDK/python-sdk)
 - [Reachy Mini conversation app](https://github.com/pollen-robotics/reachy_mini_conversation_app)
+- [Conversation app single-owner movement loop](https://github.com/pollen-robotics/reachy_mini_conversation_app/blob/main/src/reachy_mini_conversation_app/moves.py)
+- [Reachy Mini audio-reactive head wobbler](https://github.com/pollen-robotics/reachy_mini/blob/main/src/reachy_mini/motion/head_wobbler.py)

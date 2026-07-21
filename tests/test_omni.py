@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -102,6 +103,58 @@ def test_transport_error_reports_last_event_and_received_audio() -> None:
     ):
         asyncio.run(client._receive_loop(WebSocket(), robot))
     assert len(robot.audio) == 1
+
+
+def test_tts_gap_survives_response_done_and_response_id_change(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    audio = encode_pcm(np.zeros(240, dtype=np.float32))
+
+    class WebSocket:
+        def __init__(self) -> None:
+            self.index = 0
+
+        async def recv(self) -> str:
+            self.index += 1
+            if self.index == 1:
+                return json.dumps(
+                    {
+                        "type": "response.output.delta",
+                        "kind": "audio",
+                        "response_id": "r1",
+                        "audio": audio,
+                    }
+                )
+            if self.index == 2:
+                return json.dumps({"type": "response.done", "response_id": "r1"})
+            if self.index == 3:
+                await asyncio.sleep(0.08)
+                return json.dumps(
+                    {
+                        "type": "response.output.delta",
+                        "kind": "audio",
+                        "response_id": "r2",
+                        "audio": audio,
+                    }
+                )
+            raise ConnectionClosed(None, None)
+
+    class Robot:
+        def set_conversation_state(self, state: str) -> None:
+            pass
+
+        def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool:
+            return True
+
+        def force_listen_active(self) -> bool:
+            return False
+
+    client = OmniClient.__new__(OmniClient)
+    with caplog.at_level(logging.WARNING, logger="yrobot.omni"):
+        with pytest.raises(ConnectionError):
+            asyncio.run(client._receive_loop(WebSocket(), Robot()))
+
+    assert "TTS supply gap for r2" in caplog.text
 
 
 def test_sender_holds_force_listen_while_barge_in_is_active() -> None:
