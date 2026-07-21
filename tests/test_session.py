@@ -30,8 +30,12 @@ class FakeRobot:
     def get_frame_jpeg(self) -> bytes:
         return b"jpeg"
 
-    def play_omni_audio(self, samples: np.ndarray) -> None:
+    def play_omni_audio(self, samples: np.ndarray) -> bool:
         self.played.append(samples)
+        return True
+
+    def consume_barge_in(self) -> bool:
+        return False
 
     def set_conversation_state(self, state: str) -> None:
         self.states.append(state)

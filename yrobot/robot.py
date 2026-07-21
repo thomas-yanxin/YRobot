@@ -41,6 +41,10 @@ AUDIO_STARTUP_CONFIG = (
 )
 
 MOTION_PERIOD = 0.05
+BARGE_IN_ARM_DELAY = 0.3
+BARGE_IN_CONFIRMATIONS = 3
+BARGE_IN_COOLDOWN = 1.0
+BARGE_IN_OUTPUT_GUARD = 1.0
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
 MAX_HEAD_TRANSLATION_STEP = 0.003
 MAX_ANTENNA_STEP = math.radians(4.0)
@@ -126,12 +130,22 @@ class RobotIO:
     def __init__(self, mini: object) -> None:
         self.mini = mini
         self._audio_chunks: queue.Queue[np.ndarray] = queue.Queue(maxsize=2)
+        # Keep network reception independent from GStreamer.  TTS callbacks can
+        # arrive in bursts; pushing them from the WebSocket receive loop makes
+        # that loop stop reading while the audio backend catches up.
+        self._playback_chunks: queue.Queue[tuple[int, np.ndarray]] = queue.Queue()
+        self._playback_lock = threading.Lock()
+        self._playback_generation = 0
+        self._suppress_playback_until = 0.0
+        self._barge_in_event = threading.Event()
         self._stop_event = threading.Event()
         self._capture_thread: threading.Thread | None = None
+        self._playback_thread: threading.Thread | None = None
         self._motion_thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
         self._model_state = "idle"
         self._speaking_until = 0.0
+        self._barge_in_armed_at = math.inf
         self._recording = False
         self._playing = False
         self._wobbling = False
@@ -154,16 +168,20 @@ class RobotIO:
         self._capture_thread = threading.Thread(
             target=self._capture_loop, name="yrobot-audio", daemon=True
         )
+        self._playback_thread = threading.Thread(
+            target=self._playback_loop, name="yrobot-playback", daemon=True
+        )
         self._motion_thread = threading.Thread(
             target=self._motion_loop, name="yrobot-motion", daemon=True
         )
         self._capture_thread.start()
+        self._playback_thread.start()
         self._motion_thread.start()
         log.info("Reachy media and motion started")
 
     def stop(self) -> None:
         self._stop_event.set()
-        for thread in (self._capture_thread, self._motion_thread):
+        for thread in (self._capture_thread, self._playback_thread, self._motion_thread):
             if thread is not None:
                 thread.join(timeout=2.0)
 
@@ -209,15 +227,60 @@ class RobotIO:
             log.debug("Camera frame unavailable: %s", exc)
             return None
 
-    def play_omni_audio(self, samples: np.ndarray) -> None:
-        playback = resample_audio(samples)
-        if playback.size == 0:
-            return
-        with self._state_lock:
-            start = max(time.monotonic(), self._speaking_until)
-            self._speaking_until = start + playback.size / INPUT_SAMPLE_RATE
-            self._model_state = "speaking"
-        self.mini.media.push_audio_sample(playback)
+    def play_omni_audio(self, samples: np.ndarray) -> bool:
+        audio = np.asarray(samples, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("playback audio must be mono")
+        if audio.size == 0:
+            return False
+        # decode_pcm owns its array, but copying here keeps this port safe for
+        # callers that reuse a mutable input buffer after returning.
+        with self._playback_lock:
+            if time.monotonic() < self._suppress_playback_until:
+                return False
+            generation = self._playback_generation
+            self._playback_chunks.put((generation, audio.copy()))
+        return True
+
+    def interrupt_omni_audio(self) -> bool:
+        """Atomically drop pending and device-buffered speech for barge-in."""
+        now = time.monotonic()
+        with self._playback_lock:
+            with self._state_lock:
+                active = now < self._speaking_until or not self._playback_chunks.empty()
+            if not active:
+                return False
+
+            # A generation invalidates a chunk even when the playback worker
+            # has already removed it from Queue and is resampling it.
+            self._playback_generation += 1
+            self._suppress_playback_until = now + BARGE_IN_OUTPUT_GUARD
+            while True:
+                try:
+                    self._playback_chunks.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self._playback_chunks.task_done()
+
+            with self._state_lock:
+                self._speaking_until = now
+                self._barge_in_armed_at = math.inf
+                self._model_state = "listening"
+            # Serialize the SDK flush with playback pushes so an old chunk
+            # cannot be submitted immediately after clear_player().
+            self._clear_player()
+
+        self._barge_in_event.set()
+        log.info("User barge-in: cleared queued speech and resumed listening")
+        return True
+
+    def consume_barge_in(self) -> bool:
+        """Consume the one-shot request attached to the next Omni input slice."""
+        if not self._barge_in_event.is_set():
+            return False
+        self._barge_in_event.clear()
+        return True
 
     def set_conversation_state(self, state: str) -> None:
         if state not in ANTENNA_POSES:
@@ -242,6 +305,36 @@ class RobotIO:
                 log.warning("Microphone read failed: %s", exc)
                 self._stop_event.wait(1.0)
 
+    def _playback_loop(self) -> None:
+        """Feed GStreamer in order without ever blocking the WebSocket reader."""
+        while not self._stop_event.is_set():
+            try:
+                generation, samples = self._playback_chunks.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                playback = resample_audio(samples)
+                if playback.size == 0:
+                    continue
+                with self._playback_lock:
+                    now = time.monotonic()
+                    if (
+                        generation != self._playback_generation
+                        or now < self._suppress_playback_until
+                    ):
+                        continue
+                    with self._state_lock:
+                        if now >= self._speaking_until:
+                            self._barge_in_armed_at = now + BARGE_IN_ARM_DELAY
+                        start = max(now, self._speaking_until)
+                        self._speaking_until = start + playback.size / INPUT_SAMPLE_RATE
+                        self._model_state = "speaking"
+                    self.mini.media.push_audio_sample(playback)
+            except Exception as exc:
+                log.warning("Speaker playback failed: %s", exc)
+            finally:
+                self._playback_chunks.task_done()
+
     def _put_latest(self, chunk: np.ndarray) -> None:
         try:
             self._audio_chunks.put_nowait(chunk)
@@ -256,12 +349,15 @@ class RobotIO:
         last_turn = 0.0
         next_idle_motion = time.monotonic() + random.uniform(5.0, 8.0)
         last_command_error = 0.0
+        barge_in_frames = 0
+        barge_in_cooldown_until = 0.0
 
         while not self._stop_event.is_set():
             now = time.monotonic()
             with self._state_lock:
                 speaking = now < self._speaking_until
                 state = self._model_state
+                barge_in_armed_at = self._barge_in_armed_at
             effective_state = "speaking" if speaking else state
 
             if effective_state != last_effective_state:
@@ -270,11 +366,28 @@ class RobotIO:
                 )
                 last_effective_state = effective_state
 
-            if not speaking:
-                doa = self._read_doa()
-                speech_detected = False
+            # ReSpeaker provides both DoA and speech VAD. Poll it while Reachy
+            # speaks as well: the official audio tuning/AEC removes far-end
+            # playback, leaving sustained near-end speech as a barge-in signal.
+            doa = self._read_doa()
+            speech_detected = doa is not None and doa[1]
+            if speaking:
+                if (
+                    speech_detected
+                    and now >= barge_in_armed_at
+                    and now >= barge_in_cooldown_until
+                ):
+                    barge_in_frames += 1
+                    if barge_in_frames >= BARGE_IN_CONFIRMATIONS:
+                        if self.interrupt_omni_audio():
+                            barge_in_cooldown_until = now + BARGE_IN_COOLDOWN
+                        barge_in_frames = 0
+                else:
+                    barge_in_frames = 0
+            else:
+                barge_in_frames = 0
                 if doa is not None:
-                    angle, speech_detected = doa
+                    angle = doa[0]
                     moved_enough = last_doa is None or angular_distance(angle, last_doa) >= 0.12
                     if speech_detected and moved_enough and now - last_turn >= 0.8:
                         target = self._head_target_towards(angle)
@@ -348,6 +461,8 @@ class RobotIO:
     def _clear_player(self) -> None:
         audio = getattr(self.mini.media, "audio", None)
         clear_player = getattr(audio, "clear_player", None)
+        if not callable(clear_player):
+            clear_player = getattr(audio, "clear_output_buffer", None)
         if callable(clear_player):
             try:
                 clear_player()

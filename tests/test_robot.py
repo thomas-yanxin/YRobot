@@ -1,4 +1,5 @@
 import math
+import threading
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ from yrobot.robot import (
     DOA_GAZE_ELEVATION,
     MAX_HEAD_ANGULAR_STEP,
     MAX_HEAD_TRANSLATION_STEP,
+    RobotIO,
     angular_distance,
     doa_world_direction,
     resample_audio,
@@ -77,3 +79,110 @@ def test_pose_step_reaches_nearby_target() -> None:
     target = np.eye(4)
     target[0, 3] = MAX_HEAD_TRANSLATION_STEP / 2
     np.testing.assert_allclose(step_pose(current, target), target)
+
+
+def test_omni_audio_is_played_by_dedicated_worker() -> None:
+    pushed = threading.Event()
+
+    class Media:
+        def __init__(self) -> None:
+            self.samples: list[np.ndarray] = []
+            self.thread_name = ""
+
+        def push_audio_sample(self, samples: np.ndarray) -> None:
+            self.samples.append(samples)
+            self.thread_name = threading.current_thread().name
+            pushed.set()
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    mini = Mini()
+    robot = RobotIO(mini)
+    worker = threading.Thread(
+        target=robot._playback_loop, name="yrobot-playback", daemon=True
+    )
+    worker.start()
+    try:
+        robot.play_omni_audio(np.zeros(2_400, dtype=np.float32))
+        assert pushed.wait(1.0)
+        assert mini.media.thread_name == "yrobot-playback"
+        assert mini.media.samples[0].shape == (1_600,)
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
+
+
+def test_barge_in_clears_both_playback_queues_and_is_one_shot() -> None:
+    class Audio:
+        def __init__(self) -> None:
+            self.clear_count = 0
+
+        def clear_player(self) -> None:
+            self.clear_count += 1
+
+    class Media:
+        def __init__(self) -> None:
+            self.audio = Audio()
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    mini = Mini()
+    robot = RobotIO(mini)
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32))
+
+    assert robot.interrupt_omni_audio()
+    assert robot._playback_chunks.empty()
+    assert mini.media.audio.clear_count == 1
+    assert robot.consume_barge_in()
+    assert not robot.consume_barge_in()
+
+    # Late chunks from the interrupted response are ignored briefly while the
+    # one-shot force_listen reaches the server.
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32))
+    assert robot._playback_chunks.empty()
+
+
+def test_sustained_doa_speech_interrupts_active_playback() -> None:
+    interrupted = threading.Event()
+
+    class Audio:
+        def clear_player(self) -> None:
+            interrupted.set()
+
+    class Media:
+        def __init__(self) -> None:
+            self.audio = Audio()
+
+        def get_DoA(self) -> tuple[float, bool]:
+            return 0.0, True
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+        def set_target(self, **kwargs: object) -> None:
+            pass
+
+        def get_current_head_pose(self) -> np.ndarray:
+            return np.eye(4)
+
+        def look_at_world(self, *args: float, **kwargs: object) -> np.ndarray:
+            return np.eye(4)
+
+    robot = RobotIO(Mini())
+    with robot._state_lock:
+        robot._speaking_until = float("inf")
+        robot._barge_in_armed_at = 0.0
+
+    worker = threading.Thread(target=robot._motion_loop, daemon=True)
+    worker.start()
+    try:
+        assert interrupted.wait(1.0)
+        assert robot.consume_barge_in()
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
