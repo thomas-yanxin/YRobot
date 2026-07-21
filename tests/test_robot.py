@@ -189,9 +189,59 @@ def test_force_listen_timeout_frees_input_but_keeps_turn_discarded() -> None:
     assert not robot.force_listen_active()
     assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1") is False
 
+    # The user finished speaking a while ago, so this listen ends the hold.
+    with robot._state_lock:
+        robot._last_near_end_activity_at = time.monotonic() - 2.0
     robot.handle_omni_listen("r1")
 
     assert robot._discard_turn_active is False
+
+
+def test_listen_ack_holds_playback_while_user_still_speaking() -> None:
+    robot = RobotIO(object())
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+    assert robot._request_user_interrupt(-24.0, -30.0)
+
+    # The ack arrives while the user is still mid-utterance: the model's next
+    # utterance would talk straight over them, so playback stays muted.
+    with robot._state_lock:
+        robot._last_user_speech_at = time.monotonic()
+    robot.handle_omni_listen("r2")
+
+    assert not robot.force_listen_active()
+    assert robot._discard_turn_active is True
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r3") is False
+
+    # The first listen after the user goes quiet reopens playback.
+    with robot._state_lock:
+        robot._last_user_speech_at = time.monotonic() - 2.0
+        robot._last_near_end_activity_at = time.monotonic() - 2.0
+    robot.handle_omni_listen("r4")
+
+    assert robot._discard_turn_active is False
+
+
+def test_talk_over_audio_reforces_listen_without_redetection() -> None:
+    robot = RobotIO(object())
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+    assert robot._request_user_interrupt(-24.0, -30.0)
+    with robot._state_lock:
+        robot._last_user_speech_at = time.monotonic()
+    robot.handle_omni_listen("r2")
+    assert not robot.force_listen_active()
+    robot._emit_partial_event.clear()
+
+    # Model audio arriving during the hold re-forces listen at once (the
+    # energy detector's arm/confirm cycle would leak a second of talk-over).
+    robot._force_requested_at = time.monotonic() - 1.5
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r3") is False
+
+    assert robot.force_listen_active()
+    assert robot._emit_partial_event.is_set()
 
 
 def test_playback_worker_owns_the_shared_pipeline_flush() -> None:

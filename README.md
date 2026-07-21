@@ -43,6 +43,11 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
   ahead of playback, so its audio is dropped until the next `listen` boundary (the model actually
   stopped speaking) instead of resuming mid-sentence after a timeout. The GStreamer flush runs on
   the playback worker, the only thread that may cycle the shared record+playback pipeline.
+- Yields until the user finishes: a listen acknowledgement that arrives while the user is still
+  mid-utterance keeps playback muted (hardware logs showed the model starting its next utterance
+  one slice after the ack, talking straight over the user), and model audio arriving during that
+  hold re-forces `listen` immediately instead of waiting for the energy detector's arm/confirm
+  cycle. The first `listen` after the user goes quiet reopens playback; a 12 s cap bounds the hold.
 - Treats `response_id`/`response.done` as one-second time-slice bookkeeping, not sentence
   boundaries: one utterance spans several consecutive slices, so slice boundaries never restart
   playback, reset the resampler, or insert preroll waits, and transcript fragments are aggregated

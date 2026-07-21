@@ -89,6 +89,17 @@ INTERRUPT_FLOOR_RISE_DB_PER_SAMPLE = 0.15
 INTERRUPT_ACTIVITY_HOLD = 1.25
 INTERRUPT_POST_LISTEN_GUARD = 0.4
 INTERRUPT_ACK_TIMEOUT = 3.0
+# After a forced listen the model often starts its next utterance one time
+# slice later, talking straight over the still-speaking user (hardware logs
+# 2026-07-21: every ack was followed ~1 s later by a resumed monologue and the
+# user had to shout it down again). Playback therefore stays muted until the
+# first listen boundary after the user has been quiet for the yield hold, and
+# model audio that arrives while the user is still speaking re-forces listen
+# directly instead of waiting for the energy detector's arm/confirm cycle.
+# The cap bounds the mute in case something keeps the speech stamps fresh.
+INTERRUPT_YIELD_HOLD = 0.7
+INTERRUPT_REFORCE_INTERVAL = 1.0
+INTERRUPT_YIELD_MAX = 12.0
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
 MAX_HEAD_TRANSLATION_STEP = 0.003
 MAX_HEAD_ANGULAR_SPEED = math.radians(45.0)
@@ -418,6 +429,7 @@ class RobotIO:
         self._last_near_end_activity_at = -math.inf
         self._last_user_speech_at = -math.inf
         self._force_requested_at = -math.inf
+        self._interrupt_hold_started_at = -math.inf
         self._microphone_level_db = -120.0
         self._dropped_audio_chunks = 0
         self._last_audio_drop_log = 0.0
@@ -524,7 +536,11 @@ class RobotIO:
         # decode_pcm owns its array, but copying here keeps this port safe for
         # callers that reuse a mutable input buffer after returning.
         with self._playback_lock:
-            if self._discard_turn_active or time.monotonic() < self._suppress_playback_until:
+            now = time.monotonic()
+            if self._discard_turn_active:
+                self._maybe_reforce_listen(now)
+                return False
+            if now < self._suppress_playback_until:
                 return False
             # The receive loop marks the model as speaking only after this call
             # and only a listen boundary marks it listening again, so a delta
@@ -569,16 +585,36 @@ class RobotIO:
     def handle_omni_listen(self, response_id: str) -> None:
         """Finish a forced interruption once MiniCPM confirms listen mode."""
         now = time.monotonic()
-        with self._playback_lock:
-            if self._discard_turn_active:
-                self._discard_turn_active = False
-                self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
         with self._state_lock:
             forced = self._force_listen_event.is_set()
             recent_near_end = (
                 now - self._last_near_end_activity_at <= INTERRUPT_ACTIVITY_HOLD
             )
+            user_speaking = (
+                now - max(self._last_near_end_activity_at, self._last_user_speech_at)
+                <= INTERRUPT_YIELD_HOLD
+            )
             active = now < self._speaking_until or not self._playback_chunks.empty()
+        self._force_listen_event.clear()
+        with self._playback_lock:
+            if self._discard_turn_active:
+                if (
+                    user_speaking
+                    and now - self._interrupt_hold_started_at <= INTERRUPT_YIELD_MAX
+                ):
+                    # The ack arrived while the user is still mid-utterance.
+                    # Lifting the mute here lets the model's next utterance
+                    # talk straight over them; stay muted until the first
+                    # listen after the user has gone quiet.
+                    log.info(
+                        "Listen ack while user still speaking; holding playback (response=%s)",
+                        response_id or "unknown",
+                    )
+                    with self._state_lock:
+                        self._model_state = "listening"
+                    return
+                self._discard_turn_active = False
+                self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
 
         if active and (forced or recent_near_end):
             self._flush_playback_for_listen(now)
@@ -590,10 +626,34 @@ class RobotIO:
             with self._state_lock:
                 self._model_state = "listening"
 
-        self._force_listen_event.clear()
         if forced or recent_near_end:
             with self._playback_lock:
                 self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
+
+    def _maybe_reforce_listen(self, now: float) -> None:
+        """Re-chop model speech that talks over a user who is still speaking.
+
+        Runs on the discard path with the playback lock held. The energy
+        detector cannot help here: its arm delay plus confirmation window lets
+        a full second of talk-over play before it fires again.
+        """
+        if self._force_listen_event.is_set():
+            return
+        if now - self._force_requested_at < INTERRUPT_REFORCE_INTERVAL:
+            return
+        if now - self._interrupt_hold_started_at > INTERRUPT_YIELD_MAX:
+            return
+        with self._state_lock:
+            user_speaking = (
+                now - max(self._last_near_end_activity_at, self._last_user_speech_at)
+                <= INTERRUPT_YIELD_HOLD
+            )
+        if not user_speaking:
+            return
+        self._force_requested_at = now
+        self._force_listen_event.set()
+        self._emit_partial_event.set()
+        log.info("Model talked over the still-speaking user; re-forcing listen")
 
     def _request_user_interrupt(self, level_db: float, threshold_db: float) -> bool:
         """Flush current speech and hold force_listen until model acknowledgement."""
@@ -605,6 +665,7 @@ class RobotIO:
             return False
 
         self._force_requested_at = now
+        self._interrupt_hold_started_at = now
         self._force_listen_event.set()
         # Ship the user's words already sitting in the capture buffer right
         # away so the model hears WHO interrupted it in the same forced slice
