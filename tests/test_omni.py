@@ -36,7 +36,12 @@ def test_protocol_messages_match_full_duplex_backend() -> None:
     init = build_session_init("hello")
     assert init == {
         "type": "session.init",
-        "payload": {"mode": "full_duplex", "use_tts": True, "system_prompt": "hello"},
+        "payload": {
+            "mode": "full_duplex",
+            "use_tts": True,
+            "system_prompt": "hello",
+            "config": {"length_penalty": 1.1},
+        },
     }
 
     append = build_input_append(np.zeros(16_000, dtype=np.float32), b"jpeg")
@@ -47,13 +52,6 @@ def test_protocol_messages_match_full_duplex_backend() -> None:
         "max_slice_nums",
     }
     assert append["input"]["max_slice_nums"] == 1
-
-    interrupted = build_input_append(
-        np.zeros(16_000, dtype=np.float32),
-        None,
-        force_listen=True,
-    )
-    assert interrupted["input"]["force_listen"] is True
 
 
 def test_event_parser_requires_object_and_type() -> None:
@@ -146,9 +144,6 @@ def test_tts_gap_survives_response_done_and_response_id_change(
         def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool:
             return True
 
-        def force_listen_active(self) -> bool:
-            return False
-
     client = OmniClient.__new__(OmniClient)
     with caplog.at_level(logging.WARNING, logger="yrobot.omni"):
         with pytest.raises(ConnectionError):
@@ -157,36 +152,32 @@ def test_tts_gap_survives_response_done_and_response_id_change(
     assert "TTS supply gap for r2" in caplog.text
 
 
-def test_sender_holds_force_listen_while_barge_in_is_active() -> None:
+def test_normal_websocket_backpressure_does_not_flood_warnings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     stop_event = threading.Event()
 
     class WebSocket:
         def __init__(self) -> None:
-            self.message: dict[str, object] | None = None
+            self.sends = 0
 
         async def send(self, raw: str) -> None:
-            self.message = json.loads(raw)
-            stop_event.set()
+            del raw
+            await asyncio.sleep(0.06)
+            self.sends += 1
+            if self.sends == 2:
+                stop_event.set()
 
     class Robot:
-        def __init__(self) -> None:
-            self.noted = False
-
         def next_audio_chunk(self, timeout: float) -> np.ndarray:
+            del timeout
             return np.zeros(16_000, dtype=np.float32)
 
-        def force_listen_active(self) -> bool:
-            return True
-
-        def note_force_listen_sent(self, response_id: str) -> None:
-            self.noted = response_id == "test_resp_1"
-
     websocket = WebSocket()
-    robot = Robot()
     client = OmniClient.__new__(OmniClient)
     client.config = SimpleNamespace(send_video=False)
-    asyncio.run(client._send_loop(websocket, robot, stop_event, "test"))
+    with caplog.at_level(logging.WARNING, logger="yrobot.omni"):
+        asyncio.run(client._send_loop(websocket, Robot(), stop_event))
 
-    assert websocket.message is not None
-    assert websocket.message["input"]["force_listen"] is True
-    assert robot.noted
+    assert websocket.sends == 2
+    assert "Slow Omni input stage" not in caplog.text

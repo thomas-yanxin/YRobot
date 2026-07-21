@@ -34,15 +34,6 @@ class FakeRobot:
         self.played.append(samples)
         return True
 
-    def force_listen_active(self) -> bool:
-        return False
-
-    def note_force_listen_sent(self, response_id: str) -> None:
-        pass
-
-    def confirm_omni_listening(self, response_id: str) -> None:
-        pass
-
     def set_conversation_state(self, state: str) -> None:
         self.states.append(state)
 

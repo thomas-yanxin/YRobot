@@ -26,6 +26,7 @@ def test_config_loads_small_environment(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("OMNI_WS_URL", "ws://127.0.0.1:28099")
     monkeypatch.setenv("OMNI_TLS_VERIFY", "1")
     monkeypatch.setenv("OMNI_SEND_VIDEO", "0")
+    monkeypatch.setenv("OMNI_LENGTH_PENALTY", "1.2")
     monkeypatch.setenv("OMNI_SYSTEM_PROMPT", "short prompt")
 
     config = Config.load()
@@ -33,8 +34,20 @@ def test_config_loads_small_environment(monkeypatch: pytest.MonkeyPatch) -> None
     assert config.omni_url == "ws://127.0.0.1:28099/backend"
     assert config.tls_verify is True
     assert config.send_video is False
+    assert config.length_penalty == 1.2
     assert config.system_prompt == "short prompt"
     assert config.ssl_context() is None
+
+
+@pytest.mark.parametrize("value", ["nan", "0", "5.1", "not-a-number"])
+def test_length_penalty_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("OMNI_LENGTH_PENALTY", value)
+
+    with pytest.raises(ValueError, match="OMNI_LENGTH_PENALTY"):
+        Config.load()
 
 
 def test_unverified_tls_context() -> None:

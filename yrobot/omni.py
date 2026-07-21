@@ -29,12 +29,6 @@ class RobotPort(Protocol):
 
     def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool: ...
 
-    def force_listen_active(self) -> bool: ...
-
-    def note_force_listen_sent(self, response_id: str) -> None: ...
-
-    def confirm_omni_listening(self, response_id: str) -> None: ...
-
     def set_conversation_state(self, state: str) -> None: ...
 
 
@@ -55,13 +49,14 @@ def decode_pcm(value: str) -> np.ndarray:
     return samples
 
 
-def build_session_init(system_prompt: str) -> dict[str, Any]:
+def build_session_init(system_prompt: str, length_penalty: float = 1.1) -> dict[str, Any]:
     return {
         "type": "session.init",
         "payload": {
             "mode": "full_duplex",
             "use_tts": True,
             "system_prompt": system_prompt,
+            "config": {"length_penalty": length_penalty},
         },
     }
 
@@ -69,12 +64,8 @@ def build_session_init(system_prompt: str) -> dict[str, Any]:
 def build_input_append(
     audio: np.ndarray,
     frame_jpeg: bytes | None,
-    *,
-    force_listen: bool = False,
 ) -> dict[str, Any]:
     model_input: dict[str, Any] = {"audio": encode_pcm(audio)}
-    if force_listen:
-        model_input["force_listen"] = True
     if frame_jpeg:
         model_input["video_frames"] = [base64.b64encode(frame_jpeg).decode("ascii")]
         model_input["max_slice_nums"] = 1
@@ -84,12 +75,10 @@ def build_input_append(
 def serialize_input_append(
     audio: np.ndarray,
     frame_jpeg: bytes | None,
-    *,
-    force_listen: bool = False,
 ) -> str:
     """Encode one compact input message away from the receive event loop."""
     return json.dumps(
-        build_input_append(audio, frame_jpeg, force_listen=force_listen),
+        build_input_append(audio, frame_jpeg),
         separators=(",", ":"),
     )
 
@@ -135,7 +124,14 @@ class OmniClient:
             compression=None,
             max_queue=64,
         ) as websocket:
-            await websocket.send(json.dumps(build_session_init(self.config.system_prompt)))
+            await websocket.send(
+                json.dumps(
+                    build_session_init(
+                        self.config.system_prompt,
+                        self.config.length_penalty,
+                    )
+                )
+            )
             raw = await asyncio.wait_for(websocket.recv(), timeout=self.config.session_timeout)
             event = self._parse_event(raw)
             if event.get("type") != "session.created":
@@ -146,7 +142,7 @@ class OmniClient:
             robot.flush_audio_input()
             robot.set_conversation_state("listening")
 
-            sender = asyncio.create_task(self._send_loop(websocket, robot, stop_event, session_id))
+            sender = asyncio.create_task(self._send_loop(websocket, robot, stop_event))
             receiver = asyncio.create_task(self._receive_loop(websocket, robot))
             stopper = asyncio.create_task(self._stop_waiter(stop_event))
             tasks = {sender, receiver, stopper}
@@ -173,26 +169,18 @@ class OmniClient:
         websocket: Any,
         robot: RobotPort,
         stop_event: threading.Event,
-        session_id: str,
     ) -> None:
-        was_forcing_listen = False
-        input_sequence = 0
         last_send_at: float | None = None
         while not stop_event.is_set():
             audio = await asyncio.to_thread(robot.next_audio_chunk, 0.25)
             if audio is None:
                 continue
             frame = robot.get_frame_jpeg() if self.config.send_video else None
-            force_listen = robot.force_listen_active()
-            input_sequence += 1
-            if force_listen:
-                robot.note_force_listen_sent(f"{session_id}_resp_{input_sequence}")
             encode_started = time.perf_counter()
             message = await asyncio.to_thread(
                 serialize_input_append,
                 audio,
                 frame,
-                force_listen=force_listen,
             )
             encode_ms = (time.perf_counter() - encode_started) * 1_000
             send_started = time.perf_counter()
@@ -207,15 +195,16 @@ class OmniClient:
                     send_ms,
                 )
             elif encode_ms > 50.0 or send_ms > 50.0:
-                log.warning(
+                # websocket.send() applies TCP flow control. A 50--100 ms
+                # wait is normal for an audio + JPEG message on Wi-Fi and
+                # doesn't hurt a one-second stream cadence, so keep the stage
+                # timings available for diagnosis without flooding warnings.
+                log.debug(
                     "Slow Omni input stage: encode=%.1f ms, send=%.1f ms",
                     encode_ms,
                     send_ms,
                 )
             last_send_at = sent_at
-            if force_listen and not was_forcing_listen:
-                log.info("Holding force_listen until barge-in is acknowledged")
-            was_forcing_listen = force_listen
 
     async def _receive_loop(self, websocket: Any, robot: RobotPort) -> None:
         transcript: dict[str, str] = {}
@@ -270,7 +259,6 @@ class OmniClient:
                             event.get("text") or ""
                         )
                     elif kind == "listen":
-                        robot.confirm_omni_listening(str(event.get("response_id") or ""))
                         robot.set_conversation_state("listening")
                         # Silence after an explicit listen boundary is expected
                         # and must not be reported as TTS starvation.
@@ -283,7 +271,7 @@ class OmniClient:
                     # real queue/drain state instead of resetting at this event.
                     partial_text = transcript.pop(response_id, "")
                     text = str(event.get("text") or partial_text).strip()
-                    if text and not robot.force_listen_active():
+                    if text:
                         log.info("Reachy: %s", text)
                     robot.set_conversation_state("listening")
                 elif event_type == "session.closed":

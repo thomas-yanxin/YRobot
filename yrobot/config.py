@@ -30,6 +30,19 @@ def _bool_env(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean, got {value!r}")
 
 
+def _length_penalty_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
+    if not 0.1 <= parsed <= 5.0:
+        raise ValueError(f"{name} must be between 0.1 and 5.0, got {value!r}")
+    return parsed
+
+
 def normalize_backend_url(value: str) -> str:
     """Normalize a raw llama-omni-server URL to its `/backend` WebSocket."""
     parsed = urlsplit(value.strip())
@@ -51,6 +64,7 @@ class Config:
     tls_verify: bool
     send_video: bool
     system_prompt: str
+    length_penalty: float = 1.1
     reconnect_delay: float = 1.5
     session_timeout: float = 120.0
     max_message_size: int = 64 * 1024 * 1024
@@ -72,6 +86,9 @@ class Config:
             tls_verify=_bool_env("OMNI_TLS_VERIFY", False),
             send_video=_bool_env("OMNI_SEND_VIDEO", True),
             system_prompt=prompt,
+            # The raw C++ backend otherwise defaults to 1.0, which makes the
+            # model more likely to sample turn_eos before finishing a thought.
+            length_penalty=_length_penalty_env("OMNI_LENGTH_PENALTY", 1.1),
         )
 
     def ssl_context(self) -> ssl.SSLContext | None:

@@ -24,11 +24,13 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
   filter/phase continuity across TTS deltas instead of creating audible block edges.
 - Uses a 320 ms first-audio prebuffer to stay beyond the player's 200 ms clock-reset window
   and absorb Wi-Fi and Token2Wav delivery jitter.
-- Keeps the full-duplex microphone cadence while Reachy speaks, but uploads silence for
-  far-end-only audio; locally confirmed near-end speech is passed through for voice barge-in.
-- Supports voice barge-in: debounced DoA speech plus post-AEC microphone energy clears
-  local/GStreamer playback and holds `force_listen` until the server acknowledges listening.
-- Applies the official conversation app's XVF3800 echo/noise/gain tuning at startup.
+- Starts recording and playback first, then applies the official conversation app's XVF3800
+  echo/noise/gain tuning with the far-end reference path active.
+- Continuously uploads the real post-XVF microphone signal while Reachy speaks. Audio is never
+  replaced with silence, so MiniCPM-o can hear new user speech and make its native `listen/speak`
+  decision on every full-duplex time slice.
+- Keeps DoA out of turn control. Reachy's own speaker can set its speech bit, so DoA is used only
+  to orient the robot and never sends `force_listen` or truncates playback.
 - Turns toward a detected speaker with Reachy's DoA API.
 - Keeps a slightly raised natural gaze; DoA changes yaw without accumulating downward pitch.
 - Keeps the last speaker as an attention anchor instead of replacing it with permanent random poses.
@@ -87,6 +89,16 @@ yrobot --url wss://another-server:28099/backend
 yrobot --tls-verify
 ```
 
+The runtime deliberately does not implement a local DoA/energy barge-in gate. XVF3800 is
+responsible for suppressing the far-end echo, and MiniCPM-o receives every post-AEC microphone
+slice while it is speaking and decides naturally when to return to `listen`. An explicit `listen`
+boundary ends model generation; already-generated audio in the short jitter buffer is allowed to
+drain instead of cutting a sentence in half. Physical testing should confirm that the XVF output
+does not contain enough residual speaker audio to make the model react to itself.
+
+YRobot sends `length_penalty=1.1` by default to reduce premature end-of-turn sampling. It can be
+tuned with `OMNI_LENGTH_PENALTY` in the supported backend range of 0.1–5.0.
+
 ## Verify
 
 ```bash
@@ -102,12 +114,9 @@ The motion worker never runs on the microphone, WebSocket, camera, or playback w
 sampled at 20 Hz inside the motion worker while pose interpolation runs at 50 Hz, so the added
 animation does not delay the full-duplex conversation path.
 
-At runtime, warnings named `TTS supply gap`, `Slow playback stage`,
-`Slow Omni input cadence`, and `Omni switched to listen` identify whether a remaining pause
-comes from the remote TTS, the CM4 audio path, upload backpressure, or a server-side turn
-transition while local speech is still buffered. If speech is still interrupted, first run
-`yrobot --no-video` as an A/B check and inspect whether `User barge-in` appears without an
-actual interruption from the user.
+At runtime, warnings named `TTS supply gap`, `Slow playback stage`, and
+`Slow Omni input cadence` identify whether a remaining pause comes from remote TTS, the CM4 audio
+path, or upload backpressure. The client never converts DoA activity into an interruption.
 
 Simulation can exercise lifecycle and motion code, but physical audio, camera, DoA, and speaker
 behavior must be verified on the Wireless robot.
@@ -126,7 +135,7 @@ See [plan.md](plan.md) for protocol findings and acceptance criteria.
 ## Sources
 
 - [MiniCPM-o 4.5 llama.cpp-omni deployment](https://github.com/OpenSQZ/MiniCPM-V-CookBook/blob/main/deployment/llama.cpp-omni/minicpmo_4_5_llamacpp_omni_zh.md)
-- [MiniCPM-o Realtime examples](https://github.com/OpenBMB/MiniCPM-o-Demo/tree/main/examples/realtime)
+- [MiniCPM-o native full-duplex protocol](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/main/docs/zh/api/duplex.md)
 - [Reachy Mini Python SDK](https://huggingface.co/docs/reachy_mini/SDK/python-sdk)
 - [Reachy Mini conversation app](https://github.com/pollen-robotics/reachy_mini_conversation_app)
 - [Conversation app single-owner movement loop](https://github.com/pollen-robotics/reachy_mini_conversation_app/blob/main/src/reachy_mini_conversation_app/moves.py)

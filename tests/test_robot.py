@@ -1,3 +1,4 @@
+import logging
 import math
 import threading
 import time
@@ -9,8 +10,6 @@ from scipy.spatial.transform import Rotation
 
 from yrobot.robot import (
     ANTENNA_POSES,
-    BARGE_IN_MIN_LEVEL_DB,
-    BARGE_IN_RELEASE_SILENCE,
     DOA_GAZE_ELEVATION,
     MAX_HEAD_ANGULAR_SPEED,
     MAX_HEAD_ANGULAR_STEP,
@@ -19,11 +18,9 @@ from yrobot.robot import (
     RobotIO,
     StreamingAudioResampler,
     angular_distance,
-    audio_level_db,
     doa_world_direction,
     effective_conversation_state,
     gesture_pulse,
-    is_near_end_speech,
     lifelike_motion_overlay,
     resample_audio,
     smooth_pose_step,
@@ -37,19 +34,7 @@ def test_stereo_microphone_is_mixed_to_mono() -> None:
     np.testing.assert_allclose(to_mono(stereo), [0.0, 0.5])
 
 
-def test_microphone_level_is_dbfs_rms() -> None:
-    assert audio_level_db(np.ones(160, dtype=np.float32)) == pytest.approx(0.0)
-    assert audio_level_db(np.full(160, 0.01, dtype=np.float32)) == pytest.approx(-40.0)
-    assert audio_level_db(np.zeros(160, dtype=np.float32)) == pytest.approx(-120.0)
-
-
-def test_doa_alone_cannot_trigger_barge_in() -> None:
-    assert not is_near_end_speech(True, BARGE_IN_MIN_LEVEL_DB - 1.0)
-    assert not is_near_end_speech(False, 0.0)
-    assert is_near_end_speech(True, BARGE_IN_MIN_LEVEL_DB)
-
-
-def test_far_end_microphone_is_masked_without_losing_input_cadence() -> None:
+def test_post_aec_microphone_is_uploaded_unchanged_during_playback() -> None:
     robot = RobotIO(object())
     microphone = np.linspace(-0.5, 0.5, 16_000, dtype=np.float32)
     robot._audio_chunks.put(microphone)
@@ -59,22 +44,33 @@ def test_far_end_microphone_is_masked_without_losing_input_cadence() -> None:
     uploaded = robot.next_audio_chunk(0.01)
 
     assert uploaded is not None
-    np.testing.assert_array_equal(uploaded, np.zeros_like(microphone))
-
-
-def test_confirmed_near_end_microphone_passes_during_playback() -> None:
-    robot = RobotIO(object())
-    microphone = np.linspace(-0.5, 0.5, 16_000, dtype=np.float32)
-    robot._audio_chunks.put(microphone)
-    now = time.monotonic()
-    robot._update_barge_in_release(True, now)
-    with robot._state_lock:
-        robot._speaking_until = now + 1.0
-
-    uploaded = robot.next_audio_chunk(0.01)
-
-    assert uploaded is not None
     np.testing.assert_array_equal(uploaded, microphone)
+
+
+def test_xvf_configuration_uses_verified_settled_writes() -> None:
+    calls: list[tuple[object, bool, float]] = []
+
+    class Audio:
+        def apply_audio_config(
+            self,
+            config: object,
+            *,
+            verify: bool,
+            write_settle_seconds: float,
+        ) -> bool:
+            calls.append((config, verify, write_settle_seconds))
+            return True
+
+    class Media:
+        audio = Audio()
+
+    class Mini:
+        media = Media()
+
+    RobotIO(Mini())._apply_audio_startup_config()
+
+    assert len(calls) == 1
+    assert calls[0][1:] == (True, 0.1)
 
 
 def test_output_is_resampled_from_24k_to_16k() -> None:
@@ -264,90 +260,37 @@ def test_camera_jpeg_is_cached_off_the_sender_path() -> None:
         worker.join(timeout=1.0)
 
 
-def test_barge_in_stays_active_until_user_and_server_are_done() -> None:
-    class Audio:
-        def __init__(self) -> None:
-            self.clear_count = 0
-
-        def clear_player(self) -> None:
-            self.clear_count += 1
+def test_brief_sdk_liveness_miss_is_retried_without_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    recovered = threading.Event()
 
     class Media:
-        def __init__(self) -> None:
-            self.audio = Audio()
+        def get_DoA(self) -> tuple[float, bool]:
+            return 0.0, False
 
     class Mini:
         def __init__(self) -> None:
             self.media = Media()
+            self.command_count = 0
+
+        def set_target(self, **kwargs: object) -> None:
+            del kwargs
+            self.command_count += 1
+            if self.command_count <= 3:
+                raise ConnectionError("Lost connection with the server.")
+            recovered.set()
 
     mini = Mini()
     robot = RobotIO(mini)
-    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32))
-
-    assert robot.interrupt_omni_audio()
-    assert robot._playback_chunks.empty()
-    assert mini.media.audio.clear_count == 1
-    assert robot.force_listen_active()
-    assert robot.force_listen_active()
-
-    # A server listen event alone cannot release suppression while the user is
-    # still speaking, and user silence alone cannot release before the server
-    # has acknowledged a force_listen frame.
-    robot.note_force_listen_sent("session_resp_7")
-    robot.confirm_omni_listening("session_resp_6")
-    assert robot.force_listen_active()
-    robot.confirm_omni_listening("session_resp_7")
-    assert robot.force_listen_active()
-    robot._update_barge_in_release(
-        False,
-        time.monotonic() + BARGE_IN_RELEASE_SILENCE,
-    )
-    assert not robot.force_listen_active()
-
-    # Late chunks from the interrupted response are ignored briefly after the
-    # listen acknowledgement.
-    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32))
-    assert robot._playback_chunks.empty()
-
-
-def test_sustained_near_end_speech_interrupts_active_playback() -> None:
-    interrupted = threading.Event()
-
-    class Audio:
-        def clear_player(self) -> None:
-            interrupted.set()
-
-    class Media:
-        def __init__(self) -> None:
-            self.audio = Audio()
-
-        def get_DoA(self) -> tuple[float, bool]:
-            return 0.0, True
-
-    class Mini:
-        def __init__(self) -> None:
-            self.media = Media()
-
-        def set_target(self, **kwargs: object) -> None:
-            pass
-
-        def get_current_head_pose(self) -> np.ndarray:
-            return np.eye(4)
-
-        def look_at_world(self, *args: float, **kwargs: object) -> np.ndarray:
-            return np.eye(4)
-
-    robot = RobotIO(Mini())
-    with robot._state_lock:
-        robot._speaking_until = float("inf")
-        robot._barge_in_armed_at = 0.0
-        robot._microphone_level_db = BARGE_IN_MIN_LEVEL_DB + 6.0
-
     worker = threading.Thread(target=robot._motion_loop, daemon=True)
-    worker.start()
-    try:
-        assert interrupted.wait(1.0)
-        assert robot.force_listen_active()
-    finally:
-        robot._stop_event.set()
-        worker.join(timeout=1.0)
+    with caplog.at_level(logging.WARNING, logger="yrobot.robot"):
+        worker.start()
+        try:
+            assert recovered.wait(1.0)
+        finally:
+            robot._stop_event.set()
+            worker.join(timeout=1.0)
+
+    assert mini.command_count >= 4
+    assert "Motion command failed" not in caplog.text
