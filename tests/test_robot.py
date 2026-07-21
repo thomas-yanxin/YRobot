@@ -7,12 +7,15 @@ from reachy_mini.utils.interpolation import delta_angle_between_mat_rot
 from scipy.spatial.transform import Rotation
 
 from yrobot.robot import (
+    BARGE_IN_MIN_LEVEL_DB,
     DOA_GAZE_ELEVATION,
     MAX_HEAD_ANGULAR_STEP,
     MAX_HEAD_TRANSLATION_STEP,
     RobotIO,
     angular_distance,
+    audio_level_db,
     doa_world_direction,
+    is_near_end_speech,
     resample_audio,
     step_pose,
     to_mono,
@@ -22,6 +25,18 @@ from yrobot.robot import (
 def test_stereo_microphone_is_mixed_to_mono() -> None:
     stereo = np.array([[1.0, -1.0], [0.5, 0.5]], dtype=np.float32)
     np.testing.assert_allclose(to_mono(stereo), [0.0, 0.5])
+
+
+def test_microphone_level_is_dbfs_rms() -> None:
+    assert audio_level_db(np.ones(160, dtype=np.float32)) == pytest.approx(0.0)
+    assert audio_level_db(np.full(160, 0.01, dtype=np.float32)) == pytest.approx(-40.0)
+    assert audio_level_db(np.zeros(160, dtype=np.float32)) == pytest.approx(-120.0)
+
+
+def test_doa_alone_cannot_trigger_barge_in() -> None:
+    assert not is_near_end_speech(True, BARGE_IN_MIN_LEVEL_DB - 1.0)
+    assert not is_near_end_speech(False, 0.0)
+    assert is_near_end_speech(True, BARGE_IN_MIN_LEVEL_DB)
 
 
 def test_output_is_resampled_from_24k_to_16k() -> None:
@@ -146,7 +161,7 @@ def test_barge_in_clears_both_playback_queues_and_is_one_shot() -> None:
     assert robot._playback_chunks.empty()
 
 
-def test_sustained_doa_speech_interrupts_active_playback() -> None:
+def test_sustained_near_end_speech_interrupts_active_playback() -> None:
     interrupted = threading.Event()
 
     class Audio:
@@ -177,6 +192,7 @@ def test_sustained_doa_speech_interrupts_active_playback() -> None:
     with robot._state_lock:
         robot._speaking_until = float("inf")
         robot._barge_in_armed_at = 0.0
+        robot._microphone_level_db = BARGE_IN_MIN_LEVEL_DB + 6.0
 
     worker = threading.Thread(target=robot._motion_loop, daemon=True)
     worker.start()

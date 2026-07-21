@@ -44,6 +44,7 @@ MOTION_PERIOD = 0.05
 BARGE_IN_ARM_DELAY = 0.3
 BARGE_IN_CONFIRMATIONS = 3
 BARGE_IN_COOLDOWN = 1.0
+BARGE_IN_MIN_LEVEL_DB = -32.0
 BARGE_IN_OUTPUT_GUARD = 1.0
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
 MAX_HEAD_TRANSLATION_STEP = 0.003
@@ -59,6 +60,20 @@ def to_mono(samples: np.ndarray) -> np.ndarray:
     if audio.ndim == 2 and audio.shape[1] >= 1:
         return audio.mean(axis=1, dtype=np.float32)
     raise ValueError(f"unexpected microphone shape: {audio.shape}")
+
+
+def audio_level_db(samples: np.ndarray) -> float:
+    """Return a stable dBFS RMS level for AEC-processed microphone PCM."""
+    audio = np.asarray(samples, dtype=np.float64)
+    if audio.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(audio * audio)))
+    return 20.0 * math.log10(max(rms, 1e-6))
+
+
+def is_near_end_speech(speech_detected: bool, microphone_level_db: float) -> bool:
+    """Require hardware speech VAD and audible post-AEC microphone energy."""
+    return speech_detected and microphone_level_db >= BARGE_IN_MIN_LEVEL_DB
 
 
 def resample_audio(
@@ -146,6 +161,7 @@ class RobotIO:
         self._model_state = "idle"
         self._speaking_until = 0.0
         self._barge_in_armed_at = math.inf
+        self._microphone_level_db = -120.0
         self._recording = False
         self._playing = False
         self._wobbling = False
@@ -296,7 +312,10 @@ class RobotIO:
                 if sample is None:
                     self._stop_event.wait(0.01)
                     continue
-                pending = np.concatenate((pending, to_mono(sample)))
+                mono = to_mono(sample)
+                with self._state_lock:
+                    self._microphone_level_db = audio_level_db(mono)
+                pending = np.concatenate((pending, mono))
                 while pending.size >= CHUNK_SAMPLES:
                     chunk = pending[:CHUNK_SAMPLES].copy()
                     pending = pending[CHUNK_SAMPLES:]
@@ -358,6 +377,7 @@ class RobotIO:
                 speaking = now < self._speaking_until
                 state = self._model_state
                 barge_in_armed_at = self._barge_in_armed_at
+                microphone_level_db = self._microphone_level_db
             effective_state = "speaking" if speaking else state
 
             if effective_state != last_effective_state:
@@ -366,14 +386,18 @@ class RobotIO:
                 )
                 last_effective_state = effective_state
 
-            # ReSpeaker provides both DoA and speech VAD. Poll it while Reachy
-            # speaks as well: the official audio tuning/AEC removes far-end
-            # playback, leaving sustained near-end speech as a barge-in signal.
+            # DoA's hardware speech bit also sees Reachy's own speaker. It may
+            # assist barge-in, but only post-AEC microphone PCM is allowed to
+            # confirm that audible near-end speech remains.
             doa = self._read_doa()
             speech_detected = doa is not None and doa[1]
+            near_end_speech = is_near_end_speech(
+                speech_detected,
+                microphone_level_db,
+            )
             if speaking:
                 if (
-                    speech_detected
+                    near_end_speech
                     and now >= barge_in_armed_at
                     and now >= barge_in_cooldown_until
                 ):
@@ -381,6 +405,10 @@ class RobotIO:
                     if barge_in_frames >= BARGE_IN_CONFIRMATIONS:
                         if self.interrupt_omni_audio():
                             barge_in_cooldown_until = now + BARGE_IN_COOLDOWN
+                            log.info(
+                                "Near-end speech confirmed at %.1f dBFS",
+                                microphone_level_db,
+                            )
                         barge_in_frames = 0
                 else:
                     barge_in_frames = 0

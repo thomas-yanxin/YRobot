@@ -22,8 +22,8 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 - Streams one-second 16 kHz microphone slices and current camera JPEGs to `/backend`.
 - Plays the model's streamed 24 kHz speech after resampling it to Reachy's 16 kHz output.
 - Keeps listening while Reachy speaks, preserving MiniCPM-o's full-duplex behavior.
-- Supports voice barge-in: debounced ReSpeaker speech VAD clears local/GStreamer playback and
-  sends a one-shot `force_listen` with the next microphone slice.
+- Supports voice barge-in: debounced DoA speech plus post-AEC microphone energy clears
+  local/GStreamer playback and sends one `force_listen` with the next microphone slice.
 - Applies the official conversation app's XVF3800 echo/noise/gain tuning at startup.
 - Turns toward a detected speaker with Reachy's DoA API.
 - Keeps a slightly raised natural gaze; DoA changes yaw without accumulating downward pitch.
