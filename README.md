@@ -24,6 +24,7 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 - Keeps listening while Reachy speaks, preserving MiniCPM-o's full-duplex behavior.
 - Applies the official conversation app's XVF3800 echo/noise/gain tuning at startup.
 - Turns toward a detected speaker with Reachy's DoA API.
+- Keeps a slightly raised natural gaze; DoA changes yaw without accumulating downward pitch.
 - Uses the SDK's native audio-reactive wobble and restrained antenna/idle poses.
 - Uses the CM4-local media backend, avoiding a WebRTC encode/decode loop on the robot.
 - Sends all Phase-A motion through one bounded, non-blocking `set_target` control loop.

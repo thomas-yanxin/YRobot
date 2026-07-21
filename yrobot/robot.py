@@ -44,6 +44,8 @@ MOTION_PERIOD = 0.05
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
 MAX_HEAD_TRANSLATION_STEP = 0.003
 MAX_ANTENNA_STEP = math.radians(4.0)
+NATURAL_HEAD_PITCH_DEGREES = -4.0
+DOA_GAZE_ELEVATION = math.tan(math.radians(-NATURAL_HEAD_PITCH_DEGREES))
 
 
 def to_mono(samples: np.ndarray) -> np.ndarray:
@@ -69,12 +71,27 @@ def resample_audio(
 
 
 def doa_world_direction(angle: float, head_pose: np.ndarray) -> np.ndarray:
-    """Apply the official DoA head-to-world transform."""
+    """Map head-relative DoA to a stable, slightly raised world gaze."""
     pose = np.asarray(head_pose, dtype=np.float64)
     if pose.shape != (4, 4):
         raise ValueError("head_pose must be a 4x4 transform")
-    direction_head = np.array([math.sin(angle), math.cos(angle), 0.0])
-    return pose[:3, :3] @ direction_head
+
+    # DoA contains azimuth but no reliable elevation. Reusing the head's full
+    # rotation makes any temporary downward pitch feed into the next target and
+    # causes a self-reinforcing "always looking down" drift. Preserve only yaw
+    # and use a small fixed upward gaze for natural eye contact.
+    yaw = math.atan2(pose[1, 0], pose[0, 0])
+    direction_head = np.array([math.sin(angle), math.cos(angle)])
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+    direction_world = np.array(
+        [
+            cos_yaw * direction_head[0] - sin_yaw * direction_head[1],
+            sin_yaw * direction_head[0] + cos_yaw * direction_head[1],
+            DOA_GAZE_ELEVATION,
+        ]
+    )
+    return direction_world
 
 
 def angular_distance(a: float, b: float) -> float:
@@ -317,7 +334,10 @@ class RobotIO:
 
             return create_head_pose(
                 roll=random.uniform(-2.0, 2.0),
-                pitch=random.uniform(-2.0, 2.0),
+                pitch=random.uniform(
+                    NATURAL_HEAD_PITCH_DEGREES - 2.0,
+                    NATURAL_HEAD_PITCH_DEGREES + 2.0,
+                ),
                 yaw=random.uniform(-4.0, 4.0),
                 degrees=True,
             )
@@ -363,7 +383,16 @@ class RobotIO:
         except Exception as exc:
             log.warning("Could not read initial antenna pose: %s", exc)
             self._command_antennas = np.deg2rad(ANTENNA_POSES["idle"])
-        self._target_head = self._command_head.copy()
+        try:
+            from reachy_mini.utils import create_head_pose
+
+            self._target_head = create_head_pose(
+                pitch=NATURAL_HEAD_PITCH_DEGREES,
+                degrees=True,
+            )
+        except Exception as exc:
+            log.warning("Could not create natural head target: %s", exc)
+            self._target_head = np.eye(4, dtype=np.float64)
         self._target_antennas = self._command_antennas.copy()
 
     def _return_to_neutral(self) -> None:

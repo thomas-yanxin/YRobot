@@ -6,6 +6,7 @@ from reachy_mini.utils.interpolation import delta_angle_between_mat_rot
 from scipy.spatial.transform import Rotation
 
 from yrobot.robot import (
+    DOA_GAZE_ELEVATION,
     MAX_HEAD_ANGULAR_STEP,
     MAX_HEAD_TRANSLATION_STEP,
     angular_distance,
@@ -31,8 +32,21 @@ def test_output_is_resampled_from_24k_to_16k() -> None:
 
 def test_doa_uses_reachy_head_coordinates() -> None:
     pose = np.eye(4)
-    np.testing.assert_allclose(doa_world_direction(0.0, pose), [0.0, 1.0, 0.0])
-    np.testing.assert_allclose(doa_world_direction(math.pi / 2, pose), [1.0, 0.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(doa_world_direction(0.0, pose), [0.0, 1.0, DOA_GAZE_ELEVATION])
+    np.testing.assert_allclose(
+        doa_world_direction(math.pi / 2, pose),
+        [1.0, 0.0, DOA_GAZE_ELEVATION],
+        atol=1e-12,
+    )
+
+
+def test_doa_ignores_head_pitch_but_preserves_yaw() -> None:
+    pose = np.eye(4)
+    pose[:3, :3] = Rotation.from_euler("xyz", [15, 20, 90], degrees=True).as_matrix()
+
+    direction = doa_world_direction(math.pi / 2, pose)
+
+    np.testing.assert_allclose(direction, [0.0, 1.0, DOA_GAZE_ELEVATION], atol=1e-12)
 
 
 def test_doa_rejects_invalid_pose() -> None:
