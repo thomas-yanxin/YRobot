@@ -17,6 +17,8 @@ class FakeRobot:
         self.played: list[np.ndarray] = []
         self.states: list[str] = []
         self.listens: list[str] = []
+        self.supply_gaps: list[float] = []
+        self.interruption_resets = 0
 
     def next_audio_chunk(self, timeout: float) -> np.ndarray | None:
         if self.flushed and not self.sent:
@@ -37,6 +39,12 @@ class FakeRobot:
 
     def force_listen_active(self) -> bool:
         return False
+
+    def reset_interruption(self) -> None:
+        self.interruption_resets += 1
+
+    def note_tts_supply_gap(self, gap_seconds: float) -> None:
+        self.supply_gaps.append(gap_seconds)
 
     def handle_omni_listen(self, response_id: str) -> None:
         self.listens.append(response_id)
@@ -132,3 +140,4 @@ async def _session_scenario() -> None:
     assert robot.states[0] == "listening"
     assert "speaking" in robot.states
     assert robot.listens == ["r2"]
+    assert robot.interruption_resets == 1

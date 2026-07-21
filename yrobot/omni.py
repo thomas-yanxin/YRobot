@@ -15,9 +15,13 @@ import numpy as np
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from .config import OUTPUT_SAMPLE_RATE, Config
+from .config import CHUNK_SAMPLES, OUTPUT_SAMPLE_RATE, Config
 
 log = logging.getLogger(__name__)
+
+# A one-second audio + JPEG slice normally sends in well under this bound;
+# beyond it, the link is congested and video should yield to audio cadence.
+SLOW_SEND_SECONDS = 0.25
 
 
 class RobotPort(Protocol):
@@ -30,6 +34,10 @@ class RobotPort(Protocol):
     def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool: ...
 
     def force_listen_active(self) -> bool: ...
+
+    def reset_interruption(self) -> None: ...
+
+    def note_tts_supply_gap(self, gap_seconds: float) -> None: ...
 
     def handle_omni_listen(self, response_id: str) -> None: ...
 
@@ -149,6 +157,9 @@ class OmniClient:
 
             session_id = str(event.get("session_id") or "unknown")
             log.info("Omni session ready: %s", session_id)
+            # A forced listen or playback hold from a session that died before
+            # its acknowledgement must not mute the fresh session.
+            robot.reset_interruption()
             robot.flush_audio_input()
             robot.set_conversation_state("listening")
 
@@ -181,12 +192,43 @@ class OmniClient:
         stop_event: threading.Event,
     ) -> None:
         last_send_at: float | None = None
+        force_control_sent_at: float | None = None
+        deferred_audio: np.ndarray | None = None
+        last_send_cost = 0.0
         while not stop_event.is_set():
-            audio = await asyncio.to_thread(robot.next_audio_chunk, 0.25)
-            if audio is None:
-                continue
-            frame = robot.get_frame_jpeg() if self.config.send_video else None
             force_listen = robot.force_listen_active()
+            if force_listen:
+                # A forced-listen time slice is a control boundary. Sending the
+                # user's interruption in the same slice can make the backend
+                # acknowledge `listen` without retaining that short utterance.
+                # Keep real microphone audio queued and use silence for control.
+                now = time.perf_counter()
+                if force_control_sent_at is not None and now - force_control_sent_at < 1.0:
+                    await asyncio.sleep(0.05)
+                    continue
+                audio = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
+                frame = None
+            else:
+                force_control_sent_at = None
+                if deferred_audio is not None:
+                    audio = deferred_audio
+                    deferred_audio = None
+                else:
+                    audio = await asyncio.to_thread(robot.next_audio_chunk, 0.25)
+                    if audio is None:
+                        continue
+                    # Double talk can be detected while next_audio_chunk blocks.
+                    # Defer this real chunk until the listen acknowledgement.
+                    if robot.force_listen_active():
+                        deferred_audio = audio
+                        continue
+                # Degrade the optional video before the audio cadence suffers:
+                # after one slow Wi-Fi send, the next slice travels audio-only.
+                frame = (
+                    robot.get_frame_jpeg()
+                    if self.config.send_video and last_send_cost <= SLOW_SEND_SECONDS
+                    else None
+                )
             encode_started = time.perf_counter()
             message = await asyncio.to_thread(
                 serialize_input_append,
@@ -198,7 +240,10 @@ class OmniClient:
             send_started = time.perf_counter()
             await websocket.send(message)
             sent_at = time.perf_counter()
+            if force_listen:
+                force_control_sent_at = sent_at
             send_ms = (sent_at - send_started) * 1_000
+            last_send_cost = (encode_ms + send_ms) / 1_000
             if last_send_at is not None and sent_at - last_send_at > 1.15:
                 log.warning(
                     "Slow Omni input cadence: %.0f ms (encode=%.1f ms, send=%.1f ms)",
@@ -250,6 +295,7 @@ class OmniClient:
                                     response_id,
                                     supply_gap * 1_000,
                                 )
+                                robot.note_tts_supply_gap(supply_gap)
                             else:
                                 log.debug(
                                     "TTS supply margin for %s: %.0f ms",

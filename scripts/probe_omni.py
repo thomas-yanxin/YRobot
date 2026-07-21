@@ -45,10 +45,26 @@ async def probe(url: str, tls_verify: bool) -> None:
             marker = event.get("kind") or event.get("reason") or ""
             print("event", event.get("type"), marker, flush=True)
             if marker == "listen":
-                return
+                break
             if event.get("type") in {"session.closed", "error"}:
                 raise RuntimeError(f"server rejected the probe: {event}")
-        raise RuntimeError("server did not acknowledge the forced-listen time slice")
+        else:
+            raise RuntimeError("server did not acknowledge the forced-listen time slice")
+
+        # A force-listen acknowledgement must not wedge the session. Verify that
+        # the next ordinary microphone slice is still consumed normally.
+        await websocket.send(
+            json.dumps(build_input_append(np.zeros(16_000, dtype=np.float32), None))
+        )
+        for _ in range(12):
+            event = json.loads(await asyncio.wait_for(websocket.recv(), 120))
+            marker = event.get("kind") or event.get("reason") or ""
+            print("post-force", event.get("type"), marker, flush=True)
+            if marker == "listen":
+                return
+            if event.get("type") in {"session.closed", "error"}:
+                raise RuntimeError(f"server rejected post-force input: {event}")
+        raise RuntimeError("server stopped consuming input after force_listen")
 
 
 def main() -> None:

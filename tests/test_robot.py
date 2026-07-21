@@ -11,10 +11,14 @@ from scipy.spatial.transform import Rotation
 from yrobot.robot import (
     ANTENNA_POSES,
     DOA_GAZE_ELEVATION,
+    INTERRUPT_ACK_TIMEOUT,
     MAX_HEAD_ANGULAR_SPEED,
     MAX_HEAD_ANGULAR_STEP,
     MAX_HEAD_TRANSLATION_SPEED,
     MAX_HEAD_TRANSLATION_STEP,
+    PLAYBACK_PREROLL_DECAY,
+    PLAYBACK_PREROLL_MARGIN,
+    PLAYBACK_PREROLL_SECONDS,
     RobotIO,
     StreamingAudioResampler,
     angular_distance,
@@ -22,7 +26,6 @@ from yrobot.robot import (
     effective_conversation_state,
     gesture_pulse,
     lifelike_motion_overlay,
-    resample_audio,
     smooth_pose_step,
     step_pose,
     to_mono,
@@ -167,9 +170,71 @@ def test_high_confidence_double_talk_forces_listen_until_acknowledged() -> None:
     assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "late") is False
 
 
+def test_unacknowledged_force_listen_expires_instead_of_muting() -> None:
+    class Audio:
+        def clear_player(self) -> None:
+            pass
+
+    class Media:
+        audio = Audio()
+
+    class Mini:
+        media = Media()
+
+    robot = RobotIO(Mini())
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+
+    assert robot._request_user_interrupt(-24.0, -30.0)
+    assert math.isfinite(robot._suppress_playback_until)
+
+    robot._force_requested_at = time.monotonic() - INTERRUPT_ACK_TIMEOUT - 0.1
+    assert not robot.force_listen_active()
+
+
+def test_new_session_clears_stale_interruption_state() -> None:
+    class Audio:
+        def clear_player(self) -> None:
+            pass
+
+    class Media:
+        audio = Audio()
+
+    class Mini:
+        media = Media()
+
+    robot = RobotIO(Mini())
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+    assert robot._request_user_interrupt(-24.0, -30.0)
+
+    robot.reset_interruption()
+
+    assert not robot.force_listen_active()
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r2") is True
+
+
+def test_playback_preroll_grows_with_supply_gaps_and_decays_each_turn() -> None:
+    robot = RobotIO(object())
+    assert robot._playback_preroll == PLAYBACK_PREROLL_SECONDS
+
+    robot.note_tts_supply_gap(0.3)
+    assert robot._playback_preroll == pytest.approx(0.3 + PLAYBACK_PREROLL_MARGIN)
+
+    robot.note_tts_supply_gap(0.06)
+    assert robot._playback_preroll == pytest.approx(0.3 + PLAYBACK_PREROLL_MARGIN)
+
+    robot.handle_omni_listen("r1")
+    assert robot._playback_preroll == pytest.approx(
+        0.3 + PLAYBACK_PREROLL_MARGIN - PLAYBACK_PREROLL_DECAY
+    )
+
+
 def test_output_is_resampled_from_24k_to_16k() -> None:
     source = np.sin(np.linspace(0, 20 * math.pi, 2_400, endpoint=False)).astype(np.float32)
-    converted = resample_audio(source)
+    converted = StreamingAudioResampler().process(source)
     assert converted.dtype == np.float32
     assert len(converted) == 1_600
     assert np.max(np.abs(converted)) <= 1.0

@@ -145,52 +145,108 @@ def test_tts_gap_survives_response_done_and_response_id_change(
             raise ConnectionClosed(None, None)
 
     class Robot:
+        def __init__(self) -> None:
+            self.supply_gaps: list[float] = []
+
         def set_conversation_state(self, state: str) -> None:
             pass
 
         def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool:
             return True
 
+        def note_tts_supply_gap(self, gap_seconds: float) -> None:
+            self.supply_gaps.append(gap_seconds)
+
     client = OmniClient.__new__(OmniClient)
+    robot = Robot()
     with caplog.at_level(logging.WARNING, logger="yrobot.omni"):
         with pytest.raises(ConnectionError):
-            asyncio.run(client._receive_loop(WebSocket(), Robot()))
+            asyncio.run(client._receive_loop(WebSocket(), robot))
 
     assert "TTS supply gap for r2" in caplog.text
+    assert robot.supply_gaps and robot.supply_gaps[0] > 0.05
 
 
-def test_sender_repeats_force_listen_with_microphone_audio() -> None:
+def test_sender_sends_silent_force_control_before_preserved_microphone() -> None:
     stop_event = threading.Event()
+    microphone = np.linspace(-0.5, 0.5, 16_000, dtype=np.float32)
+
+    class Robot:
+        def __init__(self) -> None:
+            self.force_listen = True
+
+        def next_audio_chunk(self, timeout: float) -> np.ndarray:
+            del timeout
+            return microphone
+
+        def get_frame_jpeg(self) -> None:
+            return None
+
+        def force_listen_active(self) -> bool:
+            return self.force_listen
+
+    robot = Robot()
 
     class WebSocket:
         def __init__(self) -> None:
-            self.message: dict[str, object] | None = None
+            self.messages: list[dict[str, object]] = []
 
         async def send(self, raw: str) -> None:
-            self.message = json.loads(raw)
-            stop_event.set()
+            self.messages.append(json.loads(raw))
+            if len(self.messages) == 1:
+                robot.force_listen = False
+            else:
+                stop_event.set()
+
+    websocket = WebSocket()
+    client = OmniClient.__new__(OmniClient)
+    client.config = SimpleNamespace(send_video=False)
+
+    asyncio.run(client._send_loop(websocket, robot, stop_event))
+
+    assert len(websocket.messages) == 2
+    control, speech = websocket.messages
+    assert control["type"] == "input.append"
+    assert control["input"]["force_listen"] is True
+    np.testing.assert_array_equal(decode_pcm(control["input"]["audio"]), np.zeros(16_000))
+    assert "force_listen" not in speech["input"]
+    np.testing.assert_array_equal(decode_pcm(speech["input"]["audio"]), microphone)
+
+
+def test_video_yields_to_audio_cadence_after_a_slow_send() -> None:
+    stop_event = threading.Event()
 
     class Robot:
         def next_audio_chunk(self, timeout: float) -> np.ndarray:
             del timeout
             return np.zeros(16_000, dtype=np.float32)
 
-        def get_frame_jpeg(self) -> None:
-            return None
+        def get_frame_jpeg(self) -> bytes:
+            return b"jpeg"
 
         def force_listen_active(self) -> bool:
-            return True
+            return False
+
+    class WebSocket:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] = []
+
+        async def send(self, raw: str) -> None:
+            self.messages.append(json.loads(raw))
+            if len(self.messages) == 1:
+                await asyncio.sleep(0.3)
+            else:
+                stop_event.set()
 
     websocket = WebSocket()
     client = OmniClient.__new__(OmniClient)
-    client.config = SimpleNamespace(send_video=False)
+    client.config = SimpleNamespace(send_video=True)
 
     asyncio.run(client._send_loop(websocket, Robot(), stop_event))
 
-    assert websocket.message is not None
-    assert websocket.message["type"] == "input.append"
-    assert websocket.message["input"]["force_listen"] is True
-    assert websocket.message["input"]["audio"]
+    congested, recovering = websocket.messages
+    assert "video_frames" in congested["input"]
+    assert "video_frames" not in recovering["input"]
 
 
 def test_normal_websocket_backpressure_does_not_flood_warnings(

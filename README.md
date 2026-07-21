@@ -33,7 +33,13 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
   channels, and enables XVF's robust double-talk mode (`PP_DTSENSITIVE=10`).
 - Uses MiniCPM's natural `listen/speak` decision first. As a reliability fallback, DoA can never
   interrupt alone: post-AEC speech must remain at least 6 dB above the learned far-end residual
-  for five consecutive 20 Hz checks before playback is cleared and `force_listen` is sent.
+  for a sustained 120 ms before playback is cleared and `force_listen` is sent.
+- Sends `force_listen` as a silent control slice and temporarily holds the real microphone slice;
+  after MiniCPM acknowledges `listen`, the user's interrupting words are forwarded normally instead
+  of being consumed by the control decision. Waiting for that acknowledgement is bounded, and a new
+  session clears any stale interruption state, so a lost acknowledgement can never mute the robot.
+- Adapts the playback preroll to observed TTS delivery gaps and lets one slow Wi-Fi send degrade
+  the next slice to audio-only, so video never costs speech fluency.
 - Turns toward a detected speaker with Reachy's DoA API.
 - Keeps a slightly raised natural gaze; DoA changes yaw without accumulating downward pitch.
 - Keeps the last speaker as an attention anchor instead of replacing it with permanent random poses.
@@ -94,7 +100,7 @@ yrobot --tls-verify
 
 XVF3800 is responsible for suppressing far-end echo, and MiniCPM-o receives every post-AEC
 microphone slice while it is speaking. For reliable barge-in, the client learns the speaker-only
-residual during the first 600 ms of playback and requires sustained double-talk evidence before
+residual during the first 400 ms of playback and requires sustained double-talk evidence before
 forcing `listen`. When MiniCPM confirms `listen`, the application and GStreamer queues are flushed.
 For an ordinary quiet end-of-turn, buffered sentence audio is allowed to drain so the answer is
 not cut off. Physical testing should still confirm the threshold against the robot's actual room,
