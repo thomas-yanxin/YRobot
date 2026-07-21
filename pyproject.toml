@@ -3,59 +3,31 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "reachy-mini-live-chat"
-version = "0.2.0"
-description = "Realtime full-duplex audio-visual dialogue for Reachy Mini: streams mic+camera to a remote MiniCPM-o 4.5 omni model (llama.cpp-omni) over WebSocket, with DOA head-tracking and safety-clamped expressive motion."
+name = "yrobot"
+version = "0.3.0"
+description = "Full-duplex MiniCPM-o conversation for Reachy Mini Wireless"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Reachy Mini Live Chat" }]
-keywords = ["reachy_mini", "robotics", "voice-assistant", "full-duplex", "omni", "minicpm-o", "websocket"]
-
-# The brain is remote (over WebSocket), so the robot is just a client. The only hard deps
-# are numpy (PCM math) and websockets (the omni link). Everything else — scipy, VAD, camera
-# codecs, web UI, AEC — is an optional, lazy-imported extra with a pure-numpy/stdlib fallback,
-# so a minimal on-robot install stays tiny.
 dependencies = [
-    "numpy>=1.24",
-    "websockets>=12",
+    "numpy>=2.2",
+    "python-dotenv>=1,<2",
+    "reachy-mini>=1.9,<2",
+    "scipy>=1.15,<2",
+    "websockets>=12,<16",
 ]
 
 [project.optional-dependencies]
-# The robot SDK — provides media I/O + motion. Normally already present in the CM4 image.
-robot = ["reachy-mini"]
-
-# --- optional quality/feature add-ons (each has a fallback if absent) ---------
-config = ["python-dotenv>=1.0"]          # read a .env file (else use real env vars)
-hifi = ["scipy>=1.10"]                    # polyphase resampling (else numpy linear interp)
-vision = ["pillow"]                       # downscale frames (else the SDK's full-res get_frame_jpeg)
-web = ["fastapi", "uvicorn"]              # control/monitor web UI (headless works without it)
-
-# On-robot (Wireless CM4, ARM64 Linux): minimal client. reachy-mini is usually already in the
-# robot image, so in practice `pip install .` (numpy + websockets) is enough. dotenv is a nicety.
-cm4 = ["reachy-mini", "python-dotenv>=1.0"]
-
-# A comfortable dev-laptop bridge to the robot (smaller frames, web UI, hi-fi audio).
-laptop = [
-    "reachy-mini", "python-dotenv>=1.0",
-    "scipy>=1.10", "pillow",
-    "fastapi", "uvicorn",
-]
-
-dev = ["pytest>=7", "ruff", "numpy>=1.24", "pillow", "python-dotenv>=1.0"]
+dev = ["pytest>=8", "ruff>=0.9"]
 
 [project.entry-points."reachy_mini_apps"]
-# The Reachy Mini daemon discovers the app through this entry point.
-live_chat = "reachy_mini_live_chat.main:LiveChatApp"
+yrobot = "yrobot.main:Yrobot"
 
 [project.scripts]
-reachy-mini-live-chat = "reachy_mini_live_chat.main:cli"
+yrobot = "yrobot.main:cli"
 
 [tool.setuptools.packages.find]
-include = ["reachy_mini_live_chat*"]
-
-[tool.setuptools.package-data]
-reachy_mini_live_chat = ["static/*", "assets/*"]
+include = ["yrobot*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -64,3 +36,6 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]

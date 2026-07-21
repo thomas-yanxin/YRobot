@@ -1,52 +1,50 @@
-"""Config URL resolution: gateway vs raw backend vs verbatim path."""
-from reachy_mini_live_chat.config import Config
+import ssl
+
+import pytest
+
+from yrobot.config import Config, normalize_backend_url
 
 
-def _cfg(**kw):
-    c = Config()
-    for k, v in kw.items():
-        setattr(c, k, v)
-    return c
+def test_backend_url_adds_path() -> None:
+    assert normalize_backend_url("wss://robot-brain:28099") == ("wss://robot-brain:28099/backend")
 
 
-def test_gateway_url_default():
-    c = _cfg(omni_ws_url="wss://host:8006", omni_endpoint="gateway", omni_gateway_mode="video")
-    assert c.omni_backend_url == "wss://host:8006/v1/realtime?mode=video"
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://robot-brain:28099/backend",
+        "wss://robot-brain:8006/v1/realtime?mode=video",
+        "not-a-url",
+    ],
+)
+def test_backend_url_rejects_non_backend_urls(url: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_backend_url(url)
 
 
-def test_gateway_url_audio_mode():
-    c = _cfg(omni_ws_url="wss://host:8006", omni_endpoint="gateway", omni_gateway_mode="audio")
-    assert c.omni_backend_url == "wss://host:8006/v1/realtime?mode=audio"
+def test_config_loads_small_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNI_WS_URL", "ws://127.0.0.1:28099")
+    monkeypatch.setenv("OMNI_TLS_VERIFY", "1")
+    monkeypatch.setenv("OMNI_SEND_VIDEO", "0")
+    monkeypatch.setenv("OMNI_SYSTEM_PROMPT", "short prompt")
+
+    config = Config.load()
+
+    assert config.omni_url == "ws://127.0.0.1:28099/backend"
+    assert config.tls_verify is True
+    assert config.send_video is False
+    assert config.system_prompt == "short prompt"
+    assert config.ssl_context() is None
 
 
-def test_raw_backend_url():
-    c = _cfg(omni_ws_url="wss://host:28099", omni_endpoint="backend")
-    assert c.omni_backend_url == "wss://host:28099/backend"
-
-
-def test_explicit_path_used_verbatim():
-    c = _cfg(omni_ws_url="wss://host:8006/v1/realtime?mode=video", omni_endpoint="backend")
-    # a path is present → endpoint is ignored, URL used as-is
-    assert c.omni_backend_url == "wss://host:8006/v1/realtime?mode=video"
-
-
-def test_trailing_slash_base():
-    c = _cfg(omni_ws_url="wss://host:8006/", omni_endpoint="gateway", omni_gateway_mode="video")
-    assert c.omni_backend_url == "wss://host:8006/v1/realtime?mode=video"
-
-
-def test_video_inactive_in_audio_mode():
-    # audio-only session → never attach video frames (even via an explicit URL)
-    c = _cfg(omni_ws_url="wss://host:8006", omni_endpoint="gateway", omni_gateway_mode="audio",
-             omni_send_video=True)
-    assert c.omni_video_active is False
-    c2 = _cfg(omni_ws_url="wss://host:8006/v1/realtime?mode=audio", omni_send_video=True)
-    assert c2.omni_video_active is False
-
-
-def test_video_active_in_video_mode():
-    c = _cfg(omni_ws_url="wss://host:8006", omni_endpoint="gateway", omni_gateway_mode="video",
-             omni_send_video=True)
-    assert c.omni_video_active is True
-    c2 = _cfg(omni_send_video=False, omni_gateway_mode="video")
-    assert c2.omni_video_active is False
+def test_unverified_tls_context() -> None:
+    config = Config(
+        omni_url="wss://127.0.0.1:28099/backend",
+        tls_verify=False,
+        send_video=True,
+        system_prompt="test",
+    )
+    context = config.ssl_context()
+    assert context is not None
+    assert context.verify_mode == ssl.CERT_NONE
+    assert context.check_hostname is False

@@ -1,28 +1,26 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Reachy Mini — Live Video Chat</title>
-  <link rel="stylesheet" href="style.css" />
-</head>
-<body>
-  <main>
-    <h1>🤖🎙️ Reachy Mini — Live Video Chat</h1>
-    <p class="tag">Full-duplex · bilingual (中文/English) · ≤1.5s · local on Apple Silicon</p>
-    <p>
-      A full-duplex, low-latency voice + video conversational app for
-      <a href="https://github.com/pollen-robotics/reachy_mini">Reachy Mini</a>. It runs the
-      <code>VAD → ASR → LLM → TTS</code> pipeline locally on your Mac (MLX), reacts with expressive
-      motion, turns toward the speaker via DOA, and keeps vision-token usage tiny.
-    </p>
-    <h2>Install &amp; run</h2>
-    <pre><code>./scripts/setup_mac.sh
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YRobot</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Reachy Mini × MiniCPM-o 4.5</p>
+      <h1>YRobot</h1>
+      <p class="lede">
+        Full-duplex audiovisual conversation, expressive motion, and speaker orientation—running
+        as a small client on Reachy Mini Wireless.
+      </p>
+      <div class="flow" aria-label="Architecture">
+        <span>Reachy mic + camera</span><b>→</b><span>Omni server</span><b>→</b><span>voice + motion</span>
+      </div>
+      <pre><code>./scripts/setup_cm4.sh
 source .venv/bin/activate
-reachy-mini-live-chat --sim --stub   # hardware-free demo
-reachy-mini-live-chat                # on the robot (daemon running)</code></pre>
-    <p>This is a Reachy Mini <strong>Python app</strong>: install it and launch it from the robot
-    dashboard or the CLI. Web control UI runs on <code>:8042</code>.</p>
-  </main>
-</body>
+yrobot</code></pre>
+      <p><a href="https://github.com/pollen-robotics/reachy_mini">Reachy Mini SDK</a></p>
+    </main>
+  </body>
 </html>

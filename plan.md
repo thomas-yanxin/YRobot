@@ -1,158 +1,137 @@
-# Reachy Mini — Realtime Full-Duplex Audio-Visual Dialogue (MiniCPM-o 4.5 omni)
+# YRobot 重构计划：Reachy Mini × MiniCPM-o 4.5 Omni
 
-> Rebuilds the conversational core of `reachy_mini_live_chat` around a **remote end-to-end
-> omni model** (MiniCPM-o 4.5, served by `llama.cpp-omni`'s `llama-omni-server`) over a
-> **full-duplex WebSocket**, replacing the local `VAD→ASR→LLM→TTS` pipeline. Runs **on-robot
-> (CM4, Wireless)**; all heavy inference is offloaded to the GPU server at
-> `wss://10.0.16.187:8006`. Keeps the robot's DOA, expressive motion, and hard safety limits.
+状态：已确认，正在实施。
 
-## 0. Decisions (confirmed with the user)
+## 1. 目标理解
 
-1. **Deployment**: app runs **on the robot's CM4** (Wireless). Direct mic-array/DOA, camera,
-   speaker; cognition fully offloaded → CM4 only does I/O + WebSocket + 100 Hz motion. Light load.
-2. **Scope**: **fully replace** the local `asr/`, `llm/`, `tts/`, `vision/gating` modules with the
-   omni client. No local ML models remain. (Removes the mlx/funasr/kokoro/llama.cpp dependency.)
-3. **Video**: **continuous ~1 fps** — one current camera frame attached to each 1 s audio chunk
-   (matches the model's 1 Hz TDM design; LAN bandwidth is ample).
+把 YRobot 从零重构为一个小而可靠的 Reachy Mini Python 应用：
 
-## 1. Hard requirements → how we meet them
+- 直连已经部署好的 `llama-omni-server`：
+  `wss://10.0.16.187:28099/backend`。
+- 以 `full_duplex` 模式持续上传 Reachy 的麦克风和摄像头数据。
+- 实时播放 MiniCPM-o 4.5 返回的语音；模型负责听、说切换和打断语义。
+- 对话时让机器人有自然动作：朝向说话人、说话时随语音轻微摆动、在监听/空闲时保持
+  克制的生命感。
+- 优先复用 Reachy Mini SDK 与 MiniCPM 官方协议，不复制 conversation app 的大型框架。
+- 旧实现没有兼容要求；未确认前不删除现有代码。
 
-| # | Requirement (from user) | How |
-|---|---|---|
-| 1 | 视听交互尽可能实时 (full-duplex, low latency) | End-to-end omni over WS in `full_duplex` mode: stream 1 s mic chunks + 1 frame; the model decides listen/speak at 1 Hz; audio deltas play as they arrive. No local ASR/LLM/TTS hops. |
-| 2 | DOA 融入：说话时机器人依 DOA 转向说话人 | Kept **unchanged** — `MotionController` polls `mini.media.get_DoA()` at 10 Hz while a lightweight local VAD says a human is speaking, EMA-smoothed → head yaw (+ body yaw past ±45°), all clamped. |
-| 3 | 必要时动作交互，且**务必保证物理安全** | Motion moods per conversation state + emotion gestures inferred from the omni **text** stream (`kind:"text"` deltas). **Every** command routed through `motion/safety.py` clamps (head pitch/roll ±40°, yaw ±180°, body ±160°, head−body Δ≤65°); SDK clamps again (defense-in-depth). Return-to-rest on interrupt/shutdown. |
+2026-07-21 已做只读健康检查，服务返回：
+`{"engine":"comni","status":"ok"}`。
 
-## 2. Confirmed omni WS protocol (verified against `tc-mb/llama.cpp-omni` source)
+## 2. 已核实的事实
 
-Source of truth: `tools/server/ws_handler.cpp` + `protocol.cpp` (not just the cookbook).
+### llama.cpp-omni
 
-- **Endpoint**: `wss://10.0.16.187:8006/backend` (auto-append `/backend` if absent). Self-signed
-  cert → TLS verification disabled by default (`OMNI_TLS_INSECURE=1`). **One active session** at a
-  time server-side.
-- **Audio encoding**: base64 of **raw float32 little-endian PCM**, **mono, 16 kHz** (input WAV is
-  hardcoded 16 k/mono/IEEE-float). Output audio deltas are float32 PCM too.
-- **`session.init`** (client→server):
-  ```json
-  {"type":"session.init","payload":{
-     "mode":"full_duplex", "use_tts":true,
-     "system_prompt":"…",
-     "voice":{"ref_audio":"<b64 wav>"},          // optional voice-clone
-     "config":{"temperature":…, "top_p":…, "top_k":…,
-               "listen_prob_scale":…, "force_listen_count":…,
-               "max_new_speak_tokens_per_chunk":…, "tts_temperature":…}}}
-  ```
-  → server replies `session.created {session_id, mode, metrics}`. In full-duplex the server does an
-  index-0 prefill (system prompt / ref audio) on init.
-- **`input.append`** (full-duplex; client→server, ≈ once/second):
-  ```json
-  {"type":"input.append","input":{
-     "audio":"<b64 float32 PCM 16k mono ~1s>",
-     "video_frames":["<b64 jpeg>"],   // only the FIRST frame is used per append
-     "force_listen": false }}          // optional: force this step to LISTEN
-  ```
-  Must **not** carry `messages` (that's turn_based only → `mode_mismatch` fail-fast).
-- **Server → client events**:
-  - `response.output.delta` + `kind`:
-    - `"text"` → `{text}` (accumulate for UI + drive emotion gestures)
-    - `"audio"` → `{audio:"<b64 float32 PCM>"}` (async, as TTS is produced → play)
-    - `"listen"` → model chose to listen this step (robot stays quiet)
-  - `response.done` → `{text, reason:"turn_end", audio:null|…}` (turn boundary)
-  - `session.closed` → `{reason}` (reconnect)
+- 数据通道是 `/backend`；首条消息必须是 `session.init`。
+- `full_duplex` 每个时间片发送一条 `input.append`：1 秒左右的 16 kHz、单声道、
+  float32 裸 PCM，可附一张 base64 JPEG。
+- 服务返回 `response.output.delta`，`kind` 为 `listen`、`text` 或 `audio`。
+- C++ Token2Wav 实际输出 24 kHz float32 PCM，但 WebSocket 事件不携带采样率；客户端需
+  将 24 kHz 下采样到 Reachy 播放设备的 16 kHz。
+- 服务当前只允许一个活动会话；WebSocket 断开时后端会清理会话并保留已加载模型。
 
-## 3. Architecture (what changes, what stays)
+### Reachy Mini SDK
 
-```
- mic ─► AudioEngine ─┬─► energy VAD ──► user_speaking (DOA trigger + listen mood + barge-in)
-                     └─► 1 s float32 16k chunk ─┐
- camera ─► VideoGrabber ─► latest JPEG b64 ─────┤
-                                                ▼
-                                        OmniClient  (asyncio thread, WebSocket /backend)
-                                          send: input.append(audio[, frame])
-                                          recv: text→emit; audio→bus.tts_audio; listen/done→state
-                                                ▼
- speaker ◄── AudioEngine.playback ◄── bus.tts_audio (float32 16k, barge-in-cuttable)
-                                                │
-                    MotionController (100 Hz, single set_target owner)
-                    ◄── DOA look-at · state moods · emotion gestures (from omni text)
-                        all clamped by motion/safety.py
+- `mini.media.get_audio_sample()` 给出 16 kHz、双声道 float32；上传前只需混为单声道。
+- `mini.media.get_frame_jpeg()` 可直接复用，避免引入 OpenCV/Pillow 编码流水线。
+- `mini.media.push_audio_sample()` 原生播放 16 kHz float32。
+- `mini.enable_wobbling()` 已提供与实际播放音频同步的说话动作，不应再自建一套波形动画。
+- `mini.media.get_DoA()`、`look_at_world()` 是官方的说话人朝向路径。
+- 平滑动作使用 `goto_target()`；不需要实时姿态融合时，不引入 30/100 Hz `set_target()`
+  控制环。
+
+参考：
+
+- [Reachy Mini AGENTS.md](https://github.com/pollen-robotics/reachy_mini/blob/main/AGENTS.md)
+- [MiniCPM-o 4.5 llama.cpp-omni 文档](https://github.com/OpenSQZ/MiniCPM-V-CookBook/blob/main/deployment/llama.cpp-omni/minicpmo_4_5_llamacpp_omni_zh.md)
+- [MiniCPM-o 官方 Realtime 示例](https://github.com/OpenBMB/MiniCPM-o-Demo/tree/main/examples/realtime)
+- [Reachy Mini conversation app](https://github.com/pollen-robotics/reachy_mini_conversation_app)
+- [Reachy Mini Python SDK](https://huggingface.co/docs/reachy_mini/SDK/python-sdk)
+- [Reachy Mini DoA 示例](https://github.com/pollen-robotics/reachy_mini/blob/main/examples/sound_doa.py)
+
+## 3. 最小架构
+
+```text
+Reachy mic (16k stereo)
+  -> mono + 1 秒分片
+  -> Omni WebSocket /backend ----------------------+
+                                                     |
+Reachy camera -> 当前 JPEG，每个时间片最多一张 ------+-> MiniCPM-o 4.5
+                                                     |
+Reachy speaker <- 24k -> 16k 重采样 <- audio delta --+
+
+DoA -> 单一串行动作 worker -> look_at_world/goto_target
+播放音频 -> Reachy SDK enable_wobbling()
 ```
 
-**Reused unchanged**: `bus.py` (state machine, queues, events, barge-in), `motion/*`
-(controller, safety, doa, emotions), `audio/aec.py`, `audio/vad.py` (now only DOA/barge-in gate),
-`audio/io.py` playback path, `sim/fake_mini.py`, `web.py` + `static/` UI, `text_utils.py`.
+计划只保留四个职责明确的 Python 模块：
 
-**New**:
-- `omni/protocol.py` — pure codec: base64⇄float32 PCM, `build_session_init`, `build_input_append`,
-  `parse_event`. No I/O → fully unit-testable.
-- `omni/client.py` — `OmniClient`: runs asyncio (websockets) in its own thread; sender pulls 1 s
-  chunks + latest frame; receiver dispatches events onto the `Bus`; init/reconnect w/ backoff;
-  resamples omni output SR→16 k onto `bus.tts_audio`.
-- `omni/video.py` — grab `mini.media.get_frame()` → downscale (long edge ≤ `OMNI_VIDEO_MAX_EDGE`)
-  → JPEG (`OMNI_VIDEO_JPEG_QUALITY`) → base64, throttled to `OMNI_VIDEO_FPS`. (Salvaged from
-  `vision/gating.py`'s encode helpers; gating removed since video is continuous.)
-- `omni/fake_server.py` — tiny local asyncio omni WS server for `--stub`/tests: exercises the real
-  client path offline (emits `session.created`, alternating `listen`/`text`+`audio`+`done`).
-
-**Rewritten**:
-- `pipeline.py` → thin **orchestrator**: wires AudioEngine + VideoGrabber + OmniClient +
-  MotionController; maps omni events + local VAD → `ConvState` (LISTENING/SPEAKING/IDLE); barge-in;
-  greeting; graceful shutdown → safe rest.
-- `audio/io.py` → capture assembles 1 s 16 k mono chunks and hands them to a callback (+ keeps the
-  VAD start/stop → `user_speaking`); playback loop kept.
-- `config.py` → drop ASR/LLM/TTS/vision-model knobs; add `OMNI_*` (see §4).
-- `main.py` → CLI/`LiveChatApp` unchanged in shape; `--stub` starts the fake omni server.
-
-**Removed**: `asr/`, `llm/`, `tts/`, `vision/` packages; their deps in `pyproject.toml`.
-
-## 4. Config (env-driven, `.env`)
-
-```
-OMNI_WS_URL=wss://10.0.16.187:8006        # /backend auto-appended
-OMNI_MODE=full_duplex                       # full_duplex | turn_based
-OMNI_USE_TTS=1
-OMNI_TLS_INSECURE=1                         # self-signed cert
-OMNI_SYSTEM_PROMPT="你是 Reachy Mini…（中英双语，简洁口语化）"
-OMNI_VOICE_REF=                             # optional path to ref .wav for voice-clone
-OMNI_OUT_SR=24000                           # omni TTS output rate (assumption; 16000 fallback)
-OMNI_CHUNK_MS=1000                          # 1 s per input.append (model's TDM period)
-OMNI_SEND_VIDEO=1
-OMNI_VIDEO_FPS=1
-OMNI_VIDEO_MAX_EDGE=448
-OMNI_VIDEO_JPEG_QUALITY=70
-# sampling passthrough → session.init.config
-OMNI_TEMPERATURE / OMNI_TOP_P / OMNI_TOP_K / OMNI_LISTEN_PROB_SCALE /
-OMNI_FORCE_LISTEN_COUNT / OMNI_MAX_SPEAK_TOKENS_PER_CHUNK / OMNI_TTS_TEMPERATURE
-# kept: VAD (DOA/barge-in only), ENABLE_AEC, motion (ENABLE_MOTION/DOA, CONTROL_HZ), WEB_*
+```text
+yrobot/
+  config.py   # 少量环境配置与校验
+  omni.py     # 协议编解码、WS 会话、重连
+  robot.py    # Reachy 音视频适配、播放、DoA/动作
+  main.py     # ReachyMiniApp 与独立 CLI 生命周期
 ```
 
-## 5. Real-time, barge-in & safety notes
+测试只覆盖稳定边界：协议消息、PCM 编解码与重采样、URL/TLS 配置、DoA 坐标转换、断线重连
+和假机器人上的端到端数据流。
 
-- **Latency**: granularity is the 1 s TDM chunk (model design); first audio ≈ chunk boundary +
-  LAN RTT + prefill + generate. Audio deltas play incrementally. `OMNI_CHUNK_MS` tunable.
-- **Echo**: we keep streaming mic while the robot speaks (so the model can barge-in), so we must
-  feed **echo-suppressed** mic (`audio/aec.py` capture processing) or the model hears itself; this
-  is the main real-hardware tuning knob. Local energy-VAD barge-in also flushes `bus.tts_audio`.
-- **Output SR assumption**: MiniCPM-o token2wav ≈ 24 kHz; the server callback drops the rate field,
-  so `OMNI_OUT_SR` is configurable and flip-to-16000 is one env change if pitch sounds off.
-- **Safety**: unchanged clamps on every `set_target`; emotion moves are pre-authored in-range and
-  still clamped; interrupt/shutdown returns to a safe rest pose. Physical safety is not weakened.
+## 4. 明确删除的复杂度
 
-## 6. Tests & tooling
+- 删除自建 Event Bus、复杂状态机和多层 pipeline。
+- 删除 Web UI、FastAPI、静态前端；第一版以日志和 Reachy dashboard 生命周期为准。
+- 删除本地 ASR、VAD、LLM、TTS、AGC、情绪关键词分类和自定义 30/100 Hz 动作合成器。
+- 删除 gateway (`:8006`) 兼容；当前目标明确是直连 raw backend (`:28099`)。
+- 删除几十个实验性环境变量，只保留 endpoint、TLS、prompt、视频开关/尺寸、日志等级。
+- 不复制 conversation app 的 tool registry、profile、MCP、Gradio 和 motion manager。
 
-- New pure-logic tests: `omni/protocol.py` (b64⇄float32 round-trip, init/append builders,
-  event parsing incl. all `kind`s + `done`/`closed`), `omni/video.py` encode.
-- Keep motion/safety/doa/bus tests. Remove ASR/LLM/TTS tests.
-- `--sim --stub` smoke test drives the **real** OmniClient against `omni/fake_server.py` end-to-end
-  (mic→chunk→WS→audio back→speaker→motion) with no GPU server and no hardware.
-- `scripts/setup_cm4.sh` (+ README): lightweight venv (numpy, scipy, websockets, pillow, opencv or
-  SDK frames, python-dotenv) — no mlx/funasr/kokoro. Update README + `.env.example`.
+## 5. 复用策略
 
-## 7. Milestones
+- 音视频设备、AEC、DoA、动作安全限制、语音摆动：复用 `reachy-mini` SDK。
+- WebSocket 消息格式与 1 秒发送节奏：按 MiniCPM-o-Demo 官方 probe 实现。
+- 输出下采样：使用 Reachy SDK 已依赖的 `scipy.signal.resample_poly`。
+- 可选情绪/舞蹈若进入后续范围，复用
+  `pollen-robotics/reachy-mini-emotions-library` / dances library，不复制动作资产。
 
-1. `omni/protocol.py` + tests.  2. `omni/client.py` (asyncio thread, init/reconnect, event bridge).
-3. `omni/video.py` grabber.  4. Rewrite `audio/io.py` capture chunking; keep playback.
-5. Rewrite `pipeline.py` orchestrator + state mapping + barge-in.  6. `config.py`/`main.py`/`--stub`
-   fake server.  7. Delete `asr`/`llm`/`tts`/`vision`; update `pyproject`, `.env.example`, README,
-   `scripts/`.  8. Tests green + `ruff` clean + `--sim --stub` smoke run.
-```
+## 6. 实施顺序
+
+1. 根据下面的回答写入 `agents.local.md`，记录硬件与运行位置。
+2. 用 `reachy-mini-app-assistant check` 校验现有应用骨架；保留必要的 HF/Reachy 元数据。
+3. 新建最小 `yrobot` 包及单元测试，再替换入口和依赖。
+4. 删除旧包、旧前端和过时测试，保证仓库只剩必需内容。
+5. 运行 `pytest`、`ruff` 和 `reachy-mini-app-assistant check`。
+6. 用 fake Reachy/fake Omni 做自动化 smoke test。
+7. 最后连接真实 `wss://10.0.16.187:28099/backend` 做协议 smoke test；物理音频、DoA 和动作
+   由你在真实机器人旁确认，测试时先使用低音量和小幅动作。
+
+## 7. 已确认的选择
+
+### Q1：硬件和运行位置
+
+Reachy Mini 是哪一版，YRobot 准备运行在哪里？
+
+答案：`Wireless 的 CM4`
+
+建议：如果是 Wireless 且与 `10.0.16.187` 同一局域网，优先运行在 CM4；机器人只做 I/O，
+模型推理在远端服务器。
+
+### Q2：第一版动作范围
+
+答案：`A；后续逐步扩展到 B`
+
+- A（建议）：自然自动动作——DoA 转向、SDK 语音摆动、轻微监听/空闲姿态。
+- B：再加入模型主动选择的 `dance` / `play_emotion` / `move_head` 等命名动作。
+
+说明：raw `llama-omni-server` 的 full-duplex 协议只输出 listen/text/audio，没有原生 tool
+call。选择 B 需要额外设计一个动作控制侧通道或结构化标记协议，会增加复杂度，也需要确认
+你的服务端是否愿意配合修改。
+
+## 8. 验收标准
+
+- 连续音频和约 1 fps 视频可稳定上传，网络慢时不会无限堆积。
+- 语音 delta 连续播放，无明显变速、爆音或无限缓冲。
+- 用户可在机器人说话时继续讲话，模型仍持续收到麦克风时间片。
+- 有声音朝向和说话摆动，但动作调用串行、幅度受 SDK 安全限制。
+- 断网后有界重连；Ctrl-C/应用停止能释放媒体、关闭 WS、停止动作并安全回中性姿态。
+- 核心仓库结构明显小于当前版本，测试和文档与实际协议一致。
