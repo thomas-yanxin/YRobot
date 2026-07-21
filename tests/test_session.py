@@ -30,7 +30,7 @@ class FakeRobot:
     def get_frame_jpeg(self) -> bytes:
         return b"jpeg"
 
-    def play_omni_audio(self, samples: np.ndarray) -> bool:
+    def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool:
         self.played.append(samples)
         return True
 
@@ -91,6 +91,18 @@ async def _session_scenario() -> None:
                 }
             )
         )
+        # llama.cpp-omni can finish text decoding before its background TTS
+        # worker has delivered the final audio callback.
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "response.output.delta",
+                    "kind": "audio",
+                    "response_id": "r1",
+                    "audio": encode_pcm(np.linspace(0.2, 0.0, 120, dtype=np.float32)),
+                }
+            )
+        )
         await asyncio.sleep(0.1)
         stop_event.set()
 
@@ -107,7 +119,8 @@ async def _session_scenario() -> None:
 
     assert observed[0]["type"] == "session.init"
     assert observed[1]["type"] == "input.append"
-    assert len(robot.played) == 1
+    assert len(robot.played) == 2
     np.testing.assert_allclose(robot.played[0], np.linspace(-0.2, 0.2, 240))
+    np.testing.assert_allclose(robot.played[1], np.linspace(0.2, 0.0, 120))
     assert robot.states[0] == "listening"
     assert "speaking" in robot.states

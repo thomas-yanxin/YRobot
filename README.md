@@ -20,7 +20,9 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 ## What it does
 
 - Streams one-second 16 kHz microphone slices and current camera JPEGs to `/backend`.
-- Plays the model's streamed 24 kHz speech after resampling it to Reachy's 16 kHz output.
+- Plays streamed 24 kHz speech through a stateful 24→16 kHz resampler, preserving
+  filter/phase continuity across TTS deltas instead of creating audible block edges.
+- Uses a short 120 ms first-audio prebuffer to absorb Wi-Fi and Token2Wav delivery jitter.
 - Keeps listening while Reachy speaks, preserving MiniCPM-o's full-duplex behavior.
 - Supports voice barge-in: debounced DoA speech plus post-AEC microphone energy clears
   local/GStreamer playback and holds `force_listen` until the server acknowledges listening.
@@ -29,6 +31,9 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 - Keeps a slightly raised natural gaze; DoA changes yaw without accumulating downward pitch.
 - Uses the SDK's native audio-reactive wobble and restrained antenna/idle poses.
 - Uses the CM4-local media backend, avoiding a WebRTC encode/decode loop on the robot.
+- Encodes camera JPEGs on a dedicated latest-frame worker so video cannot stall audio upload.
+- Disables WebSocket compression for already-dense PCM/JPEG payloads and serializes uploads
+  away from the receive loop, keeping streamed TTS packets responsive on the CM4.
 - Sends all Phase-A motion through one bounded, non-blocking `set_target` control loop.
 - Reconnects after network failures and returns to a neutral pose on shutdown.
 
@@ -83,6 +88,12 @@ python scripts/probe_omni.py
 The probe sends one second of silence with the protocol's `force_listen` hint. It checks TLS,
 session initialization, audio prefill, and the response channel without making the model speak.
 For local development checks, install `.[dev]` and run `python -m pytest` plus `ruff check .`.
+
+At runtime, warnings named `TTS supply gap`, `Slow playback stage`, and
+`Slow Omni input cadence` identify whether a remaining pause comes from the remote TTS,
+the CM4 audio path, or upload backpressure. If speech is still interrupted, first run
+`yrobot --no-video` as an A/B check and inspect whether `User barge-in` appears without an
+actual interruption from the user.
 
 Simulation can exercise lifecycle and motion code, but physical audio, camera, DoA, and speaker
 behavior must be verified on the Wireless robot.

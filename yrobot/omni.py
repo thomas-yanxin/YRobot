@@ -8,6 +8,7 @@ import contextlib
 import json
 import logging
 import threading
+import time
 from typing import Any, Protocol
 
 import numpy as np
@@ -26,7 +27,7 @@ class RobotPort(Protocol):
 
     def get_frame_jpeg(self) -> bytes | None: ...
 
-    def play_omni_audio(self, samples: np.ndarray) -> bool: ...
+    def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool: ...
 
     def force_listen_active(self) -> bool: ...
 
@@ -80,6 +81,19 @@ def build_input_append(
     return {"type": "input.append", "input": model_input}
 
 
+def serialize_input_append(
+    audio: np.ndarray,
+    frame_jpeg: bytes | None,
+    *,
+    force_listen: bool = False,
+) -> str:
+    """Encode one compact input message away from the receive event loop."""
+    return json.dumps(
+        build_input_append(audio, frame_jpeg, force_listen=force_listen),
+        separators=(",", ":"),
+    )
+
+
 class OmniClient:
     """Maintain one bounded full-duplex session and reconnect after failures."""
 
@@ -116,6 +130,9 @@ class OmniClient:
             # answers server pings automatically when its own periodic ping is
             # disabled, avoiding two independent heartbeat loops.
             ping_interval=None,
+            # PCM and JPEG are already dense; permessage-deflate adds CM4 CPU
+            # and event-loop jitter for little bandwidth reduction on the LAN.
+            compression=None,
             max_queue=64,
         ) as websocket:
             await websocket.send(json.dumps(build_session_init(self.config.system_prompt)))
@@ -129,9 +146,7 @@ class OmniClient:
             robot.flush_audio_input()
             robot.set_conversation_state("listening")
 
-            sender = asyncio.create_task(
-                self._send_loop(websocket, robot, stop_event, session_id)
-            )
+            sender = asyncio.create_task(self._send_loop(websocket, robot, stop_event, session_id))
             receiver = asyncio.create_task(self._receive_loop(websocket, robot))
             stopper = asyncio.create_task(self._stop_waiter(stop_event))
             tasks = {sender, receiver, stopper}
@@ -162,28 +177,49 @@ class OmniClient:
     ) -> None:
         was_forcing_listen = False
         input_sequence = 0
+        last_send_at: float | None = None
         while not stop_event.is_set():
             audio = await asyncio.to_thread(robot.next_audio_chunk, 0.25)
             if audio is None:
                 continue
-            frame = None
-            if self.config.send_video:
-                frame = await asyncio.to_thread(robot.get_frame_jpeg)
+            frame = robot.get_frame_jpeg() if self.config.send_video else None
             force_listen = robot.force_listen_active()
             input_sequence += 1
             if force_listen:
-                robot.note_force_listen_sent(
-                    f"{session_id}_resp_{input_sequence}"
-                )
-            await websocket.send(
-                json.dumps(build_input_append(audio, frame, force_listen=force_listen))
+                robot.note_force_listen_sent(f"{session_id}_resp_{input_sequence}")
+            encode_started = time.perf_counter()
+            message = await asyncio.to_thread(
+                serialize_input_append,
+                audio,
+                frame,
+                force_listen=force_listen,
             )
+            encode_ms = (time.perf_counter() - encode_started) * 1_000
+            send_started = time.perf_counter()
+            await websocket.send(message)
+            sent_at = time.perf_counter()
+            send_ms = (sent_at - send_started) * 1_000
+            if last_send_at is not None and sent_at - last_send_at > 1.15:
+                log.warning(
+                    "Slow Omni input cadence: %.0f ms (encode=%.1f ms, send=%.1f ms)",
+                    (sent_at - last_send_at) * 1_000,
+                    encode_ms,
+                    send_ms,
+                )
+            elif encode_ms > 50.0 or send_ms > 50.0:
+                log.warning(
+                    "Slow Omni input stage: encode=%.1f ms, send=%.1f ms",
+                    encode_ms,
+                    send_ms,
+                )
+            last_send_at = sent_at
             if force_listen and not was_forcing_listen:
                 log.info("Holding force_listen until barge-in is acknowledged")
             was_forcing_listen = force_listen
 
     async def _receive_loop(self, websocket: Any, robot: RobotPort) -> None:
         transcript: dict[str, str] = {}
+        audio_supply_until: dict[str, float] = {}
         last_event = "none"
         audio_samples = 0
         try:
@@ -195,11 +231,32 @@ class OmniClient:
                     kind = event.get("kind")
                     last_event = f"{event_type}:{kind}"
                     if kind == "audio" and event.get("audio"):
+                        response_id = str(event.get("response_id") or "current")
+                        arrived_at = time.perf_counter()
                         samples = decode_pcm(event["audio"])
                         audio_samples += samples.size
+                        duration = samples.size / OUTPUT_SAMPLE_RATE
+                        supplied_until = audio_supply_until.get(response_id)
+                        if supplied_until is not None:
+                            supply_gap = arrived_at - supplied_until
+                            if supply_gap > 0.05:
+                                log.warning(
+                                    "TTS supply gap for %s: %.0f ms beyond buffered audio",
+                                    response_id,
+                                    supply_gap * 1_000,
+                                )
+                            else:
+                                log.debug(
+                                    "TTS supply margin for %s: %.0f ms",
+                                    response_id,
+                                    -supply_gap * 1_000,
+                                )
+                        audio_supply_until[response_id] = (
+                            max(arrived_at, supplied_until or arrived_at) + duration
+                        )
                         # RobotIO only enqueues here; its dedicated playback
                         # worker preserves order and survives a reconnect.
-                        if robot.play_omni_audio(samples):
+                        if robot.play_omni_audio(samples, response_id):
                             robot.set_conversation_state("speaking")
                     elif kind == "text":
                         response_id = str(event.get("response_id") or "current")
@@ -211,6 +268,10 @@ class OmniClient:
                         robot.set_conversation_state("listening")
                 elif event_type == "response.done":
                     response_id = str(event.get("response_id") or "current")
+                    # Text decoding can finish before Token2Wav's background
+                    # callback emits its final audio delta.  Playback uses its
+                    # real queue/drain state instead of resetting at this event.
+                    audio_supply_until.pop(response_id, None)
                     partial_text = transcript.pop(response_id, "")
                     text = str(event.get("text") or partial_text).strip()
                     if text and not robot.force_listen_active():

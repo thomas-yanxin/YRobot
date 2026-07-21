@@ -90,7 +90,7 @@ def test_transport_error_reports_last_event_and_received_audio() -> None:
         def set_conversation_state(self, state: str) -> None:
             pass
 
-        def play_omni_audio(self, samples: np.ndarray) -> bool:
+        def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool:
             self.audio.append(samples)
             return True
 

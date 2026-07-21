@@ -27,7 +27,7 @@ def configure_logging() -> None:
 
 
 def run_conversation(mini: object, config: Config, stop_event: threading.Event) -> None:
-    robot = RobotIO(mini)
+    robot = RobotIO(mini, capture_video=config.send_video)
     client = OmniClient(config)
     try:
         robot.start()

@@ -14,6 +14,7 @@ from yrobot.robot import (
     MAX_HEAD_ANGULAR_STEP,
     MAX_HEAD_TRANSLATION_STEP,
     RobotIO,
+    StreamingAudioResampler,
     angular_distance,
     audio_level_db,
     doa_world_direction,
@@ -47,6 +48,25 @@ def test_output_is_resampled_from_24k_to_16k() -> None:
     assert converted.dtype == np.float32
     assert len(converted) == 1_600
     assert np.max(np.abs(converted)) <= 1.0
+
+
+def test_streaming_resampler_is_continuous_across_arbitrary_deltas() -> None:
+    source = np.sin(np.linspace(0, 200 * math.pi, 24_017, endpoint=False)).astype(np.float32)
+    whole = StreamingAudioResampler().process(source)
+    chunked_resampler = StreamingAudioResampler()
+    sizes = (317, 911, 2_003, 79, 4_097)
+    chunks: list[np.ndarray] = []
+    offset = 0
+    index = 0
+    while offset < source.size:
+        size = sizes[index % len(sizes)]
+        chunks.append(chunked_resampler.process(source[offset : offset + size]))
+        offset += size
+        index += 1
+
+    chunked = np.concatenate(chunks)
+    np.testing.assert_allclose(chunked, whole, atol=1e-6)
+    assert abs(chunked.size - source.size * 2 / 3) < 1
 
 
 def test_doa_uses_reachy_head_coordinates() -> None:
@@ -117,15 +137,36 @@ def test_omni_audio_is_played_by_dedicated_worker() -> None:
 
     mini = Mini()
     robot = RobotIO(mini)
-    worker = threading.Thread(
-        target=robot._playback_loop, name="yrobot-playback", daemon=True
-    )
+    worker = threading.Thread(target=robot._playback_loop, name="yrobot-playback", daemon=True)
     worker.start()
     try:
-        robot.play_omni_audio(np.zeros(2_400, dtype=np.float32))
+        robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "response-1")
         assert pushed.wait(1.0)
         assert mini.media.thread_name == "yrobot-playback"
         assert mini.media.samples[0].shape == (1_600,)
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
+
+
+def test_camera_jpeg_is_cached_off_the_sender_path() -> None:
+    captured = threading.Event()
+
+    class Media:
+        def get_frame_jpeg(self) -> bytes:
+            captured.set()
+            return b"latest-jpeg"
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    robot = RobotIO(Mini())
+    worker = threading.Thread(target=robot._camera_loop, daemon=True)
+    worker.start()
+    try:
+        assert captured.wait(1.0)
+        assert robot.get_frame_jpeg() == b"latest-jpeg"
     finally:
         robot._stop_event.set()
         worker.join(timeout=1.0)

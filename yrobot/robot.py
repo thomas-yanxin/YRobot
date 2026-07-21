@@ -17,7 +17,7 @@ from reachy_mini.utils.interpolation import (
     linear_pose_interpolation,
     time_trajectory,
 )
-from scipy.signal import resample_poly
+from scipy.signal import firwin, lfilter
 
 from .config import CHUNK_SAMPLES, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE
 
@@ -41,6 +41,8 @@ AUDIO_STARTUP_CONFIG = (
 )
 
 MOTION_PERIOD = 0.05
+CAMERA_PERIOD = 1.0
+PLAYBACK_PREROLL_SECONDS = 0.12
 BARGE_IN_ARM_DELAY = 0.3
 BARGE_IN_CONFIRMATIONS = 3
 BARGE_IN_COOLDOWN = 1.0
@@ -65,10 +67,10 @@ def to_mono(samples: np.ndarray) -> np.ndarray:
 
 def audio_level_db(samples: np.ndarray) -> float:
     """Return a stable dBFS RMS level for AEC-processed microphone PCM."""
-    audio = np.asarray(samples, dtype=np.float64)
+    audio = np.asarray(samples, dtype=np.float32)
     if audio.size == 0:
         return -120.0
-    rms = float(np.sqrt(np.mean(audio * audio)))
+    rms = math.sqrt(float(np.dot(audio, audio)) / audio.size)
     return 20.0 * math.log10(max(rms, 1e-6))
 
 
@@ -77,17 +79,75 @@ def is_near_end_speech(speech_detected: bool, microphone_level_db: float) -> boo
     return speech_detected and microphone_level_db >= BARGE_IN_MIN_LEVEL_DB
 
 
+class StreamingAudioResampler:
+    """Causal rational resampler whose filter and phase survive TTS deltas.
+
+    ``resample_poly`` is excellent for a complete buffer, but it pads every
+    independent call with zeros.  Calling it once per streamed TTS delta makes
+    those artificial edges audible.  This implementation keeps the FIR delay
+    line and decimation phase across every streamed TTS delta.  RobotIO only
+    resets it after playback has genuinely drained or an interruption
+    invalidates the playback generation.
+    """
+
+    def __init__(self, input_rate: int = OUTPUT_SAMPLE_RATE, output_rate: int = INPUT_SAMPLE_RATE):
+        if input_rate <= 0 or output_rate <= 0:
+            raise ValueError("audio sample rates must be positive")
+        divisor = math.gcd(input_rate, output_rate)
+        self._up = output_rate // divisor
+        self._down = input_rate // divisor
+        self._passthrough = self._up == self._down
+        self._phase = 0
+
+        if self._passthrough:
+            self._taps = np.ones(1, dtype=np.float32)
+        else:
+            max_rate = max(self._up, self._down)
+            half_length = 10 * max_rate
+            self._taps = (
+                firwin(
+                    2 * half_length + 1,
+                    1.0 / max_rate,
+                    window=("kaiser", 5.0),
+                )
+                * self._up
+            ).astype(np.float32)
+        self._denominator = np.ones(1, dtype=np.float32)
+        self._filter_state = np.zeros(self._taps.size - 1, dtype=np.float32)
+
+    def reset(self) -> None:
+        self._phase = 0
+        self._filter_state.fill(0.0)
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        audio = np.asarray(samples, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("playback audio must be mono")
+        if audio.size == 0:
+            return np.empty(0, dtype=np.float32)
+        if self._passthrough:
+            return np.clip(audio, -1.0, 1.0).astype(np.float32, copy=True)
+
+        upsampled = np.zeros(audio.size * self._up, dtype=np.float32)
+        upsampled[:: self._up] = audio
+        filtered, self._filter_state = lfilter(
+            self._taps,
+            self._denominator,
+            upsampled,
+            zi=self._filter_state,
+        )
+        converted = filtered[self._phase :: self._down]
+        self._phase = (self._phase - filtered.size) % self._down
+        return np.clip(converted, -1.0, 1.0).astype(np.float32, copy=False)
+
+
 def resample_audio(
     samples: np.ndarray,
     input_rate: int = OUTPUT_SAMPLE_RATE,
     output_rate: int = INPUT_SAMPLE_RATE,
 ) -> np.ndarray:
-    audio = np.asarray(samples, dtype=np.float32)
-    if audio.ndim != 1:
-        raise ValueError("playback audio must be mono")
-    divisor = math.gcd(input_rate, output_rate)
-    converted = resample_poly(audio, output_rate // divisor, input_rate // divisor)
-    return np.clip(converted, -1.0, 1.0).astype(np.float32, copy=False)
+    """Resample one complete buffer; streaming playback reuses one instance."""
+    return StreamingAudioResampler(input_rate, output_rate).process(samples)
 
 
 def doa_world_direction(angle: float, head_pose: np.ndarray) -> np.ndarray:
@@ -143,14 +203,26 @@ def step_pose(
 class RobotIO:
     """Own Reachy media and serialize every application-level motion command."""
 
-    def __init__(self, mini: object) -> None:
+    def __init__(
+        self,
+        mini: object,
+        *,
+        capture_video: bool = True,
+        playback_preroll: float = PLAYBACK_PREROLL_SECONDS,
+    ) -> None:
+        if playback_preroll < 0:
+            raise ValueError("playback_preroll must not be negative")
         self.mini = mini
+        self._capture_video = capture_video
+        self._playback_preroll = playback_preroll
         self._audio_chunks: queue.Queue[np.ndarray] = queue.Queue(maxsize=2)
         # Keep network reception independent from GStreamer.  TTS callbacks can
         # arrive in bursts; pushing them from the WebSocket receive loop makes
         # that loop stop reading while the audio backend catches up.
-        self._playback_chunks: queue.Queue[tuple[int, np.ndarray]] = queue.Queue()
+        self._playback_chunks: queue.Queue[tuple[int, str, np.ndarray]] = queue.Queue()
         self._playback_lock = threading.Lock()
+        self._camera_lock = threading.Lock()
+        self._latest_frame_jpeg: bytes | None = None
         self._playback_generation = 0
         self._suppress_playback_until = 0.0
         self._barge_in_event = threading.Event()
@@ -160,6 +232,7 @@ class RobotIO:
         self._expected_listen_response_id: str | None = None
         self._stop_event = threading.Event()
         self._capture_thread: threading.Thread | None = None
+        self._camera_thread: threading.Thread | None = None
         self._playback_thread: threading.Thread | None = None
         self._motion_thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
@@ -168,6 +241,8 @@ class RobotIO:
         self._barge_in_armed_at = math.inf
         self._last_near_end_speech_at = 0.0
         self._microphone_level_db = -120.0
+        self._dropped_audio_chunks = 0
+        self._last_audio_drop_log = 0.0
         self._recording = False
         self._playing = False
         self._wobbling = False
@@ -190,6 +265,10 @@ class RobotIO:
         self._capture_thread = threading.Thread(
             target=self._capture_loop, name="yrobot-audio", daemon=True
         )
+        if self._capture_video:
+            self._camera_thread = threading.Thread(
+                target=self._camera_loop, name="yrobot-camera", daemon=True
+            )
         self._playback_thread = threading.Thread(
             target=self._playback_loop, name="yrobot-playback", daemon=True
         )
@@ -197,13 +276,20 @@ class RobotIO:
             target=self._motion_loop, name="yrobot-motion", daemon=True
         )
         self._capture_thread.start()
+        if self._camera_thread is not None:
+            self._camera_thread.start()
         self._playback_thread.start()
         self._motion_thread.start()
         log.info("Reachy media and motion started")
 
     def stop(self) -> None:
         self._stop_event.set()
-        for thread in (self._capture_thread, self._playback_thread, self._motion_thread):
+        for thread in (
+            self._capture_thread,
+            self._camera_thread,
+            self._playback_thread,
+            self._motion_thread,
+        ):
             if thread is not None:
                 thread.join(timeout=2.0)
 
@@ -243,13 +329,11 @@ class RobotIO:
                 return
 
     def get_frame_jpeg(self) -> bytes | None:
-        try:
-            return self.mini.media.get_frame_jpeg()
-        except Exception as exc:
-            log.debug("Camera frame unavailable: %s", exc)
-            return None
+        """Return the latest asynchronously encoded frame without blocking audio send."""
+        with self._camera_lock:
+            return self._latest_frame_jpeg
 
-    def play_omni_audio(self, samples: np.ndarray) -> bool:
+    def play_omni_audio(self, samples: np.ndarray, response_id: str = "current") -> bool:
         audio = np.asarray(samples, dtype=np.float32)
         if audio.ndim != 1:
             raise ValueError("playback audio must be mono")
@@ -261,7 +345,7 @@ class RobotIO:
             if time.monotonic() < self._suppress_playback_until:
                 return False
             generation = self._playback_generation
-            self._playback_chunks.put((generation, audio.copy()))
+            self._playback_chunks.put((generation, response_id, audio.copy()))
         return True
 
     def interrupt_omni_audio(self) -> bool:
@@ -362,9 +446,7 @@ class RobotIO:
                 self._expected_listen_response_id = None
             # Drop any asynchronous TTS callback already in flight after the
             # listen acknowledgement. A new response cannot arrive this soon.
-            self._suppress_playback_until = (
-                time.monotonic() + BARGE_IN_POST_LISTEN_GUARD
-            )
+            self._suppress_playback_until = time.monotonic() + BARGE_IN_POST_LISTEN_GUARD
         log.info("Omni listen confirmed; barge-in complete")
 
     def set_conversation_state(self, state: str) -> None:
@@ -374,7 +456,8 @@ class RobotIO:
             self._model_state = state
 
     def _capture_loop(self) -> None:
-        pending = np.empty(0, dtype=np.float32)
+        pending = np.empty(CHUNK_SAMPLES, dtype=np.float32)
+        pending_size = 0
         while not self._stop_event.is_set():
             try:
                 sample = self.mini.media.get_audio_sample()
@@ -384,44 +467,127 @@ class RobotIO:
                 mono = to_mono(sample)
                 with self._state_lock:
                     self._microphone_level_db = audio_level_db(mono)
-                pending = np.concatenate((pending, mono))
-                while pending.size >= CHUNK_SAMPLES:
-                    chunk = pending[:CHUNK_SAMPLES].copy()
-                    pending = pending[CHUNK_SAMPLES:]
-                    self._put_latest(chunk)
+                offset = 0
+                while offset < mono.size:
+                    copied = min(CHUNK_SAMPLES - pending_size, mono.size - offset)
+                    pending[pending_size : pending_size + copied] = mono[offset : offset + copied]
+                    pending_size += copied
+                    offset += copied
+                    if pending_size == CHUNK_SAMPLES:
+                        self._put_latest(pending.copy())
+                        pending_size = 0
             except Exception as exc:
                 log.warning("Microphone read failed: %s", exc)
                 self._stop_event.wait(1.0)
 
-    def _playback_loop(self) -> None:
-        """Feed GStreamer in order without ever blocking the WebSocket reader."""
+    def _camera_loop(self) -> None:
+        """Encode stills off the audio sender and expose only the latest frame."""
+        next_capture = time.monotonic()
         while not self._stop_event.is_set():
             try:
-                generation, samples = self._playback_chunks.get(timeout=0.1)
-            except queue.Empty:
-                continue
+                frame = self.mini.media.get_frame_jpeg()
+                if frame:
+                    with self._camera_lock:
+                        self._latest_frame_jpeg = frame
+            except Exception as exc:
+                log.debug("Camera frame unavailable: %s", exc)
+            next_capture += CAMERA_PERIOD
+            now = time.monotonic()
+            if next_capture < now:
+                next_capture = now
+            self._stop_event.wait(next_capture - now)
+
+    def _playback_loop(self) -> None:
+        """Continuously resample TTS and feed a short jitter buffer to GStreamer."""
+        resampler = StreamingAudioResampler()
+        resampler_generation: int | None = None
+        deferred_item: tuple[int, str, np.ndarray] | None = None
+
+        while not self._stop_event.is_set():
+            if deferred_item is None:
+                try:
+                    first_item = self._playback_chunks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+            else:
+                first_item = deferred_item
+                deferred_item = None
+
+            items = [first_item]
+            generation, response_id, samples = first_item
+            with self._state_lock:
+                playback_was_idle = time.monotonic() >= self._speaking_until
+            buffered_samples = samples.size
+            preroll_samples = round(self._playback_preroll * OUTPUT_SAMPLE_RATE)
+            if playback_was_idle and buffered_samples < preroll_samples:
+                deadline = time.monotonic() + self._playback_preroll
+                while not self._stop_event.is_set() and buffered_samples < preroll_samples:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = self._playback_chunks.get(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    item_generation, _, _ = item
+                    if item_generation != generation:
+                        deferred_item = item
+                        break
+                    items.append(item)
+                    buffered_samples += item[2].size
+
             try:
-                playback = resample_audio(samples)
+                if generation != resampler_generation or playback_was_idle:
+                    resampler.reset()
+                    resampler_generation = generation
+
+                audio_parts = [item_samples for _, _, item_samples in items]
+                source = audio_parts[0] if len(audio_parts) == 1 else np.concatenate(audio_parts)
+                resample_started = time.perf_counter()
+                playback = resampler.process(source)
+                resample_ms = (time.perf_counter() - resample_started) * 1_000
                 if playback.size == 0:
                     continue
                 with self._playback_lock:
                     now = time.monotonic()
-                    if (
+                    playback_is_current = not (
                         generation != self._playback_generation
                         or now < self._suppress_playback_until
-                    ):
-                        continue
-                    with self._state_lock:
-                        if now >= self._speaking_until:
-                            self._barge_in_armed_at = now + BARGE_IN_ARM_DELAY
-                        start = max(now, self._speaking_until)
-                        self._speaking_until = start + playback.size / INPUT_SAMPLE_RATE
-                        self._model_state = "speaking"
-                    self.mini.media.push_audio_sample(playback)
+                    )
+                    if playback_is_current:
+                        with self._state_lock:
+                            if now >= self._speaking_until:
+                                self._barge_in_armed_at = now + BARGE_IN_ARM_DELAY
+                            start = max(now, self._speaking_until)
+                            self._speaking_until = start + playback.size / INPUT_SAMPLE_RATE
+                            self._model_state = "speaking"
+                        push_started = time.perf_counter()
+                        self.mini.media.push_audio_sample(playback)
+                        push_ms = (time.perf_counter() - push_started) * 1_000
+                if not playback_is_current:
+                    resampler.reset()
+                    resampler_generation = None
+                    continue
+                if playback_was_idle:
+                    log.debug(
+                        "Playback %s started with %.0f ms buffered; resample=%.1f ms, push=%.1f ms",
+                        response_id,
+                        source.size / OUTPUT_SAMPLE_RATE * 1_000,
+                        resample_ms,
+                        push_ms,
+                    )
+                elif resample_ms > 10.0 or push_ms > 10.0:
+                    log.warning(
+                        "Slow playback stage for %s: resample=%.1f ms, push=%.1f ms",
+                        response_id,
+                        resample_ms,
+                        push_ms,
+                    )
             except Exception as exc:
                 log.warning("Speaker playback failed: %s", exc)
             finally:
-                self._playback_chunks.task_done()
+                for _ in items:
+                    self._playback_chunks.task_done()
 
     def _put_latest(self, chunk: np.ndarray) -> None:
         try:
@@ -430,6 +596,14 @@ class RobotIO:
             with suppress(queue.Empty):
                 self._audio_chunks.get_nowait()
             self._audio_chunks.put_nowait(chunk)
+            self._dropped_audio_chunks += 1
+            now = time.monotonic()
+            if now - self._last_audio_drop_log >= 5.0:
+                log.warning(
+                    "Dropped %d stale microphone slice(s) due to upload backpressure",
+                    self._dropped_audio_chunks,
+                )
+                self._last_audio_drop_log = now
 
     def _motion_loop(self) -> None:
         last_effective_state = ""
@@ -466,11 +640,7 @@ class RobotIO:
             )
             self._update_barge_in_release(near_end_speech, now)
             if speaking:
-                if (
-                    near_end_speech
-                    and now >= barge_in_armed_at
-                    and now >= barge_in_cooldown_until
-                ):
+                if near_end_speech and now >= barge_in_armed_at and now >= barge_in_cooldown_until:
                     barge_in_frames += 1
                     if barge_in_frames >= BARGE_IN_CONFIRMATIONS:
                         if self.interrupt_omni_audio():
