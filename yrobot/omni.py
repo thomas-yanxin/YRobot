@@ -29,6 +29,10 @@ class RobotPort(Protocol):
 
     def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool: ...
 
+    def force_listen_active(self) -> bool: ...
+
+    def handle_omni_listen(self, response_id: str) -> None: ...
+
     def set_conversation_state(self, state: str) -> None: ...
 
 
@@ -64,8 +68,12 @@ def build_session_init(system_prompt: str, length_penalty: float = 1.1) -> dict[
 def build_input_append(
     audio: np.ndarray,
     frame_jpeg: bytes | None,
+    *,
+    force_listen: bool = False,
 ) -> dict[str, Any]:
     model_input: dict[str, Any] = {"audio": encode_pcm(audio)}
+    if force_listen:
+        model_input["force_listen"] = True
     if frame_jpeg:
         model_input["video_frames"] = [base64.b64encode(frame_jpeg).decode("ascii")]
         model_input["max_slice_nums"] = 1
@@ -75,10 +83,12 @@ def build_input_append(
 def serialize_input_append(
     audio: np.ndarray,
     frame_jpeg: bytes | None,
+    *,
+    force_listen: bool = False,
 ) -> str:
     """Encode one compact input message away from the receive event loop."""
     return json.dumps(
-        build_input_append(audio, frame_jpeg),
+        build_input_append(audio, frame_jpeg, force_listen=force_listen),
         separators=(",", ":"),
     )
 
@@ -176,11 +186,13 @@ class OmniClient:
             if audio is None:
                 continue
             frame = robot.get_frame_jpeg() if self.config.send_video else None
+            force_listen = robot.force_listen_active()
             encode_started = time.perf_counter()
             message = await asyncio.to_thread(
                 serialize_input_append,
                 audio,
                 frame,
+                force_listen=force_listen,
             )
             encode_ms = (time.perf_counter() - encode_started) * 1_000
             send_started = time.perf_counter()
@@ -259,6 +271,7 @@ class OmniClient:
                             event.get("text") or ""
                         )
                     elif kind == "listen":
+                        robot.handle_omni_listen(str(event.get("response_id") or ""))
                         robot.set_conversation_state("listening")
                         # Silence after an explicit listen boundary is expected
                         # and must not be reported as TTS starvation.

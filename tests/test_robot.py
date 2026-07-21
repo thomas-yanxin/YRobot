@@ -29,9 +29,12 @@ from yrobot.robot import (
 )
 
 
-def test_stereo_microphone_is_mixed_to_mono() -> None:
+def test_stereo_microphone_uses_xvf_processed_channel_zero() -> None:
     stereo = np.array([[1.0, -1.0], [0.5, 0.5]], dtype=np.float32)
-    np.testing.assert_allclose(to_mono(stereo), [0.0, 0.5])
+    np.testing.assert_allclose(to_mono(stereo), [1.0, 0.5])
+
+    channels_first = np.array([[1.0, 0.5, 0.25], [-1.0, 0.5, -0.25]], dtype=np.float32)
+    np.testing.assert_allclose(to_mono(channels_first), [1.0, 0.5, 0.25])
 
 
 def test_post_aec_microphone_is_uploaded_unchanged_during_playback() -> None:
@@ -71,6 +74,97 @@ def test_xvf_configuration_uses_verified_settled_writes() -> None:
 
     assert len(calls) == 1
     assert calls[0][1:] == (True, 0.1)
+
+
+def test_model_listen_flushes_playback_after_recent_near_end_activity() -> None:
+    class Audio:
+        def __init__(self) -> None:
+            self.clear_count = 0
+
+        def clear_player(self) -> None:
+            self.clear_count += 1
+
+    class Media:
+        def __init__(self) -> None:
+            self.audio = Audio()
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    mini = Mini()
+    robot = RobotIO(mini)
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+        robot._last_near_end_activity_at = time.monotonic()
+
+    robot.handle_omni_listen("r2")
+
+    assert mini.media.audio.clear_count == 1
+    assert robot._playback_chunks.empty()
+    assert not robot.force_listen_active()
+
+
+def test_quiet_model_listen_allows_buffered_sentence_tail_to_drain() -> None:
+    class Audio:
+        def __init__(self) -> None:
+            self.clear_count = 0
+
+        def clear_player(self) -> None:
+            self.clear_count += 1
+
+    class Media:
+        def __init__(self) -> None:
+            self.audio = Audio()
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    mini = Mini()
+    robot = RobotIO(mini)
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+
+    robot.handle_omni_listen("r2")
+
+    assert mini.media.audio.clear_count == 0
+    assert not robot._playback_chunks.empty()
+
+
+def test_high_confidence_double_talk_forces_listen_until_acknowledged() -> None:
+    class Audio:
+        def __init__(self) -> None:
+            self.clear_count = 0
+
+        def clear_player(self) -> None:
+            self.clear_count += 1
+
+    class Media:
+        def __init__(self) -> None:
+            self.audio = Audio()
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    mini = Mini()
+    robot = RobotIO(mini)
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+
+    assert robot._request_user_interrupt(-24.0, -30.0)
+    assert robot.force_listen_active()
+    assert mini.media.audio.clear_count == 1
+    assert robot._playback_chunks.empty()
+
+    robot.handle_omni_listen("r2")
+
+    assert not robot.force_listen_active()
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "late") is False
 
 
 def test_output_is_resampled_from_24k_to_16k() -> None:

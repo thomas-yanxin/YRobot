@@ -16,6 +16,7 @@ class FakeRobot:
         self.flushed = False
         self.played: list[np.ndarray] = []
         self.states: list[str] = []
+        self.listens: list[str] = []
 
     def next_audio_chunk(self, timeout: float) -> np.ndarray | None:
         if self.flushed and not self.sent:
@@ -33,6 +34,12 @@ class FakeRobot:
     def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool:
         self.played.append(samples)
         return True
+
+    def force_listen_active(self) -> bool:
+        return False
+
+    def handle_omni_listen(self, response_id: str) -> None:
+        self.listens.append(response_id)
 
     def set_conversation_state(self, state: str) -> None:
         self.states.append(state)
@@ -94,6 +101,15 @@ async def _session_scenario() -> None:
                 }
             )
         )
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "response.output.delta",
+                    "kind": "listen",
+                    "response_id": "r2",
+                }
+            )
+        )
         await asyncio.sleep(0.1)
         stop_event.set()
 
@@ -115,3 +131,4 @@ async def _session_scenario() -> None:
     np.testing.assert_allclose(robot.played[1], np.linspace(0.2, 0.0, 120))
     assert robot.states[0] == "listening"
     assert "speaking" in robot.states
+    assert robot.listens == ["r2"]

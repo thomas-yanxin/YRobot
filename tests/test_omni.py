@@ -53,6 +53,13 @@ def test_protocol_messages_match_full_duplex_backend() -> None:
     }
     assert append["input"]["max_slice_nums"] == 1
 
+    forced = build_input_append(
+        np.zeros(16_000, dtype=np.float32),
+        None,
+        force_listen=True,
+    )
+    assert forced["input"]["force_listen"] is True
+
 
 def test_event_parser_requires_object_and_type() -> None:
     assert OmniClient._parse_event('{"type":"session.created"}') == {"type": "session.created"}
@@ -152,6 +159,40 @@ def test_tts_gap_survives_response_done_and_response_id_change(
     assert "TTS supply gap for r2" in caplog.text
 
 
+def test_sender_repeats_force_listen_with_microphone_audio() -> None:
+    stop_event = threading.Event()
+
+    class WebSocket:
+        def __init__(self) -> None:
+            self.message: dict[str, object] | None = None
+
+        async def send(self, raw: str) -> None:
+            self.message = json.loads(raw)
+            stop_event.set()
+
+    class Robot:
+        def next_audio_chunk(self, timeout: float) -> np.ndarray:
+            del timeout
+            return np.zeros(16_000, dtype=np.float32)
+
+        def get_frame_jpeg(self) -> None:
+            return None
+
+        def force_listen_active(self) -> bool:
+            return True
+
+    websocket = WebSocket()
+    client = OmniClient.__new__(OmniClient)
+    client.config = SimpleNamespace(send_video=False)
+
+    asyncio.run(client._send_loop(websocket, Robot(), stop_event))
+
+    assert websocket.message is not None
+    assert websocket.message["type"] == "input.append"
+    assert websocket.message["input"]["force_listen"] is True
+    assert websocket.message["input"]["audio"]
+
+
 def test_normal_websocket_backpressure_does_not_flood_warnings(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -172,6 +213,9 @@ def test_normal_websocket_backpressure_does_not_flood_warnings(
         def next_audio_chunk(self, timeout: float) -> np.ndarray:
             del timeout
             return np.zeros(16_000, dtype=np.float32)
+
+        def force_listen_active(self) -> bool:
+            return False
 
     websocket = WebSocket()
     client = OmniClient.__new__(OmniClient)

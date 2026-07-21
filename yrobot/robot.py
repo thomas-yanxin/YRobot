@@ -31,7 +31,8 @@ ANTENNA_POSES: Mapping[str, tuple[float, float]] = {
     "speaking": (-20.0, 20.0),
 }
 
-# Tuned XVF3800 parameters from the official Reachy Mini conversation app.
+# Reachy conversation-app tuning plus the XVF robust double-talk mode needed
+# to preserve near-end speech while the built-in speaker is active.
 AUDIO_STARTUP_CONFIG = (
     ("PP_AGCMAXGAIN", (10.0,)),
     ("PP_MIN_NS", (0.8,)),
@@ -40,6 +41,9 @@ AUDIO_STARTUP_CONFIG = (
     ("PP_GAMMA_ETAIL", (0.5,)),
     ("PP_NLATTENONOFF", (0,)),
     ("PP_MGSCALE", (4.0, 1.0, 1.0)),
+    # Lowest robust double-talk mode: preserves near-end speech while the
+    # speaker is active and enables XVF's extra near-end speech detector.
+    ("PP_DTSENSITIVE", (10,)),
 )
 AUDIO_CONFIG_SETTLE_SECONDS = 0.1
 
@@ -54,6 +58,14 @@ CAMERA_PERIOD = 1.0
 # Keeping more than that buffered before the first push prevents a short TTS
 # delivery pause from being heard as a truncated/restarted utterance.
 PLAYBACK_PREROLL_SECONDS = 0.32
+INTERRUPT_ARM_DELAY = 0.6
+INTERRUPT_CONFIRMATIONS = 5
+INTERRUPT_COOLDOWN = 1.0
+INTERRUPT_MIN_LEVEL_DB = -38.0
+INTERRUPT_MIN_RISE_DB = 6.0
+INTERRUPT_FLOOR_RISE_DB_PER_SAMPLE = 0.15
+INTERRUPT_ACTIVITY_HOLD = 1.25
+INTERRUPT_POST_LISTEN_GUARD = 0.4
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
 MAX_HEAD_TRANSLATION_STEP = 0.003
 MAX_HEAD_ANGULAR_SPEED = math.radians(45.0)
@@ -74,8 +86,22 @@ def to_mono(samples: np.ndarray) -> np.ndarray:
     if audio.ndim == 1:
         return audio
     if audio.ndim == 2 and audio.shape[1] >= 1:
-        return audio.mean(axis=1, dtype=np.float32)
+        # Reachy/XVF exposes two channels, but the official conversation app
+        # forwards channel 0. Averaging can mix a non-target channel back into
+        # the AEC-processed ASR signal.
+        if audio.shape[1] > audio.shape[0]:
+            audio = audio.T
+        return audio[:, 0]
     raise ValueError(f"unexpected microphone shape: {audio.shape}")
+
+
+def audio_level_db(samples: np.ndarray) -> float:
+    """Return dBFS RMS for one post-AEC microphone frame."""
+    audio = np.asarray(samples, dtype=np.float32)
+    if audio.size == 0:
+        return -120.0
+    rms = math.sqrt(float(np.dot(audio, audio)) / audio.size)
+    return 20.0 * math.log10(max(rms, 1e-6))
 
 
 class StreamingAudioResampler:
@@ -326,9 +352,13 @@ class RobotIO:
         # Keep network reception independent from GStreamer.  TTS callbacks can
         # arrive in bursts; pushing them from the WebSocket receive loop makes
         # that loop stop reading while the audio backend catches up.
-        self._playback_chunks: queue.Queue[tuple[str, np.ndarray]] = queue.Queue()
+        self._playback_chunks: queue.Queue[tuple[int, str, np.ndarray]] = queue.Queue()
+        self._playback_lock = threading.Lock()
         self._camera_lock = threading.Lock()
         self._latest_frame_jpeg: bytes | None = None
+        self._playback_generation = 0
+        self._suppress_playback_until = 0.0
+        self._force_listen_event = threading.Event()
         self._stop_event = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._camera_thread: threading.Thread | None = None
@@ -337,6 +367,9 @@ class RobotIO:
         self._state_lock = threading.Lock()
         self._model_state = "idle"
         self._speaking_until = 0.0
+        self._interrupt_armed_at = math.inf
+        self._last_near_end_activity_at = -math.inf
+        self._microphone_level_db = -120.0
         self._dropped_audio_chunks = 0
         self._last_audio_drop_log = 0.0
         self._recording = False
@@ -441,8 +474,86 @@ class RobotIO:
             return False
         # decode_pcm owns its array, but copying here keeps this port safe for
         # callers that reuse a mutable input buffer after returning.
-        self._playback_chunks.put((response_id, audio.copy()))
+        with self._playback_lock:
+            if time.monotonic() < self._suppress_playback_until:
+                return False
+            generation = self._playback_generation
+            self._playback_chunks.put((generation, response_id, audio.copy()))
         return True
+
+    def force_listen_active(self) -> bool:
+        """Tell MiniCPM to stop speaking after high-confidence double talk."""
+        return self._force_listen_event.is_set()
+
+    def handle_omni_listen(self, response_id: str) -> None:
+        """Finish a forced interruption once MiniCPM confirms listen mode."""
+        now = time.monotonic()
+        with self._state_lock:
+            forced = self._force_listen_event.is_set()
+            recent_near_end = (
+                now - self._last_near_end_activity_at <= INTERRUPT_ACTIVITY_HOLD
+            )
+            active = now < self._speaking_until or not self._playback_chunks.empty()
+
+        if active and (forced or recent_near_end):
+            self._flush_playback_for_listen(now)
+            log.info(
+                "MiniCPM listen confirmed user interruption (response=%s)",
+                response_id or "unknown",
+            )
+        else:
+            with self._state_lock:
+                self._model_state = "listening"
+
+        self._force_listen_event.clear()
+        if forced or recent_near_end:
+            with self._playback_lock:
+                self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
+
+    def _request_user_interrupt(self, level_db: float, threshold_db: float) -> bool:
+        """Flush current speech and hold force_listen until model acknowledgement."""
+        now = time.monotonic()
+        with self._state_lock:
+            active = now < self._speaking_until or not self._playback_chunks.empty()
+            self._last_near_end_activity_at = now
+        if not active or self._force_listen_event.is_set():
+            return False
+
+        self._force_listen_event.set()
+        self._flush_playback_for_listen(now, suppress_until_listen=True)
+        log.info(
+            "Post-AEC double talk detected at %.1f dBFS (threshold %.1f); forcing listen",
+            level_db,
+            threshold_db,
+        )
+        return True
+
+    def _flush_playback_for_listen(
+        self,
+        now: float,
+        *,
+        suppress_until_listen: bool = False,
+    ) -> None:
+        """Invalidate queued/appsrc audio without racing the playback worker."""
+        with self._playback_lock:
+            self._playback_generation += 1
+            self._suppress_playback_until = (
+                math.inf
+                if suppress_until_listen
+                else now + INTERRUPT_POST_LISTEN_GUARD
+            )
+            while True:
+                try:
+                    self._playback_chunks.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    self._playback_chunks.task_done()
+            with self._state_lock:
+                self._speaking_until = now
+                self._interrupt_armed_at = math.inf
+                self._model_state = "listening"
+            self._clear_player()
 
     def set_conversation_state(self, state: str) -> None:
         if state not in ANTENNA_POSES:
@@ -460,6 +571,8 @@ class RobotIO:
                     self._stop_event.wait(0.01)
                     continue
                 mono = to_mono(sample)
+                with self._state_lock:
+                    self._microphone_level_db = audio_level_db(mono)
                 offset = 0
                 while offset < mono.size:
                     copied = min(CHUNK_SAMPLES - pending_size, mono.size - offset)
@@ -493,15 +606,21 @@ class RobotIO:
     def _playback_loop(self) -> None:
         """Continuously resample TTS and feed a short jitter buffer to GStreamer."""
         resampler = StreamingAudioResampler()
+        resampler_generation: int | None = None
+        deferred_item: tuple[int, str, np.ndarray] | None = None
 
         while not self._stop_event.is_set():
-            try:
-                first_item = self._playback_chunks.get(timeout=0.1)
-            except queue.Empty:
-                continue
+            if deferred_item is None:
+                try:
+                    first_item = self._playback_chunks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+            else:
+                first_item = deferred_item
+                deferred_item = None
 
             items = [first_item]
-            response_id, samples = first_item
+            generation, response_id, samples = first_item
             with self._state_lock:
                 playback_was_idle = time.monotonic() >= self._speaking_until
             buffered_samples = samples.size
@@ -516,28 +635,45 @@ class RobotIO:
                         item = self._playback_chunks.get(timeout=remaining)
                     except queue.Empty:
                         break
+                    item_generation, _, _ = item
+                    if item_generation != generation:
+                        deferred_item = item
+                        break
                     items.append(item)
-                    buffered_samples += item[1].size
+                    buffered_samples += item[2].size
 
             try:
-                if playback_was_idle:
+                if generation != resampler_generation or playback_was_idle:
                     resampler.reset()
+                    resampler_generation = generation
 
-                audio_parts = [item_samples for _, item_samples in items]
+                audio_parts = [item_samples for _, _, item_samples in items]
                 source = audio_parts[0] if len(audio_parts) == 1 else np.concatenate(audio_parts)
                 resample_started = time.perf_counter()
                 playback = resampler.process(source)
                 resample_ms = (time.perf_counter() - resample_started) * 1_000
                 if playback.size == 0:
                     continue
-                now = time.monotonic()
-                with self._state_lock:
-                    start = max(now, self._speaking_until)
-                    self._speaking_until = start + playback.size / INPUT_SAMPLE_RATE
-                    self._model_state = "speaking"
-                push_started = time.perf_counter()
-                self.mini.media.push_audio_sample(playback)
-                push_ms = (time.perf_counter() - push_started) * 1_000
+                with self._playback_lock:
+                    now = time.monotonic()
+                    playback_is_current = not (
+                        generation != self._playback_generation
+                        or now < self._suppress_playback_until
+                    )
+                    if playback_is_current:
+                        with self._state_lock:
+                            if now >= self._speaking_until:
+                                self._interrupt_armed_at = now + INTERRUPT_ARM_DELAY
+                            start = max(now, self._speaking_until)
+                            self._speaking_until = start + playback.size / INPUT_SAMPLE_RATE
+                            self._model_state = "speaking"
+                        push_started = time.perf_counter()
+                        self.mini.media.push_audio_sample(playback)
+                        push_ms = (time.perf_counter() - push_started) * 1_000
+                if not playback_is_current:
+                    resampler.reset()
+                    resampler_generation = None
+                    continue
                 if playback_was_idle:
                     log.debug(
                         "Playback %s started with %.0f ms buffered; resample=%.1f ms, push=%.1f ms",
@@ -581,6 +717,9 @@ class RobotIO:
         last_turn = 0.0
         last_command_error = -math.inf
         connection_error_started_at: float | None = None
+        interrupt_frames = 0
+        interrupt_cooldown_until = 0.0
+        far_end_floor_db: float | None = None
         started_at = time.monotonic()
         state_entered_at = started_at
         last_tick = started_at
@@ -605,24 +744,70 @@ class RobotIO:
             with self._state_lock:
                 speaking = now < self._speaking_until
                 state = self._model_state
+                interrupt_armed_at = self._interrupt_armed_at
+                microphone_level_db = self._microphone_level_db
             effective_state = effective_conversation_state(state, speaking)
 
             if effective_state != last_effective_state:
                 last_effective_state = effective_state
                 state_entered_at = now
                 if effective_state == "speaking":
+                    far_end_floor_db = microphone_level_db
+                    interrupt_frames = 0
                     nod_started_at = None
                     glance_started_at = None
                     next_glance_at = now + self._motion_rng.uniform(12.0, 20.0)
 
-            # DoA is used for gaze only. It is deliberately excluded from turn
-            # control because Reachy's own speaker can set the speech bit.
+            # DoA remains the gaze source. During playback its speech bit is only
+            # an extra double-talk gate; the adaptive post-AEC level threshold
+            # prevents Reachy's own speaker from interrupting the response.
             doa_sampled = now >= next_doa_read
             if doa_sampled:
                 latest_doa = self._read_doa()
                 next_doa_read = max(next_doa_read + DOA_PERIOD, now + DOA_PERIOD)
             speech_detected = latest_doa is not None and latest_doa[1]
-            if not speaking:
+            if speaking:
+                if now < interrupt_armed_at:
+                    # Learn the current far-end residual during the startup
+                    # guard instead of treating the first loud speaker frame
+                    # as near-end speech.
+                    far_end_floor_db = microphone_level_db
+                elif far_end_floor_db is None:
+                    far_end_floor_db = microphone_level_db
+                elif microphone_level_db <= far_end_floor_db:
+                    far_end_floor_db = 0.7 * far_end_floor_db + 0.3 * microphone_level_db
+                else:
+                    far_end_floor_db = min(
+                        microphone_level_db,
+                        far_end_floor_db + INTERRUPT_FLOOR_RISE_DB_PER_SAMPLE,
+                    )
+                interrupt_threshold_db = max(
+                    INTERRUPT_MIN_LEVEL_DB,
+                    far_end_floor_db + INTERRUPT_MIN_RISE_DB,
+                )
+                near_end_candidate = (
+                    doa_sampled
+                    and speech_detected
+                    and now >= interrupt_armed_at
+                    and now >= interrupt_cooldown_until
+                    and microphone_level_db >= interrupt_threshold_db
+                )
+                if near_end_candidate:
+                    with self._state_lock:
+                        self._last_near_end_activity_at = now
+                    interrupt_frames += 1
+                    if interrupt_frames >= INTERRUPT_CONFIRMATIONS:
+                        if self._request_user_interrupt(
+                            microphone_level_db,
+                            interrupt_threshold_db,
+                        ):
+                            interrupt_cooldown_until = now + INTERRUPT_COOLDOWN
+                        interrupt_frames = 0
+                else:
+                    interrupt_frames = 0
+            else:
+                far_end_floor_db = None
+                interrupt_frames = 0
                 if speech_detected:
                     last_user_speech_at = now
                 if doa_sampled and latest_doa is not None:

@@ -29,8 +29,11 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 - Continuously uploads the real post-XVF microphone signal while Reachy speaks. Audio is never
   replaced with silence, so MiniCPM-o can hear new user speech and make its native `listen/speak`
   decision on every full-duplex time slice.
-- Keeps DoA out of turn control. Reachy's own speaker can set its speech bit, so DoA is used only
-  to orient the robot and never sends `force_listen` or truncates playback.
+- Selects XVF channel 0, matching the official conversation app instead of averaging both USB
+  channels, and enables XVF's robust double-talk mode (`PP_DTSENSITIVE=10`).
+- Uses MiniCPM's natural `listen/speak` decision first. As a reliability fallback, DoA can never
+  interrupt alone: post-AEC speech must remain at least 6 dB above the learned far-end residual
+  for five consecutive 20 Hz checks before playback is cleared and `force_listen` is sent.
 - Turns toward a detected speaker with Reachy's DoA API.
 - Keeps a slightly raised natural gaze; DoA changes yaw without accumulating downward pitch.
 - Keeps the last speaker as an attention anchor instead of replacing it with permanent random poses.
@@ -89,12 +92,13 @@ yrobot --url wss://another-server:28099/backend
 yrobot --tls-verify
 ```
 
-The runtime deliberately does not implement a local DoA/energy barge-in gate. XVF3800 is
-responsible for suppressing the far-end echo, and MiniCPM-o receives every post-AEC microphone
-slice while it is speaking and decides naturally when to return to `listen`. An explicit `listen`
-boundary ends model generation; already-generated audio in the short jitter buffer is allowed to
-drain instead of cutting a sentence in half. Physical testing should confirm that the XVF output
-does not contain enough residual speaker audio to make the model react to itself.
+XVF3800 is responsible for suppressing far-end echo, and MiniCPM-o receives every post-AEC
+microphone slice while it is speaking. For reliable barge-in, the client learns the speaker-only
+residual during the first 600 ms of playback and requires sustained double-talk evidence before
+forcing `listen`. When MiniCPM confirms `listen`, the application and GStreamer queues are flushed.
+For an ordinary quiet end-of-turn, buffered sentence audio is allowed to drain so the answer is
+not cut off. Physical testing should still confirm the threshold against the robot's actual room,
+speaker volume, and user distance.
 
 YRobot sends `length_penalty=1.1` by default to reduce premature end-of-turn sampling. It can be
 tuned with `OMNI_LENGTH_PENALTY` in the supported backend range of 0.1–5.0.
@@ -116,7 +120,8 @@ animation does not delay the full-duplex conversation path.
 
 At runtime, warnings named `TTS supply gap`, `Slow playback stage`, and
 `Slow Omni input cadence` identify whether a remaining pause comes from remote TTS, the CM4 audio
-path, or upload backpressure. The client never converts DoA activity into an interruption.
+path, or upload backpressure. A real interruption logs `Post-AEC double talk detected` followed by
+`MiniCPM listen confirmed user interruption`; DoA activity by itself cannot trigger either action.
 
 Simulation can exercise lifecycle and motion code, but physical audio, camera, DoA, and speaker
 behavior must be verified on the Wireless robot.
@@ -138,5 +143,6 @@ See [plan.md](plan.md) for protocol findings and acceptance criteria.
 - [MiniCPM-o native full-duplex protocol](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/main/docs/zh/api/duplex.md)
 - [Reachy Mini Python SDK](https://huggingface.co/docs/reachy_mini/SDK/python-sdk)
 - [Reachy Mini conversation app](https://github.com/pollen-robotics/reachy_mini_conversation_app)
+- [XMOS XVF3800 echo/double-talk tuning](https://www.xmos.com/documentation/XM-014888-PC/html/modules/fwk_xvf/doc/user_guide/04_tuning_the_application.html)
 - [Conversation app single-owner movement loop](https://github.com/pollen-robotics/reachy_mini_conversation_app/blob/main/src/reachy_mini_conversation_app/moves.py)
 - [Reachy Mini audio-reactive head wobbler](https://github.com/pollen-robotics/reachy_mini/blob/main/src/reachy_mini/motion/head_wobbler.py)
