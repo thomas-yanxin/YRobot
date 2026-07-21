@@ -28,7 +28,11 @@ class RobotPort(Protocol):
 
     def play_omni_audio(self, samples: np.ndarray) -> bool: ...
 
-    def consume_barge_in(self) -> bool: ...
+    def force_listen_active(self) -> bool: ...
+
+    def note_force_listen_sent(self, response_id: str) -> None: ...
+
+    def confirm_omni_listening(self, response_id: str) -> None: ...
 
     def set_conversation_state(self, state: str) -> None: ...
 
@@ -120,11 +124,14 @@ class OmniClient:
             if event.get("type") != "session.created":
                 raise RuntimeError(f"expected session.created, got {event.get('type')!r}")
 
-            log.info("Omni session ready: %s", event.get("session_id", "unknown"))
+            session_id = str(event.get("session_id") or "unknown")
+            log.info("Omni session ready: %s", session_id)
             robot.flush_audio_input()
             robot.set_conversation_state("listening")
 
-            sender = asyncio.create_task(self._send_loop(websocket, robot, stop_event))
+            sender = asyncio.create_task(
+                self._send_loop(websocket, robot, stop_event, session_id)
+            )
             receiver = asyncio.create_task(self._receive_loop(websocket, robot))
             stopper = asyncio.create_task(self._stop_waiter(stop_event))
             tasks = {sender, receiver, stopper}
@@ -151,7 +158,10 @@ class OmniClient:
         websocket: Any,
         robot: RobotPort,
         stop_event: threading.Event,
+        session_id: str,
     ) -> None:
+        was_forcing_listen = False
+        input_sequence = 0
         while not stop_event.is_set():
             audio = await asyncio.to_thread(robot.next_audio_chunk, 0.25)
             if audio is None:
@@ -159,12 +169,18 @@ class OmniClient:
             frame = None
             if self.config.send_video:
                 frame = await asyncio.to_thread(robot.get_frame_jpeg)
-            force_listen = robot.consume_barge_in()
+            force_listen = robot.force_listen_active()
+            input_sequence += 1
+            if force_listen:
+                robot.note_force_listen_sent(
+                    f"{session_id}_resp_{input_sequence}"
+                )
             await websocket.send(
                 json.dumps(build_input_append(audio, frame, force_listen=force_listen))
             )
-            if force_listen:
-                log.info("Sent one-shot force_listen after user barge-in")
+            if force_listen and not was_forcing_listen:
+                log.info("Holding force_listen until barge-in is acknowledged")
+            was_forcing_listen = force_listen
 
     async def _receive_loop(self, websocket: Any, robot: RobotPort) -> None:
         transcript: dict[str, str] = {}
@@ -191,12 +207,13 @@ class OmniClient:
                             event.get("text") or ""
                         )
                     elif kind == "listen":
+                        robot.confirm_omni_listening(str(event.get("response_id") or ""))
                         robot.set_conversation_state("listening")
                 elif event_type == "response.done":
                     response_id = str(event.get("response_id") or "current")
                     partial_text = transcript.pop(response_id, "")
                     text = str(event.get("text") or partial_text).strip()
-                    if text:
+                    if text and not robot.force_listen_active():
                         log.info("Reachy: %s", text)
                     robot.set_conversation_state("listening")
                 elif event_type == "session.closed":

@@ -45,7 +45,8 @@ BARGE_IN_ARM_DELAY = 0.3
 BARGE_IN_CONFIRMATIONS = 3
 BARGE_IN_COOLDOWN = 1.0
 BARGE_IN_MIN_LEVEL_DB = -32.0
-BARGE_IN_OUTPUT_GUARD = 1.0
+BARGE_IN_RELEASE_SILENCE = 0.7
+BARGE_IN_POST_LISTEN_GUARD = 0.4
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
 MAX_HEAD_TRANSLATION_STEP = 0.003
 MAX_ANTENNA_STEP = math.radians(4.0)
@@ -153,6 +154,10 @@ class RobotIO:
         self._playback_generation = 0
         self._suppress_playback_until = 0.0
         self._barge_in_event = threading.Event()
+        self._force_listen_sent = threading.Event()
+        self._omni_listen_confirmed = threading.Event()
+        self._barge_in_user_done = threading.Event()
+        self._expected_listen_response_id: str | None = None
         self._stop_event = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._playback_thread: threading.Thread | None = None
@@ -161,6 +166,7 @@ class RobotIO:
         self._model_state = "idle"
         self._speaking_until = 0.0
         self._barge_in_armed_at = math.inf
+        self._last_near_end_speech_at = 0.0
         self._microphone_level_db = -120.0
         self._recording = False
         self._playing = False
@@ -270,7 +276,12 @@ class RobotIO:
             # A generation invalidates a chunk even when the playback worker
             # has already removed it from Queue and is resampling it.
             self._playback_generation += 1
-            self._suppress_playback_until = now + BARGE_IN_OUTPUT_GUARD
+            self._suppress_playback_until = math.inf
+            self._force_listen_sent.clear()
+            self._omni_listen_confirmed.clear()
+            self._barge_in_user_done.clear()
+            self._expected_listen_response_id = None
+            self._barge_in_event.set()
             while True:
                 try:
                     self._playback_chunks.get_nowait()
@@ -282,21 +293,79 @@ class RobotIO:
             with self._state_lock:
                 self._speaking_until = now
                 self._barge_in_armed_at = math.inf
+                self._last_near_end_speech_at = now
                 self._model_state = "listening"
             # Serialize the SDK flush with playback pushes so an old chunk
             # cannot be submitted immediately after clear_player().
             self._clear_player()
 
-        self._barge_in_event.set()
         log.info("User barge-in: cleared queued speech and resumed listening")
         return True
 
-    def consume_barge_in(self) -> bool:
-        """Consume the one-shot request attached to the next Omni input slice."""
+    def force_listen_active(self) -> bool:
+        """Keep force_listen on every input until both sides finish barge-in."""
+        return self._barge_in_event.is_set()
+
+    def note_force_listen_sent(self, response_id: str) -> None:
         if not self._barge_in_event.is_set():
-            return False
-        self._barge_in_event.clear()
-        return True
+            return
+        with self._state_lock:
+            expected = self._expected_listen_response_id
+            expected_session = expected.rpartition("_resp_")[0] if expected else ""
+            response_session = response_id.rpartition("_resp_")[0]
+            if expected is None or expected_session != response_session:
+                self._expected_listen_response_id = response_id
+        self._force_listen_sent.set()
+
+    def confirm_omni_listening(self, response_id: str) -> None:
+        """Record a server listen event that follows a force_listen input."""
+        with self._state_lock:
+            expected = self._expected_listen_response_id
+        if (
+            self._barge_in_event.is_set()
+            and self._force_listen_sent.is_set()
+            and response_id == expected
+        ):
+            self._omni_listen_confirmed.set()
+            self._try_finish_barge_in()
+
+    def _update_barge_in_release(self, near_end_speech: bool, now: float) -> None:
+        if not self._barge_in_event.is_set():
+            return
+        if near_end_speech:
+            with self._state_lock:
+                self._last_near_end_speech_at = now
+            self._barge_in_user_done.clear()
+            return
+        with self._state_lock:
+            silent_for = now - self._last_near_end_speech_at
+        if silent_for >= BARGE_IN_RELEASE_SILENCE:
+            self._barge_in_user_done.set()
+            self._try_finish_barge_in()
+
+    def _try_finish_barge_in(self) -> None:
+        if not (
+            self._barge_in_event.is_set()
+            and self._barge_in_user_done.is_set()
+            and self._force_listen_sent.is_set()
+            and self._omni_listen_confirmed.is_set()
+        ):
+            return
+        with self._playback_lock:
+            if not self._barge_in_event.is_set():
+                return
+            self._barge_in_event.clear()
+            self._force_listen_sent.clear()
+            self._omni_listen_confirmed.clear()
+            self._barge_in_user_done.clear()
+            with self._state_lock:
+                self._expected_listen_response_id = None
+            # Drop any asynchronous TTS callback already in flight after the
+            # listen acknowledgement. A new response cannot arrive this soon.
+            self._suppress_playback_until = (
+                time.monotonic() + BARGE_IN_POST_LISTEN_GUARD
+            )
+        log.info("Omni listen confirmed; barge-in complete")
 
     def set_conversation_state(self, state: str) -> None:
         if state not in ANTENNA_POSES:
@@ -395,6 +464,7 @@ class RobotIO:
                 speech_detected,
                 microphone_level_db,
             )
+            self._update_barge_in_release(near_end_speech, now)
             if speaking:
                 if (
                     near_end_speech

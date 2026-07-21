@@ -1,5 +1,6 @@
 import math
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ from scipy.spatial.transform import Rotation
 
 from yrobot.robot import (
     BARGE_IN_MIN_LEVEL_DB,
+    BARGE_IN_RELEASE_SILENCE,
     DOA_GAZE_ELEVATION,
     MAX_HEAD_ANGULAR_STEP,
     MAX_HEAD_TRANSLATION_STEP,
@@ -129,7 +131,7 @@ def test_omni_audio_is_played_by_dedicated_worker() -> None:
         worker.join(timeout=1.0)
 
 
-def test_barge_in_clears_both_playback_queues_and_is_one_shot() -> None:
+def test_barge_in_stays_active_until_user_and_server_are_done() -> None:
     class Audio:
         def __init__(self) -> None:
             self.clear_count = 0
@@ -152,11 +154,25 @@ def test_barge_in_clears_both_playback_queues_and_is_one_shot() -> None:
     assert robot.interrupt_omni_audio()
     assert robot._playback_chunks.empty()
     assert mini.media.audio.clear_count == 1
-    assert robot.consume_barge_in()
-    assert not robot.consume_barge_in()
+    assert robot.force_listen_active()
+    assert robot.force_listen_active()
 
-    # Late chunks from the interrupted response are ignored briefly while the
-    # one-shot force_listen reaches the server.
+    # A server listen event alone cannot release suppression while the user is
+    # still speaking, and user silence alone cannot release before the server
+    # has acknowledged a force_listen frame.
+    robot.note_force_listen_sent("session_resp_7")
+    robot.confirm_omni_listening("session_resp_6")
+    assert robot.force_listen_active()
+    robot.confirm_omni_listening("session_resp_7")
+    assert robot.force_listen_active()
+    robot._update_barge_in_release(
+        False,
+        time.monotonic() + BARGE_IN_RELEASE_SILENCE,
+    )
+    assert not robot.force_listen_active()
+
+    # Late chunks from the interrupted response are ignored briefly after the
+    # listen acknowledgement.
     robot.play_omni_audio(np.zeros(2_400, dtype=np.float32))
     assert robot._playback_chunks.empty()
 
@@ -198,7 +214,7 @@ def test_sustained_near_end_speech_interrupts_active_playback() -> None:
     worker.start()
     try:
         assert interrupted.wait(1.0)
-        assert robot.consume_barge_in()
+        assert robot.force_listen_active()
     finally:
         robot._stop_event.set()
         worker.join(timeout=1.0)

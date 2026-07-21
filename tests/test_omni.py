@@ -104,7 +104,7 @@ def test_transport_error_reports_last_event_and_received_audio() -> None:
     assert len(robot.audio) == 1
 
 
-def test_sender_attaches_one_shot_barge_in_to_next_audio_slice() -> None:
+def test_sender_holds_force_listen_while_barge_in_is_active() -> None:
     stop_event = threading.Event()
 
     class WebSocket:
@@ -116,16 +116,24 @@ def test_sender_attaches_one_shot_barge_in_to_next_audio_slice() -> None:
             stop_event.set()
 
     class Robot:
+        def __init__(self) -> None:
+            self.noted = False
+
         def next_audio_chunk(self, timeout: float) -> np.ndarray:
             return np.zeros(16_000, dtype=np.float32)
 
-        def consume_barge_in(self) -> bool:
+        def force_listen_active(self) -> bool:
             return True
 
+        def note_force_listen_sent(self, response_id: str) -> None:
+            self.noted = response_id == "test_resp_1"
+
     websocket = WebSocket()
+    robot = Robot()
     client = OmniClient.__new__(OmniClient)
     client.config = SimpleNamespace(send_video=False)
-    asyncio.run(client._send_loop(websocket, Robot(), stop_event))
+    asyncio.run(client._send_loop(websocket, robot, stop_event, "test"))
 
     assert websocket.message is not None
     assert websocket.message["input"]["force_listen"] is True
+    assert robot.noted
