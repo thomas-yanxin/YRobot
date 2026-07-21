@@ -54,15 +54,16 @@ MOTION_CONNECTION_GRACE = 2.5
 MOTION_ERROR_LOG_INTERVAL = 5.0
 DOA_PERIOD = 0.05
 CAMERA_PERIOD = 1.0
-# Reachy's GStreamer player reanchors its clock after a 200 ms input gap.
-# A response therefore starts behind an adaptive jitter buffer: an observed
-# TTS supply gap raises it to that gap plus a margin, and every completed turn
-# decays it toward the floor. The buffer applies only at a response start —
-# a mid-response starvation resumes immediately, because waiting would only
-# stretch the audible hole.
-PLAYBACK_PREROLL_SECONDS = 0.24
-PLAYBACK_PREROLL_MIN = 0.12
-PLAYBACK_PREROLL_MAX = 0.45
+# Reachy's GStreamer player reanchors its clock after a 200 ms input gap, and
+# TTS arrives as one-second time slices whose boundaries carry real jitter.
+# An utterance therefore starts behind an adaptive jitter buffer: an observed
+# TTS supply gap raises it to that gap plus a margin, and every started
+# utterance decays it toward the floor. The buffer applies only at an
+# utterance start — a mid-utterance starvation resumes immediately, because
+# waiting would only stretch the audible hole.
+PLAYBACK_PREROLL_SECONDS = 0.3
+PLAYBACK_PREROLL_MIN = 0.2
+PLAYBACK_PREROLL_MAX = 0.5
 PLAYBACK_PREROLL_MARGIN = 0.1
 PLAYBACK_PREROLL_DECAY = 0.02
 # Uplink AGC: hardware testing with MiniCPM-o showed the model treats quiet
@@ -524,9 +525,10 @@ class RobotIO:
         with self._playback_lock:
             if self._discard_turn_active or time.monotonic() < self._suppress_playback_until:
                 return False
-            # The receive loop marks the model as speaking only after this
-            # call, so a delta arriving while the model was listening is the
-            # first one of a new response and earns the start-of-turn preroll.
+            # The receive loop marks the model as speaking only after this call
+            # and only a listen boundary marks it listening again, so a delta
+            # arriving while the model was not speaking starts a new utterance
+            # and earns the start-of-utterance preroll.
             with self._state_lock:
                 starts_response = self._model_state != "speaking"
             self._playback_chunks.put(
@@ -562,27 +564,10 @@ class RobotIO:
                 self._playback_preroll = target
                 log.info("Playback preroll raised to %.0f ms", target * 1_000)
 
-    def handle_omni_done(self, response_id: str) -> None:
-        """Close a turn: a discarded turn must not leak trailing burst audio."""
-        now = time.monotonic()
-        with self._playback_lock:
-            if self._discard_turn_active:
-                self._discard_turn_active = False
-                self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
-                log.info(
-                    "Interrupted turn closed by response.done (response=%s)",
-                    response_id or "unknown",
-                )
-
     def handle_omni_listen(self, response_id: str) -> None:
         """Finish a forced interruption once MiniCPM confirms listen mode."""
         now = time.monotonic()
         with self._playback_lock:
-            # Every completed turn earns a slightly faster first word until the
-            # next supply gap proves the network needs more buffering.
-            self._playback_preroll = max(
-                PLAYBACK_PREROLL_MIN, self._playback_preroll - PLAYBACK_PREROLL_DECAY
-            )
             if self._discard_turn_active:
                 self._discard_turn_active = False
                 self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
@@ -791,6 +776,13 @@ class RobotIO:
                         push_started = time.perf_counter()
                         self.mini.media.push_audio_sample(playback)
                         push_ms = (time.perf_counter() - push_started) * 1_000
+                        if should_preroll:
+                            # Every started utterance earns a slightly faster
+                            # first word until a supply gap says otherwise.
+                            self._playback_preroll = max(
+                                PLAYBACK_PREROLL_MIN,
+                                self._playback_preroll - PLAYBACK_PREROLL_DECAY,
+                            )
                 if not playback_is_current:
                     resampler.reset()
                     resampler_generation = None

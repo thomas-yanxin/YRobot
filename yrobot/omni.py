@@ -41,8 +41,6 @@ class RobotPort(Protocol):
 
     def handle_omni_listen(self, response_id: str) -> None: ...
 
-    def handle_omni_done(self, response_id: str) -> None: ...
-
     def set_conversation_state(self, state: str) -> None: ...
 
 
@@ -267,6 +265,12 @@ class OmniClient:
 
     async def _receive_loop(self, websocket: Any, robot: RobotPort) -> None:
         transcript: dict[str, str] = {}
+        # Response ids advance once per one-second full-duplex time slice, NOT
+        # per spoken sentence: one utterance spans several consecutive speak
+        # slices, each closed by its own response.done. Only a `listen` delta
+        # marks the real utterance boundary, so slice-level response.done never
+        # touches conversation state and text is aggregated until the listen.
+        utterance_parts: list[str] = []
         # The raw full-duplex backend may relabel asynchronous Token2Wav
         # callbacks with a later response id, and response.done can precede the
         # final audio delta. Track the physical stream globally so diagnostics
@@ -319,6 +323,9 @@ class OmniClient:
                             event.get("text") or ""
                         )
                     elif kind == "listen":
+                        if utterance_parts:
+                            log.info("Reachy: %s", "".join(utterance_parts))
+                            utterance_parts.clear()
                         robot.handle_omni_listen(str(event.get("response_id") or ""))
                         robot.set_conversation_state("listening")
                         # Silence after an explicit listen boundary is expected
@@ -326,16 +333,14 @@ class OmniClient:
                         audio_supply_until = None
                         audio_stream_active = False
                 elif event_type == "response.done":
+                    # One per time slice, mid-utterance: collect the text
+                    # fragment and leave state alone. Token2Wav's final audio
+                    # delta may also still be in flight for this slice.
                     response_id = str(event.get("response_id") or "current")
-                    # Text decoding can finish before Token2Wav's background
-                    # callback emits its final audio delta.  Playback uses its
-                    # real queue/drain state instead of resetting at this event.
                     partial_text = transcript.pop(response_id, "")
                     text = str(event.get("text") or partial_text).strip()
                     if text:
-                        log.info("Reachy: %s", text)
-                    robot.handle_omni_done(response_id)
-                    robot.set_conversation_state("listening")
+                        utterance_parts.append(text)
                 elif event_type == "session.closed":
                     raise ConnectionError(str(event.get("reason") or "server closed session"))
                 elif event_type == "error":

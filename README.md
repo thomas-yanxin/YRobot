@@ -39,12 +39,16 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
   of being consumed by the control decision. Waiting for that acknowledgement is bounded, and a new
   session clears any stale interruption state, so a lost acknowledgement can never mute the robot.
 - Discards the whole interrupted turn: the backend streams a turn in bursts that run many seconds
-  ahead of playback, so its audio is dropped until the turn's own `listen`/`response.done` boundary
-  instead of resuming mid-sentence after a timeout. The GStreamer flush runs on the playback worker,
-  the only thread that may cycle the shared record+playback pipeline.
-- Adapts the start-of-response preroll to observed TTS delivery gaps (a mid-response stall resumes
-  immediately rather than re-buffering) and lets one slow Wi-Fi send degrade the next slice to
-  audio-only, so video never costs speech fluency.
+  ahead of playback, so its audio is dropped until the next `listen` boundary (the model actually
+  stopped speaking) instead of resuming mid-sentence after a timeout. The GStreamer flush runs on
+  the playback worker, the only thread that may cycle the shared record+playback pipeline.
+- Treats `response_id`/`response.done` as one-second time-slice bookkeeping, not sentence
+  boundaries: one utterance spans several consecutive slices, so slice boundaries never restart
+  playback, reset the resampler, or insert preroll waits, and transcript fragments are aggregated
+  until the `listen` boundary before logging.
+- Adapts the start-of-utterance preroll to observed TTS delivery gaps (a mid-utterance stall
+  resumes immediately rather than re-buffering) and lets one slow Wi-Fi send degrade the next
+  slice to audio-only, so video never costs speech fluency.
 - Applies uplink AGC toward 0.12 rms (gain-up only, frozen while the robot speaks) because the omni
   model treats quiet near-end speech as background and never answers it.
 - Turns toward a detected speaker with Reachy's DoA API.

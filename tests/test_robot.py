@@ -183,11 +183,12 @@ def test_force_listen_timeout_frees_input_but_keeps_turn_discarded() -> None:
     robot._force_requested_at = time.monotonic() - INTERRUPT_ACK_TIMEOUT - 0.1
 
     # The control flag expires so real microphone slices flow again, but the
-    # interrupted turn's burst audio must never resume mid-sentence.
+    # interrupted turn's burst audio must never resume mid-sentence: only a
+    # listen boundary (the model actually stopped speaking) ends the discard.
     assert not robot.force_listen_active()
     assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1") is False
 
-    robot.handle_omni_done("r1")
+    robot.handle_omni_listen("r1")
 
     assert robot._discard_turn_active is False
 
@@ -273,8 +274,31 @@ def test_new_session_clears_stale_interruption_state() -> None:
     assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r2") is True
 
 
-def test_playback_preroll_grows_with_supply_gaps_and_decays_each_turn() -> None:
+def test_slice_boundaries_within_one_utterance_do_not_restart_playback() -> None:
     robot = RobotIO(object())
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "resp_39")
+    robot.set_conversation_state("speaking")
+    # The per-slice response.done between resp_39 and resp_40 leaves the model
+    # state alone, so the next slice continues the utterance without the
+    # start-of-utterance preroll or a resampler reset.
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "resp_40")
+
+    assert robot._playback_chunks.get_nowait()[3] is True
+    assert robot._playback_chunks.get_nowait()[3] is False
+
+
+def test_playback_preroll_grows_with_supply_gaps_and_decays_per_utterance() -> None:
+    pushed = threading.Event()
+
+    class Media:
+        def push_audio_sample(self, samples: np.ndarray) -> None:
+            pushed.set()
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    robot = RobotIO(Mini())
     assert robot._playback_preroll == PLAYBACK_PREROLL_SECONDS
 
     robot.note_tts_supply_gap(0.3)
@@ -283,7 +307,25 @@ def test_playback_preroll_grows_with_supply_gaps_and_decays_each_turn() -> None:
     robot.note_tts_supply_gap(0.06)
     assert robot._playback_preroll == pytest.approx(0.3 + PLAYBACK_PREROLL_MARGIN)
 
+    # Listen slices arrive once per second while idle; they must not erode
+    # the jitter buffer the way a started utterance does.
     robot.handle_omni_listen("r1")
+    assert robot._playback_preroll == pytest.approx(0.3 + PLAYBACK_PREROLL_MARGIN)
+
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r2")
+    worker = threading.Thread(target=robot._playback_loop, name="yrobot-playback", daemon=True)
+    worker.start()
+    try:
+        assert pushed.wait(2.0)
+        deadline = time.monotonic() + 1.0
+        while (
+            robot._playback_preroll > 0.3 + PLAYBACK_PREROLL_MARGIN - 1e-9
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
     assert robot._playback_preroll == pytest.approx(
         0.3 + PLAYBACK_PREROLL_MARGIN - PLAYBACK_PREROLL_DECAY
     )
