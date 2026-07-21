@@ -40,7 +40,10 @@ class Yrobot(ReachyMiniApp):
     """Full-duplex MiniCPM-o conversation for Reachy Mini Wireless."""
 
     dont_start_webserver = True
-    request_media_backend = "default"
+    # YRobot's production target is the Wireless CM4 itself. Selecting LOCAL
+    # explicitly avoids a costly WebRTC loopback if the SDK control connection
+    # has to fall back from localhost to reachy-mini.local.
+    request_media_backend = "local"
 
     def __init__(self, running_on_wireless: bool = False) -> None:
         super().__init__(running_on_wireless)
@@ -71,7 +74,7 @@ def cli(argv: list[str] | None = None) -> None:
 
     stop_event = threading.Event()
     try:
-        with ReachyMini(automatic_body_yaw=True, media_backend="default") as mini:
+        with ReachyMini(automatic_body_yaw=True, media_backend="local") as mini:
             run_conversation(mini, config, stop_event)
     except KeyboardInterrupt:
         log.info("Stopping YRobot")

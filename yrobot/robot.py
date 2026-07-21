@@ -12,6 +12,11 @@ from collections.abc import Mapping
 from contextlib import suppress
 
 import numpy as np
+from reachy_mini.utils.interpolation import (
+    delta_angle_between_mat_rot,
+    linear_pose_interpolation,
+    time_trajectory,
+)
 from scipy.signal import resample_poly
 
 from .config import CHUNK_SAMPLES, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE
@@ -34,6 +39,11 @@ AUDIO_STARTUP_CONFIG = (
     ("PP_NLATTENONOFF", (0,)),
     ("PP_MGSCALE", (4.0, 1.0, 1.0)),
 )
+
+MOTION_PERIOD = 0.05
+MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
+MAX_HEAD_TRANSLATION_STEP = 0.003
+MAX_ANTENNA_STEP = math.radians(4.0)
 
 
 def to_mono(samples: np.ndarray) -> np.ndarray:
@@ -71,6 +81,28 @@ def angular_distance(a: float, b: float) -> float:
     return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
 
 
+def step_pose(
+    current: np.ndarray,
+    target: np.ndarray,
+    max_angular_step: float = MAX_HEAD_ANGULAR_STEP,
+    max_translation_step: float = MAX_HEAD_TRANSLATION_STEP,
+) -> np.ndarray:
+    """Take one bounded interpolation step between two head poses."""
+    current_pose = np.asarray(current, dtype=np.float64)
+    target_pose = np.asarray(target, dtype=np.float64)
+    if current_pose.shape != (4, 4) or target_pose.shape != (4, 4):
+        raise ValueError("head poses must be 4x4 transforms")
+
+    angular_delta = delta_angle_between_mat_rot(current_pose[:3, :3], target_pose[:3, :3])
+    translation_delta = float(np.linalg.norm(target_pose[:3, 3] - current_pose[:3, 3]))
+    fraction = 1.0
+    if angular_delta > 0:
+        fraction = min(fraction, max_angular_step / angular_delta)
+    if translation_delta > 0:
+        fraction = min(fraction, max_translation_step / translation_delta)
+    return linear_pose_interpolation(current_pose, target_pose, fraction)
+
+
 class RobotIO:
     """Own Reachy media and serialize every application-level motion command."""
 
@@ -86,9 +118,14 @@ class RobotIO:
         self._recording = False
         self._playing = False
         self._wobbling = False
+        self._command_head = np.eye(4, dtype=np.float64)
+        self._target_head = self._command_head.copy()
+        self._command_antennas = np.deg2rad(ANTENNA_POSES["idle"])
+        self._target_antennas = self._command_antennas.copy()
 
     def start(self) -> None:
         self.mini.enable_motors()
+        self._initialize_motion_state()
         self._apply_audio_startup_config()
         self.mini.media.start_recording()
         self._recording = True
@@ -201,6 +238,7 @@ class RobotIO:
         last_doa: float | None = None
         last_turn = 0.0
         next_idle_motion = time.monotonic() + random.uniform(5.0, 8.0)
+        last_command_error = 0.0
 
         while not self._stop_event.is_set():
             now = time.monotonic()
@@ -210,24 +248,49 @@ class RobotIO:
             effective_state = "speaking" if speaking else state
 
             if effective_state != last_effective_state:
-                self._set_antennas(effective_state)
+                self._target_antennas = np.deg2rad(
+                    ANTENNA_POSES.get(effective_state, ANTENNA_POSES["idle"])
+                )
                 last_effective_state = effective_state
 
             if not speaking:
                 doa = self._read_doa()
+                speech_detected = False
                 if doa is not None:
                     angle, speech_detected = doa
                     moved_enough = last_doa is None or angular_distance(angle, last_doa) >= 0.12
                     if speech_detected and moved_enough and now - last_turn >= 0.8:
-                        if self._look_towards(angle):
+                        target = self._head_target_towards(angle)
+                        if target is not None:
+                            self._target_head = target
                             last_doa = angle
-                            last_turn = time.monotonic()
+                            last_turn = now
                             next_idle_motion = last_turn + random.uniform(5.0, 8.0)
-                elif effective_state == "idle" and now >= next_idle_motion:
-                    self._idle_glance()
+                if not speech_detected and effective_state == "idle" and now >= next_idle_motion:
+                    target = self._idle_glance_target()
+                    if target is not None:
+                        self._target_head = target
                     next_idle_motion = time.monotonic() + random.uniform(6.0, 10.0)
 
-            self._stop_event.wait(0.1)
+            self._command_head = step_pose(self._command_head, self._target_head)
+            antenna_delta = np.clip(
+                self._target_antennas - self._command_antennas,
+                -MAX_ANTENNA_STEP,
+                MAX_ANTENNA_STEP,
+            )
+            self._command_antennas = self._command_antennas + antenna_delta
+            try:
+                self.mini.set_target(
+                    head=self._command_head,
+                    antennas=self._command_antennas,
+                    body_yaw=None,
+                )
+            except Exception as exc:
+                if now - last_command_error >= 5.0:
+                    log.warning("Motion command failed: %s", exc)
+                    last_command_error = now
+
+            self._stop_event.wait(MOTION_PERIOD)
 
     def _read_doa(self) -> tuple[float, bool] | None:
         try:
@@ -236,36 +299,31 @@ class RobotIO:
             log.debug("DoA unavailable: %s", exc)
             return None
 
-    def _look_towards(self, angle: float) -> bool:
+    def _head_target_towards(self, angle: float) -> np.ndarray | None:
         try:
-            world = doa_world_direction(angle, self.mini.get_current_head_pose())
-            target = self.mini.look_at_world(*world, perform_movement=False)
-            self.mini.goto_target(head=target, duration=0.45, body_yaw=None)
-            return True
+            try:
+                head_pose = self.mini.get_current_head_pose()
+            except Exception:
+                head_pose = self._command_head
+            world = doa_world_direction(angle, head_pose)
+            return self.mini.look_at_world(*world, perform_movement=False)
         except Exception as exc:
-            log.warning("DoA motion failed: %s", exc)
-            return False
+            log.warning("Could not calculate DoA target: %s", exc)
+            return None
 
-    def _idle_glance(self) -> None:
+    def _idle_glance_target(self) -> np.ndarray | None:
         try:
             from reachy_mini.utils import create_head_pose
 
-            target = create_head_pose(
+            return create_head_pose(
                 roll=random.uniform(-2.0, 2.0),
                 pitch=random.uniform(-2.0, 2.0),
                 yaw=random.uniform(-4.0, 4.0),
                 degrees=True,
             )
-            self.mini.goto_target(head=target, duration=0.8, body_yaw=None)
         except Exception as exc:
             log.debug("Idle motion unavailable: %s", exc)
-
-    def _set_antennas(self, state: str) -> None:
-        angles = ANTENNA_POSES.get(state, ANTENNA_POSES["idle"])
-        try:
-            self.mini.goto_target(antennas=np.deg2rad(angles), duration=0.35, body_yaw=None)
-        except Exception as exc:
-            log.debug("Antenna posture unavailable: %s", exc)
+            return None
 
     def _clear_player(self) -> None:
         audio = getattr(self.mini.media, "audio", None)
@@ -290,15 +348,42 @@ class RobotIO:
         except Exception as exc:
             log.warning("Could not apply Reachy audio DSP configuration: %s", exc)
 
+    def _initialize_motion_state(self) -> None:
+        try:
+            self._command_head = np.asarray(
+                self.mini.get_current_head_pose(), dtype=np.float64
+            ).copy()
+        except Exception as exc:
+            log.warning("Could not read initial head pose: %s", exc)
+            self._command_head = np.eye(4, dtype=np.float64)
+        try:
+            self._command_antennas = np.asarray(
+                self.mini.get_present_antenna_joint_positions(), dtype=np.float64
+            )
+        except Exception as exc:
+            log.warning("Could not read initial antenna pose: %s", exc)
+            self._command_antennas = np.deg2rad(ANTENNA_POSES["idle"])
+        self._target_head = self._command_head.copy()
+        self._target_antennas = self._command_antennas.copy()
+
     def _return_to_neutral(self) -> None:
         try:
             from reachy_mini.reachy_mini import INIT_ANTENNAS_JOINT_POSITIONS, INIT_HEAD_POSE
 
-            self.mini.goto_target(
-                head=INIT_HEAD_POSE,
-                antennas=INIT_ANTENNAS_JOINT_POSITIONS,
-                duration=0.8,
-                body_yaw=None,
-            )
+            start_head = self._command_head.copy()
+            start_antennas = self._command_antennas.copy()
+            duration = 0.8
+            steps = round(duration / MOTION_PERIOD)
+            for index in range(1, steps + 1):
+                fraction = time_trajectory(index / steps)
+                head = linear_pose_interpolation(start_head, INIT_HEAD_POSE, fraction)
+                antennas = (
+                    start_antennas
+                    + (np.asarray(INIT_ANTENNAS_JOINT_POSITIONS) - start_antennas) * fraction
+                )
+                self.mini.set_target(head=head, antennas=antennas, body_yaw=None)
+                time.sleep(MOTION_PERIOD)
+            self._command_head = np.asarray(INIT_HEAD_POSE).copy()
+            self._command_antennas = np.asarray(INIT_ANTENNAS_JOINT_POSITIONS).copy()
         except Exception as exc:
             log.warning("Could not return Reachy to neutral: %s", exc)

@@ -25,6 +25,8 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 - Applies the official conversation app's XVF3800 echo/noise/gain tuning at startup.
 - Turns toward a detected speaker with Reachy's DoA API.
 - Uses the SDK's native audio-reactive wobble and restrained antenna/idle poses.
+- Uses the CM4-local media backend, avoiding a WebRTC encode/decode loop on the robot.
+- Sends all Phase-A motion through one bounded, non-blocking `set_target` control loop.
 - Reconnects after network failures and returns to a neutral pose on shutdown.
 
 The first motion phase is deliberately bounded. MiniCPM-o's raw full-duplex protocol emits
@@ -51,7 +53,7 @@ after the server uses a certificate trusted by the CM4.
 
 ## Run
 
-With the Reachy daemon already running:
+With the Reachy daemon already running, execute this on the Wireless CM4:
 
 ```bash
 source .venv/bin/activate
