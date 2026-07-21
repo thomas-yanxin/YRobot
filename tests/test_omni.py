@@ -154,6 +154,9 @@ def test_tts_gap_survives_response_done_and_response_id_change(
         def play_omni_audio(self, samples: np.ndarray, response_id: str) -> bool:
             return True
 
+        def handle_omni_done(self, response_id: str) -> None:
+            pass
+
         def note_tts_supply_gap(self, gap_seconds: float) -> None:
             self.supply_gaps.append(gap_seconds)
 

@@ -41,6 +41,8 @@ class RobotPort(Protocol):
 
     def handle_omni_listen(self, response_id: str) -> None: ...
 
+    def handle_omni_done(self, response_id: str) -> None: ...
+
     def set_conversation_state(self, state: str) -> None: ...
 
 
@@ -332,6 +334,7 @@ class OmniClient:
                     text = str(event.get("text") or partial_text).strip()
                     if text:
                         log.info("Reachy: %s", text)
+                    robot.handle_omni_done(response_id)
                     robot.set_conversation_state("listening")
                 elif event_type == "session.closed":
                     raise ConnectionError(str(event.get("reason") or "server closed session"))

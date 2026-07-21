@@ -38,8 +38,15 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
   after MiniCPM acknowledges `listen`, the user's interrupting words are forwarded normally instead
   of being consumed by the control decision. Waiting for that acknowledgement is bounded, and a new
   session clears any stale interruption state, so a lost acknowledgement can never mute the robot.
-- Adapts the playback preroll to observed TTS delivery gaps and lets one slow Wi-Fi send degrade
-  the next slice to audio-only, so video never costs speech fluency.
+- Discards the whole interrupted turn: the backend streams a turn in bursts that run many seconds
+  ahead of playback, so its audio is dropped until the turn's own `listen`/`response.done` boundary
+  instead of resuming mid-sentence after a timeout. The GStreamer flush runs on the playback worker,
+  the only thread that may cycle the shared record+playback pipeline.
+- Adapts the start-of-response preroll to observed TTS delivery gaps (a mid-response stall resumes
+  immediately rather than re-buffering) and lets one slow Wi-Fi send degrade the next slice to
+  audio-only, so video never costs speech fluency.
+- Applies uplink AGC toward 0.12 rms (gain-up only, frozen while the robot speaks) because the omni
+  model treats quiet near-end speech as background and never answers it.
 - Turns toward a detected speaker with Reachy's DoA API.
 - Keeps a slightly raised natural gaze; DoA changes yaw without accumulating downward pitch.
 - Keeps the last speaker as an attention anchor instead of replacing it with permanent random poses.

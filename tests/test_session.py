@@ -17,6 +17,7 @@ class FakeRobot:
         self.played: list[np.ndarray] = []
         self.states: list[str] = []
         self.listens: list[str] = []
+        self.dones: list[str] = []
         self.supply_gaps: list[float] = []
         self.interruption_resets = 0
 
@@ -48,6 +49,9 @@ class FakeRobot:
 
     def handle_omni_listen(self, response_id: str) -> None:
         self.listens.append(response_id)
+
+    def handle_omni_done(self, response_id: str) -> None:
+        self.dones.append(response_id)
 
     def set_conversation_state(self, state: str) -> None:
         self.states.append(state)
@@ -140,4 +144,5 @@ async def _session_scenario() -> None:
     assert robot.states[0] == "listening"
     assert "speaking" in robot.states
     assert robot.listens == ["r2"]
+    assert robot.dones == ["r1"]
     assert robot.interruption_resets == 1

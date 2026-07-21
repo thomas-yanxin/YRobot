@@ -55,18 +55,30 @@ MOTION_ERROR_LOG_INTERVAL = 5.0
 DOA_PERIOD = 0.05
 CAMERA_PERIOD = 1.0
 # Reachy's GStreamer player reanchors its clock after a 200 ms input gap.
-# Playback therefore starts behind an adaptive jitter buffer: an observed TTS
-# supply gap raises it to that gap plus a margin, and every completed turn
-# decays it toward the floor so a healthy network earns a faster first word.
-PLAYBACK_PREROLL_SECONDS = 0.32
+# A response therefore starts behind an adaptive jitter buffer: an observed
+# TTS supply gap raises it to that gap plus a margin, and every completed turn
+# decays it toward the floor. The buffer applies only at a response start —
+# a mid-response starvation resumes immediately, because waiting would only
+# stretch the audible hole.
+PLAYBACK_PREROLL_SECONDS = 0.24
 PLAYBACK_PREROLL_MIN = 0.12
-PLAYBACK_PREROLL_MAX = 0.6
+PLAYBACK_PREROLL_MAX = 0.45
 PLAYBACK_PREROLL_MARGIN = 0.1
 PLAYBACK_PREROLL_DECAY = 0.02
+# Uplink AGC: hardware testing with MiniCPM-o showed the model treats quiet
+# near-end speech as background and never answers, so uploaded slices are
+# lifted toward a fixed speech level. Adaptation freezes while the robot is
+# speaking so residual echo cannot pull the estimate down, and the gain never
+# attenuates.
+UPLINK_AGC_TARGET_RMS = 0.12
+UPLINK_AGC_MAX_GAIN = 8.0
+UPLINK_AGC_SPEECH_FLOOR_RMS = 0.006
+UPLINK_AGC_SMOOTHING = 0.3
 # The arm delay is dead time in which the user cannot barge in; the XVF AEC
 # filters stay converged between utterances, so 0.4 s of residual-floor
-# learning suffices. Confirmation is then a sustained-duration test on the
-# 20 ms motion tick rather than a count of 50 ms DoA samples.
+# learning suffices. Confirmation is a sustained-duration test on the 20 ms
+# motion tick. The XVF "speech" flag is PRE-AEC — it stays high while the
+# robot's own speaker plays — so the post-AEC level test is the only gate.
 INTERRUPT_ARM_DELAY = 0.4
 INTERRUPT_CONFIRM_SECONDS = 0.12
 INTERRUPT_COOLDOWN = 1.0
@@ -74,7 +86,6 @@ INTERRUPT_MIN_LEVEL_DB = -38.0
 INTERRUPT_MIN_RISE_DB = 6.0
 INTERRUPT_FLOOR_RISE_DB_PER_SAMPLE = 0.15
 INTERRUPT_ACTIVITY_HOLD = 1.25
-INTERRUPT_SPEECH_HOLD = 0.15
 INTERRUPT_POST_LISTEN_GUARD = 0.4
 INTERRUPT_ACK_TIMEOUT = 3.0
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
@@ -113,6 +124,33 @@ def audio_level_db(samples: np.ndarray) -> float:
         return -120.0
     rms = math.sqrt(float(np.dot(audio, audio)) / audio.size)
     return 20.0 * math.log10(max(rms, 1e-6))
+
+
+class UplinkAGC:
+    """Lift quiet near-end speech toward the level MiniCPM answers reliably.
+
+    The estimate tracks a smoothed speech RMS and is only trusted below the
+    target, so the gain is always >= 1 and loud speech passes unchanged.
+    """
+
+    def __init__(self) -> None:
+        self._speech_rms: float | None = None
+
+    def process(self, chunk: np.ndarray, *, adapt: bool = True) -> np.ndarray:
+        if chunk.size == 0:
+            return chunk
+        rms = math.sqrt(float(np.dot(chunk, chunk)) / chunk.size)
+        if adapt and rms > UPLINK_AGC_SPEECH_FLOOR_RMS:
+            self._speech_rms = (
+                rms
+                if self._speech_rms is None
+                else (1.0 - UPLINK_AGC_SMOOTHING) * self._speech_rms
+                + UPLINK_AGC_SMOOTHING * rms
+            )
+        if self._speech_rms is None or self._speech_rms >= UPLINK_AGC_TARGET_RMS:
+            return chunk
+        gain = min(UPLINK_AGC_MAX_GAIN, UPLINK_AGC_TARGET_RMS / self._speech_rms)
+        return np.clip(chunk * gain, -1.0, 1.0)
 
 
 class StreamingAudioResampler:
@@ -357,12 +395,14 @@ class RobotIO:
         # Keep network reception independent from GStreamer.  TTS callbacks can
         # arrive in bursts; pushing them from the WebSocket receive loop makes
         # that loop stop reading while the audio backend catches up.
-        self._playback_chunks: queue.Queue[tuple[int, str, np.ndarray]] = queue.Queue()
+        self._playback_chunks: queue.Queue[tuple[int, str, np.ndarray, bool]] = queue.Queue()
         self._playback_lock = threading.Lock()
         self._camera_lock = threading.Lock()
         self._latest_frame_jpeg: bytes | None = None
         self._playback_generation = 0
         self._suppress_playback_until = 0.0
+        self._discard_turn_active = False
+        self._player_clear_pending = False
         self._force_listen_event = threading.Event()
         self._stop_event = threading.Event()
         self._capture_thread: threading.Thread | None = None
@@ -482,10 +522,16 @@ class RobotIO:
         # decode_pcm owns its array, but copying here keeps this port safe for
         # callers that reuse a mutable input buffer after returning.
         with self._playback_lock:
-            if time.monotonic() < self._suppress_playback_until:
+            if self._discard_turn_active or time.monotonic() < self._suppress_playback_until:
                 return False
-            generation = self._playback_generation
-            self._playback_chunks.put((generation, response_id, audio.copy()))
+            # The receive loop marks the model as speaking only after this
+            # call, so a delta arriving while the model was listening is the
+            # first one of a new response and earns the start-of-turn preroll.
+            with self._state_lock:
+                starts_response = self._model_state != "speaking"
+            self._playback_chunks.put(
+                (self._playback_generation, response_id, audio.copy(), starts_response)
+            )
         return True
 
     def force_listen_active(self) -> bool:
@@ -493,9 +539,9 @@ class RobotIO:
         if not self._force_listen_event.is_set():
             return False
         if time.monotonic() - self._force_requested_at > INTERRUPT_ACK_TIMEOUT:
-            # Without a listen acknowledgement the flag would keep replacing
-            # real microphone slices with silent control slices forever; the
-            # bounded playback suppression expires on the same clock.
+            # Stop replacing real microphone slices with silent control slices
+            # so the conversation can continue. The discarded turn stays muted
+            # until its own listen/done boundary regardless.
             log.warning("Forced listen was not acknowledged; resuming normal input")
             self._force_listen_event.clear()
             return False
@@ -506,6 +552,7 @@ class RobotIO:
         self._force_listen_event.clear()
         with self._playback_lock:
             self._suppress_playback_until = 0.0
+            self._discard_turn_active = False
 
     def note_tts_supply_gap(self, gap_seconds: float) -> None:
         """Grow the playback preroll to cover an observed TTS delivery stall."""
@@ -514,6 +561,18 @@ class RobotIO:
             if target > self._playback_preroll:
                 self._playback_preroll = target
                 log.info("Playback preroll raised to %.0f ms", target * 1_000)
+
+    def handle_omni_done(self, response_id: str) -> None:
+        """Close a turn: a discarded turn must not leak trailing burst audio."""
+        now = time.monotonic()
+        with self._playback_lock:
+            if self._discard_turn_active:
+                self._discard_turn_active = False
+                self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
+                log.info(
+                    "Interrupted turn closed by response.done (response=%s)",
+                    response_id or "unknown",
+                )
 
     def handle_omni_listen(self, response_id: str) -> None:
         """Finish a forced interruption once MiniCPM confirms listen mode."""
@@ -524,6 +583,9 @@ class RobotIO:
             self._playback_preroll = max(
                 PLAYBACK_PREROLL_MIN, self._playback_preroll - PLAYBACK_PREROLL_DECAY
             )
+            if self._discard_turn_active:
+                self._discard_turn_active = False
+                self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
         with self._state_lock:
             forced = self._force_listen_event.is_set()
             recent_near_end = (
@@ -574,11 +636,14 @@ class RobotIO:
         """Invalidate queued/appsrc audio without racing the playback worker."""
         with self._playback_lock:
             self._playback_generation += 1
-            # Waiting for the listen acknowledgement stays bounded so a lost
-            # acknowledgement degrades to resumed speech instead of a mute robot.
-            self._suppress_playback_until = now + (
-                INTERRUPT_ACK_TIMEOUT if suppress_until_listen else INTERRUPT_POST_LISTEN_GUARD
-            )
+            if suppress_until_listen:
+                # The backend streams a whole turn in bursts that can run 10+
+                # seconds ahead of playback, so a time window always leaks:
+                # discard everything until the model closes this turn with a
+                # listen or response.done boundary.
+                self._discard_turn_active = True
+            else:
+                self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
             while True:
                 try:
                     self._playback_chunks.get_nowait()
@@ -590,7 +655,11 @@ class RobotIO:
                 self._speaking_until = now
                 self._interrupt_armed_at = math.inf
                 self._model_state = "listening"
-            self._clear_player()
+            # clear_player cycles the SHARED record+playback pipeline through
+            # PAUSED→flush→PLAYING; hardware testing showed calling it from any
+            # thread but the sole pusher can wedge the pipeline for good, so the
+            # playback worker executes it.
+            self._player_clear_pending = True
 
     def set_conversation_state(self, state: str) -> None:
         if state not in ANTENNA_POSES:
@@ -599,6 +668,7 @@ class RobotIO:
             self._model_state = state
 
     def _capture_loop(self) -> None:
+        agc = UplinkAGC()
         pending = np.empty(CHUNK_SAMPLES, dtype=np.float32)
         pending_size = 0
         while not self._stop_event.is_set():
@@ -608,8 +678,11 @@ class RobotIO:
                     self._stop_event.wait(0.01)
                     continue
                 mono = to_mono(sample)
+                # The double-talk detector reads the raw post-AEC level; only
+                # the uploaded slice gets the AGC lift.
                 with self._state_lock:
                     self._microphone_level_db = audio_level_db(mono)
+                    speaking = time.monotonic() < self._speaking_until
                 offset = 0
                 while offset < mono.size:
                     copied = min(CHUNK_SAMPLES - pending_size, mono.size - offset)
@@ -617,7 +690,7 @@ class RobotIO:
                     pending_size += copied
                     offset += copied
                     if pending_size == CHUNK_SAMPLES:
-                        self._put_latest(pending.copy())
+                        self._put_latest(agc.process(pending.copy(), adapt=not speaking))
                         pending_size = 0
             except Exception as exc:
                 log.warning("Microphone read failed: %s", exc)
@@ -644,9 +717,17 @@ class RobotIO:
         """Continuously resample TTS and feed a short jitter buffer to GStreamer."""
         resampler = StreamingAudioResampler()
         resampler_generation: int | None = None
-        deferred_item: tuple[int, str, np.ndarray] | None = None
+        deferred_item: tuple[int, str, np.ndarray, bool] | None = None
 
         while not self._stop_event.is_set():
+            with self._playback_lock:
+                clear_pending = self._player_clear_pending
+                self._player_clear_pending = False
+            if clear_pending:
+                # Only this thread may cycle the shared pipeline; see
+                # _flush_playback_for_listen.
+                self._clear_player()
+
             if deferred_item is None:
                 try:
                     first_item = self._playback_chunks.get(timeout=0.1)
@@ -657,13 +738,16 @@ class RobotIO:
                 deferred_item = None
 
             items = [first_item]
-            generation, response_id, samples = first_item
+            generation, response_id, samples, starts_response = first_item
             with self._state_lock:
                 playback_was_idle = time.monotonic() >= self._speaking_until
                 last_user_speech_at = self._last_user_speech_at
+            # A drained mid-response resume pushes immediately: the hole has
+            # already been heard, and buffering now would only stretch it.
+            should_preroll = playback_was_idle and starts_response
             buffered_samples = samples.size
             preroll_samples = round(self._playback_preroll * OUTPUT_SAMPLE_RATE)
-            if playback_was_idle and buffered_samples < preroll_samples:
+            if should_preroll and buffered_samples < preroll_samples:
                 deadline = time.monotonic() + self._playback_preroll
                 while not self._stop_event.is_set() and buffered_samples < preroll_samples:
                     remaining = deadline - time.monotonic()
@@ -673,19 +757,18 @@ class RobotIO:
                         item = self._playback_chunks.get(timeout=remaining)
                     except queue.Empty:
                         break
-                    item_generation, _, _ = item
-                    if item_generation != generation:
+                    if item[0] != generation:
                         deferred_item = item
                         break
                     items.append(item)
                     buffered_samples += item[2].size
 
             try:
-                if generation != resampler_generation or playback_was_idle:
+                if generation != resampler_generation or should_preroll:
                     resampler.reset()
                     resampler_generation = generation
 
-                audio_parts = [item_samples for _, _, item_samples in items]
+                audio_parts = [item_samples for _, _, item_samples, _ in items]
                 source = audio_parts[0] if len(audio_parts) == 1 else np.concatenate(audio_parts)
                 resample_started = time.perf_counter()
                 playback = resampler.process(source)
@@ -716,7 +799,7 @@ class RobotIO:
                     # The single end-to-end number every latency tuning knob
                     # (chunk cadence, preroll, model) must ultimately improve.
                     turn_gap = time.monotonic() - last_user_speech_at
-                    if 0.0 < turn_gap < 10.0:
+                    if starts_response and 0.0 < turn_gap < 10.0:
                         log.info(
                             "Turn latency for %s: %.0f ms from last heard user speech",
                             response_id,
@@ -766,7 +849,6 @@ class RobotIO:
         connection_error_started_at: float | None = None
         interrupt_candidate_since: float | None = None
         interrupt_cooldown_until = 0.0
-        last_doa_speech_at = -math.inf
         far_end_floor_db: float | None = None
         started_at = time.monotonic()
         state_entered_at = started_at
@@ -806,16 +888,15 @@ class RobotIO:
                     glance_started_at = None
                     next_glance_at = now + self._motion_rng.uniform(12.0, 20.0)
 
-            # DoA remains the gaze source. During playback its speech bit is only
-            # an extra double-talk gate; the adaptive post-AEC level threshold
-            # prevents Reachy's own speaker from interrupting the response.
+            # DoA is the gaze source while listening. Its speech bit is PRE-AEC
+            # and stays high whenever the robot's own speaker plays, so it takes
+            # no part in double-talk detection; the adaptive post-AEC level
+            # threshold is what prevents Reachy from interrupting itself.
             doa_sampled = now >= next_doa_read
             if doa_sampled:
                 latest_doa = self._read_doa()
                 next_doa_read = max(next_doa_read + DOA_PERIOD, now + DOA_PERIOD)
             speech_detected = latest_doa is not None and latest_doa[1]
-            if doa_sampled and speech_detected:
-                last_doa_speech_at = now
             if speaking:
                 if now < interrupt_armed_at:
                     # Learn the current far-end residual during the startup
@@ -835,12 +916,8 @@ class RobotIO:
                     INTERRUPT_MIN_LEVEL_DB,
                     far_end_floor_db + INTERRUPT_MIN_RISE_DB,
                 )
-                # Confirmation is a sustained-duration test on the motion tick,
-                # with the DoA speech flag held across its slower 50 ms sampling,
-                # so reaction time no longer multiplies the two cadences.
                 near_end_candidate = (
-                    now - last_doa_speech_at <= INTERRUPT_SPEECH_HOLD
-                    and now >= interrupt_armed_at
+                    now >= interrupt_armed_at
                     and now >= interrupt_cooldown_until
                     and microphone_level_db >= interrupt_threshold_db
                 )

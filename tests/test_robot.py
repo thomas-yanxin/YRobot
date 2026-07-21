@@ -21,6 +21,7 @@ from yrobot.robot import (
     PLAYBACK_PREROLL_SECONDS,
     RobotIO,
     StreamingAudioResampler,
+    UplinkAGC,
     angular_distance,
     doa_world_direction,
     effective_conversation_state,
@@ -104,7 +105,7 @@ def test_model_listen_flushes_playback_after_recent_near_end_activity() -> None:
 
     robot.handle_omni_listen("r2")
 
-    assert mini.media.audio.clear_count == 1
+    assert robot._player_clear_pending is True
     assert robot._playback_chunks.empty()
     assert not robot.force_listen_active()
 
@@ -133,7 +134,7 @@ def test_quiet_model_listen_allows_buffered_sentence_tail_to_drain() -> None:
 
     robot.handle_omni_listen("r2")
 
-    assert mini.media.audio.clear_count == 0
+    assert robot._player_clear_pending is False
     assert not robot._playback_chunks.empty()
 
 
@@ -161,8 +162,10 @@ def test_high_confidence_double_talk_forces_listen_until_acknowledged() -> None:
 
     assert robot._request_user_interrupt(-24.0, -30.0)
     assert robot.force_listen_active()
-    assert mini.media.audio.clear_count == 1
+    assert robot._player_clear_pending is True
     assert robot._playback_chunks.empty()
+    # Burst audio of the interrupted turn is discarded until a turn boundary.
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1") is False
 
     robot.handle_omni_listen("r2")
 
@@ -170,10 +173,35 @@ def test_high_confidence_double_talk_forces_listen_until_acknowledged() -> None:
     assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "late") is False
 
 
-def test_unacknowledged_force_listen_expires_instead_of_muting() -> None:
+def test_force_listen_timeout_frees_input_but_keeps_turn_discarded() -> None:
+    robot = RobotIO(object())
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+
+    assert robot._request_user_interrupt(-24.0, -30.0)
+    robot._force_requested_at = time.monotonic() - INTERRUPT_ACK_TIMEOUT - 0.1
+
+    # The control flag expires so real microphone slices flow again, but the
+    # interrupted turn's burst audio must never resume mid-sentence.
+    assert not robot.force_listen_active()
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1") is False
+
+    robot.handle_omni_done("r1")
+
+    assert robot._discard_turn_active is False
+
+
+def test_playback_worker_owns_the_shared_pipeline_flush() -> None:
+    cleared = threading.Event()
+
     class Audio:
+        def __init__(self) -> None:
+            self.thread_name = ""
+
         def clear_player(self) -> None:
-            pass
+            self.thread_name = threading.current_thread().name
+            cleared.set()
 
     class Media:
         audio = Audio()
@@ -181,16 +209,45 @@ def test_unacknowledged_force_listen_expires_instead_of_muting() -> None:
     class Mini:
         media = Media()
 
-    robot = RobotIO(Mini())
+    mini = Mini()
+    robot = RobotIO(mini)
     robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
     with robot._state_lock:
         robot._speaking_until = time.monotonic() + 2.0
-
     assert robot._request_user_interrupt(-24.0, -30.0)
-    assert math.isfinite(robot._suppress_playback_until)
 
-    robot._force_requested_at = time.monotonic() - INTERRUPT_ACK_TIMEOUT - 0.1
-    assert not robot.force_listen_active()
+    worker = threading.Thread(target=robot._playback_loop, name="yrobot-playback", daemon=True)
+    worker.start()
+    try:
+        assert cleared.wait(1.0)
+        assert mini.media.audio.thread_name == "yrobot-playback"
+        assert robot._player_clear_pending is False
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
+
+
+def test_uplink_agc_lifts_quiet_speech_and_leaves_loud_speech_alone() -> None:
+    agc = UplinkAGC()
+    quiet = np.full(16_000, 0.02, dtype=np.float32)
+    lifted = agc.process(quiet)
+    assert np.sqrt(np.mean(np.square(lifted))) == pytest.approx(0.12, rel=0.05)
+
+    loud = np.full(16_000, 0.5, dtype=np.float32)
+    np.testing.assert_array_equal(agc.process(loud), loud)
+
+    silence = np.zeros(16_000, dtype=np.float32)
+    np.testing.assert_array_equal(UplinkAGC().process(silence), silence)
+
+
+def test_uplink_agc_freezes_its_estimate_while_the_robot_speaks() -> None:
+    agc = UplinkAGC()
+    agc.process(np.full(16_000, 0.05, dtype=np.float32))
+    residual_echo = np.full(16_000, 0.01, dtype=np.float32)
+
+    agc.process(residual_echo, adapt=False)
+
+    assert agc._speech_rms == pytest.approx(0.05)
 
 
 def test_new_session_clears_stale_interruption_state() -> None:
