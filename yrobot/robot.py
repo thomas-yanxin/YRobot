@@ -126,22 +126,29 @@ INTERRUPT_FLOOR_RISE_DB_PER_SAMPLE = 0.15
 INTERRUPT_ACTIVITY_HOLD = 1.25
 INTERRUPT_POST_LISTEN_GUARD = 0.4
 INTERRUPT_ACK_TIMEOUT = 3.0
-# Stage-two verification window: the settle time covers the pipeline
-# PAUSED→flush→PLAYING cycle plus the acoustic and capture path before mic
-# samples can be trusted as echo-free; evidence must then persist for the
-# usual confirmation time before the turn is destroyed. A false alarm bumps
-# the learned floor so the same residual level stops re-triggering.
-INTERRUPT_VERIFY_SECONDS = 0.35
-INTERRUPT_VERIFY_SETTLE = 0.15
+# Stage-two verification window: the settle time covers everything between
+# "we asked for silence" and "the microphone can prove it" — the pipeline
+# PAUSED→flush→PLAYING cycle, any sink residue, the acoustic path and the
+# capture/XVF/delivery path back. The shared GStreamer pipeline reports
+# min_latency=286 ms at startup (hardware log 2026-07-22), and a 150 ms
+# settle let in-flight echo of the just-muted speech confirm a false
+# barge-in, so the settle must stay comfortably above that figure. Evidence
+# must then persist for the usual confirmation time before the turn is
+# destroyed. A false alarm bumps the learned floor so the same residual
+# level stops re-triggering.
+INTERRUPT_VERIFY_SECONDS = 1.0
+INTERRUPT_VERIFY_SETTLE = 0.6
 INTERRUPT_FALSE_TRIGGER_FLOOR_MARGIN = 1.0
 # The far-end signal is known exactly (we push every frame), so the expected
 # residual is predicted per-tick from the recent playout envelope instead of
 # only the slow floor: threshold >= playout level + learned residual offset
 # + the usual rise margin. The offset (residual-to-far-end ratio through
 # speaker, room and AEC) learns fast upward from echo-only frames and decays
-# slowly, and persists across utterances. The lookback absorbs unknown
-# playout-to-capture latency.
-FAR_END_ENVELOPE_WINDOW = 0.45
+# slowly, and persists across utterances. The lookback must cover the full
+# playout-to-capture latency: the pipeline alone reports up to 1.256 s
+# (hardware log 2026-07-22 — a 0.45 s window missed the loud frames actually
+# in the air and predicted a near-silent far end during loud speech).
+FAR_END_ENVELOPE_WINDOW = 1.6
 FAR_END_ENVELOPE_KEEP = 2.0
 RESIDUAL_OFFSET_INIT_DB = -18.0
 RESIDUAL_OFFSET_RISE_DB = 0.5
@@ -614,6 +621,11 @@ class RobotIO:
         self._playback_generation = 0
         self._suppress_playback_until = 0.0
         self._discard_turn_active = False
+        # Set when a listen ack arrived but the discard was kept because the
+        # user was still speaking: the turn boundary has passed, so model
+        # audio arriving once the user has gone quiet is a fresh utterance
+        # and may end the discard instead of waiting for another listen.
+        self._hold_post_listen = False
         self._player_clear_pending = False
         # Duck-and-verify state (all under _playback_lock): while the hold is
         # active the worker pushes nothing; the resume tail is the un-played
@@ -772,8 +784,9 @@ class RobotIO:
         with self._playback_lock:
             now = time.monotonic()
             if self._discard_turn_active:
-                self._maybe_reforce_listen(now)
-                return False
+                if not self._end_hold_for_quiet_user(now):
+                    self._maybe_reforce_listen(now)
+                    return False
             if now < self._suppress_playback_until:
                 return False
             # The receive loop marks the model as speaking only after this call
@@ -824,6 +837,7 @@ class RobotIO:
         with self._playback_lock:
             self._suppress_playback_until = 0.0
             self._discard_turn_active = False
+            self._hold_post_listen = False
             self._playback_hold_active = False
             self._player_duck_pending = False
             self._playback_resume_tail = None
@@ -869,10 +883,14 @@ class RobotIO:
                         "Listen ack while user still speaking; holding playback (response=%s)",
                         response_id or "unknown",
                     )
+                    # The turn boundary has passed: model audio arriving once
+                    # the user goes quiet may end this hold directly.
+                    self._hold_post_listen = True
                     with self._state_lock:
                         self._model_state = "listening"
                     return
                 self._discard_turn_active = False
+                self._hold_post_listen = False
                 self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
                 with self._state_lock:
                     self._interrupting = False
@@ -891,6 +909,37 @@ class RobotIO:
         if forced or recent_near_end:
             with self._playback_lock:
                 self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
+
+    def _end_hold_for_quiet_user(self, now: float) -> bool:
+        """Reopen playback for a post-listen delta once the user is quiet.
+
+        Runs on the discard path with the playback lock held. The yield hold
+        exists to stop the model talking over a still-speaking user; once a
+        listen boundary has passed AND the user has stayed quiet, arriving
+        model audio is a fresh utterance with nobody to talk over. Without
+        this the discard only ends at the NEXT listen boundary, which for a
+        long monologue turn can be a minute away — one bad interrupt then
+        silently swallows the entire turn (hardware logs 2026-07-22: a 49 s
+        story played into the void after a single echo-confirmed barge-in).
+        """
+        if not self._hold_post_listen:
+            return False
+        if self._force_listen_event.is_set():
+            # A re-force is in flight; wait for its ack instead of playing
+            # the utterance it is trying to chop.
+            return False
+        with self._state_lock:
+            quiet = (
+                now - max(self._last_near_end_activity_at, self._last_user_speech_at)
+                > INTERRUPT_YIELD_HOLD
+            )
+            if not quiet:
+                return False
+            self._interrupting = False
+        self._discard_turn_active = False
+        self._hold_post_listen = False
+        log.info("User stayed quiet; model audio after listen reopens playback")
+        return True
 
     def _maybe_reforce_listen(self, now: float) -> None:
         """Re-chop model speech that talks over a user who is still speaking.
@@ -1019,6 +1068,7 @@ class RobotIO:
                 # discard everything until the model closes this turn with a
                 # listen or response.done boundary.
                 self._discard_turn_active = True
+                self._hold_post_listen = False
             else:
                 self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
             while True:

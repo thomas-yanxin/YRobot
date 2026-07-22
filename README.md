@@ -37,10 +37,17 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
   plus 6 dB — for a sustained 60 ms to become a barge-in candidate.
 - Verifies before destroying (duck-and-verify): a confirmed candidate only mutes the speaker while
   keeping the un-played tail. With the far end silent the echo path is dead, so sustained post-AEC
-  energy within the 350 ms window proves a real user and commits the flush + `force_listen`;
+  energy within the ~1 s window proves a real user and commits the flush + `force_listen`;
   silence proves echo residual, resumes the tail where it stopped, and raises the learned residual
   so the same level stops re-triggering. A false trigger costs a short dip, not the whole turn
-  (hardware logs 2026-07-22: a 0.4 dB overshoot used to discard 12 s of speech).
+  (hardware logs 2026-07-22: a 0.4 dB overshoot used to discard 12 s of speech). The verify settle
+  and the envelope lookback are calibrated against the shared GStreamer pipeline's reported
+  latency (min 286 ms, max 1.26 s): sampling earlier reads in-flight echo of the just-muted
+  speech, and a short lookback misses the loud frames actually in the air.
+- Caps the damage of any wrong interrupt: once a listen ack has passed, model audio arriving after
+  the user has stayed quiet for the yield hold ends the discard directly — without this the hold
+  only ends at the NEXT listen boundary, and one bad barge-in silently swallowed an entire 49 s
+  story turn.
 - Ships the user's real interrupting words immediately with the `force_listen` flag (the partial
   capture buffer is flushed at the moment of detection). Hardware testing showed a silent control
   slice makes the model hear nobody, resume its own story after the acknowledgement, and then stall

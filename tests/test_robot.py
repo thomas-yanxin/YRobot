@@ -261,6 +261,35 @@ def test_talk_over_audio_reforces_listen_without_redetection() -> None:
     assert robot._emit_partial_event.is_set()
 
 
+def test_post_listen_hold_ends_when_user_goes_quiet() -> None:
+    robot = RobotIO(object())
+    robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1")
+    with robot._state_lock:
+        robot._speaking_until = time.monotonic() + 2.0
+    assert robot._request_user_interrupt(-24.0, -30.0)
+    with robot._state_lock:
+        robot._last_user_speech_at = time.monotonic()
+    robot.handle_omni_listen("r2")
+    assert robot._discard_turn_active is True
+
+    # Model audio while the user still speaks stays discarded (re-force path).
+    robot._emit_partial_event.clear()
+    robot._force_requested_at = time.monotonic() - 1.5
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r3") is False
+
+    # Once the user has been quiet past the yield hold, the next delta is a
+    # fresh post-listen utterance: it must end the hold and play, without
+    # waiting for another listen boundary that a long turn may never send.
+    robot._force_listen_event.clear()
+    with robot._state_lock:
+        robot._last_user_speech_at = time.monotonic() - 2.0
+        robot._last_near_end_activity_at = time.monotonic() - 2.0
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r4") is True
+    assert robot._discard_turn_active is False
+    with robot._state_lock:
+        assert robot._interrupting is False
+
+
 def _pushable_mini(pushed: list[np.ndarray] | None = None):
     class Audio:
         def __init__(self) -> None:
