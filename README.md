@@ -32,8 +32,15 @@ MiniCPM-o 4.5. The app runs as a thin client on the CM4 and connects directly to
 - Selects XVF channel 0, matching the official conversation app instead of averaging both USB
   channels, and enables XVF's robust double-talk mode (`PP_DTSENSITIVE=10`).
 - Uses MiniCPM's natural `listen/speak` decision first. As a reliability fallback, DoA can never
-  interrupt alone: post-AEC speech must remain at least 6 dB above the learned far-end residual
-  for a sustained 120 ms before playback is cleared and `force_listen` is sent.
+  interrupt alone: post-AEC speech must rise above the expected far-end residual — predicted from
+  the known playout envelope plus a learned residual offset, never below the slow-learned floor
+  plus 6 dB — for a sustained 60 ms to become a barge-in candidate.
+- Verifies before destroying (duck-and-verify): a confirmed candidate only mutes the speaker while
+  keeping the un-played tail. With the far end silent the echo path is dead, so sustained post-AEC
+  energy within the 350 ms window proves a real user and commits the flush + `force_listen`;
+  silence proves echo residual, resumes the tail where it stopped, and raises the learned residual
+  so the same level stops re-triggering. A false trigger costs a short dip, not the whole turn
+  (hardware logs 2026-07-22: a 0.4 dB overshoot used to discard 12 s of speech).
 - Ships the user's real interrupting words immediately with the `force_listen` flag (the partial
   capture buffer is flushed at the moment of detection). Hardware testing showed a silent control
   slice makes the model hear nobody, resume its own story after the acknowledgement, and then stall
@@ -116,12 +123,15 @@ yrobot --tls-verify
 ```
 
 XVF3800 is responsible for suppressing far-end echo, and MiniCPM-o receives every post-AEC
-microphone slice while it is speaking. For reliable barge-in, the client learns the speaker-only
-residual during the first 400 ms of playback and requires sustained double-talk evidence before
-forcing `listen`. When MiniCPM confirms `listen`, the application and GStreamer queues are flushed.
-For an ordinary quiet end-of-turn, buffered sentence audio is allowed to drain so the answer is
-not cut off. Physical testing should still confirm the threshold against the robot's actual room,
-speaker volume, and user distance.
+microphone slice while it is speaking. For reliable barge-in, the client predicts the expected
+echo residual from the playout envelope it just pushed (plus a continuously learned residual
+offset) and treats sustained post-AEC energy above that prediction as a candidate. A candidate
+never destroys the turn directly: the speaker is muted with the un-played tail retained, and only
+speech that persists once the echo path is dead commits the flush and `force_listen`; otherwise
+playback resumes where it stopped. When MiniCPM confirms `listen`, the application and GStreamer
+queues are flushed. For an ordinary quiet end-of-turn, buffered sentence audio is allowed to drain
+so the answer is not cut off. Physical testing should still confirm the absolute speech floor
+(`INTERRUPT_MIN_LEVEL_DB`) against the robot's actual room, speaker volume, and user distance.
 
 YRobot sends `length_penalty=1.1` by default to reduce premature end-of-turn sampling. It can be
 tuned with `OMNI_LENGTH_PENALTY` in the supported backend range of 0.1–5.0.

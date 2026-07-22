@@ -261,6 +261,120 @@ def test_talk_over_audio_reforces_listen_without_redetection() -> None:
     assert robot._emit_partial_event.is_set()
 
 
+def _pushable_mini(pushed: list[np.ndarray] | None = None):
+    class Audio:
+        def __init__(self) -> None:
+            self.clear_count = 0
+
+        def clear_player(self) -> None:
+            self.clear_count += 1
+
+    class Media:
+        def __init__(self) -> None:
+            self.audio = Audio()
+
+        def push_audio_sample(self, frame: np.ndarray) -> None:
+            if pushed is not None:
+                pushed.append(np.asarray(frame, dtype=np.float32).copy())
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    return Mini()
+
+
+def test_double_talk_candidate_ducks_playback_without_discarding_turn() -> None:
+    robot = RobotIO(_pushable_mini())
+    status, _ = robot._push_playback_frame(0, np.full(6_400, 0.1, dtype=np.float32))
+    assert status == "pushed"
+
+    now = time.monotonic()
+    assert robot._begin_playback_hold(now)
+
+    # The device queue is cycled (by the worker) but the un-played tail is
+    # kept and the turn is not discarded: nothing destructive happened yet.
+    assert robot._player_duck_pending is True
+    assert robot._playback_resume_tail is not None
+    assert robot._playback_resume_tail.size > 0
+    with robot._state_lock:
+        assert robot._speaking_until <= now
+    assert not robot.force_listen_active()
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1") is True
+    # A push racing the duck reports "held" so the worker preserves the frame.
+    status, _ = robot._push_playback_frame(0, np.zeros(640, dtype=np.float32))
+    assert status == "held"
+
+
+def test_cancelled_verify_resumes_the_held_device_tail() -> None:
+    pushed: list[np.ndarray] = []
+    resumed = threading.Event()
+    target_size = [1 << 30]
+
+    mini = _pushable_mini(pushed)
+    push_frame = mini.media.push_audio_sample
+
+    def watched_push(frame: np.ndarray) -> None:
+        push_frame(frame)
+        if len(pushed) > 1 and sum(f.size for f in pushed[1:]) >= target_size[0]:
+            resumed.set()
+
+    mini.media.push_audio_sample = watched_push
+
+    robot = RobotIO(mini)
+    tail_audio = np.linspace(-0.5, 0.5, 6_400, dtype=np.float32)
+    status, _ = robot._push_playback_frame(0, tail_audio)
+    assert status == "pushed"
+
+    assert robot._begin_playback_hold(time.monotonic())
+    held_tail = robot._playback_resume_tail.copy()
+    target_size[0] = held_tail.size
+    robot._release_playback_hold(resume=True)
+
+    worker = threading.Thread(target=robot._playback_loop, name="yrobot-playback", daemon=True)
+    worker.start()
+    try:
+        assert resumed.wait(2.0)
+    finally:
+        robot._stop_event.set()
+        robot._playback_wakeup.set()
+        worker.join(timeout=1.0)
+
+    # The duck cycled the shared pipeline exactly once, and the resumed
+    # audio replays the un-played tail sample-for-sample, in order.
+    assert mini.media.audio.clear_count == 1
+    replayed = np.concatenate(pushed[1:])[: held_tail.size]
+    assert np.array_equal(replayed, held_tail)
+
+
+def test_confirmed_interrupt_during_hold_discards_turn_and_tail() -> None:
+    robot = RobotIO(_pushable_mini())
+    robot._push_playback_frame(0, np.full(6_400, 0.1, dtype=np.float32))
+    assert robot._begin_playback_hold(time.monotonic())
+
+    # _speaking_until was reset by the duck, but the held turn is still live
+    # and must remain interruptible.
+    assert robot._request_user_interrupt(-24.0, -38.0)
+
+    assert robot.force_listen_active()
+    assert robot._playback_hold_active is False
+    assert robot._playback_resume_tail is None
+    assert robot._discard_turn_active is True
+    assert robot.play_omni_audio(np.zeros(2_400, dtype=np.float32), "r1") is False
+
+
+def test_far_end_envelope_tracks_recent_playout_level() -> None:
+    robot = RobotIO(_pushable_mini())
+    assert robot._recent_far_end_db(time.monotonic()) == -120.0
+
+    robot._push_playback_frame(0, np.full(1_600, 0.5, dtype=np.float32))
+
+    level = robot._recent_far_end_db(time.monotonic())
+    assert level == pytest.approx(20.0 * math.log10(0.5), abs=0.5)
+    # Frames scheduled outside the lookback window stop contributing.
+    assert robot._recent_far_end_db(time.monotonic() + 10.0) == -120.0
+
+
 def test_playback_worker_owns_the_shared_pipeline_flush() -> None:
     cleared = threading.Event()
 

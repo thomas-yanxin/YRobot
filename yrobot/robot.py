@@ -103,11 +103,20 @@ UPLINK_AGC_TARGET_RMS = 0.12
 UPLINK_AGC_MAX_GAIN = 8.0
 UPLINK_AGC_SPEECH_FLOOR_RMS = 0.006
 UPLINK_AGC_SMOOTHING = 0.3
-# The arm delay is dead time in which the user cannot barge in; the XVF AEC
-# filters stay converged between utterances, so a short residual-floor learning
-# window suffices. Confirmation is a sustained-duration test on the 60 Hz
-# motion tick. The XVF "speech" flag is PRE-AEC — it stays high while the
-# robot's own speaker plays — so the post-AEC level test is the only gate.
+# Barge-in detection is two-staged. Stage one is the fast energy candidate:
+# arm delay, slow-rising residual floor and a sustained-duration test on the
+# 60 Hz motion tick. The XVF "speech" flag is PRE-AEC — it stays high while
+# the robot's own speaker plays — so post-AEC level tests are the only gate.
+# Stage one alone cannot be trusted: the AEC residual tracks the far-end
+# envelope within one syllable while the learned floor rises at only
+# ~9 dB/s, so a loud TTS passage after a quiet stretch pierces any static
+# margin (hardware logs 2026-07-22: a false trigger at 0.4 dB over threshold
+# discarded a whole 12 s turn). A confirmed candidate therefore only DUCKS:
+# the device queue is cleared but the un-played tail is retained. With the
+# speaker silent the echo path is dead, so stage two re-checks the post-AEC
+# level against the absolute speech floor; sustained energy commits the
+# destructive force-listen flush, silence resumes the held tail and the
+# user hears at most a short dip instead of losing the rest of the turn.
 INTERRUPT_ARM_DELAY = 0.10
 INTERRUPT_CONFIRM_SECONDS = 0.06
 INTERRUPT_COOLDOWN = 1.0
@@ -117,6 +126,31 @@ INTERRUPT_FLOOR_RISE_DB_PER_SAMPLE = 0.15
 INTERRUPT_ACTIVITY_HOLD = 1.25
 INTERRUPT_POST_LISTEN_GUARD = 0.4
 INTERRUPT_ACK_TIMEOUT = 3.0
+# Stage-two verification window: the settle time covers the pipeline
+# PAUSED→flush→PLAYING cycle plus the acoustic and capture path before mic
+# samples can be trusted as echo-free; evidence must then persist for the
+# usual confirmation time before the turn is destroyed. A false alarm bumps
+# the learned floor so the same residual level stops re-triggering.
+INTERRUPT_VERIFY_SECONDS = 0.35
+INTERRUPT_VERIFY_SETTLE = 0.15
+INTERRUPT_FALSE_TRIGGER_FLOOR_MARGIN = 1.0
+# The far-end signal is known exactly (we push every frame), so the expected
+# residual is predicted per-tick from the recent playout envelope instead of
+# only the slow floor: threshold >= playout level + learned residual offset
+# + the usual rise margin. The offset (residual-to-far-end ratio through
+# speaker, room and AEC) learns fast upward from echo-only frames and decays
+# slowly, and persists across utterances. The lookback absorbs unknown
+# playout-to-capture latency.
+FAR_END_ENVELOPE_WINDOW = 0.45
+FAR_END_ENVELOPE_KEEP = 2.0
+RESIDUAL_OFFSET_INIT_DB = -18.0
+RESIDUAL_OFFSET_RISE_DB = 0.5
+RESIDUAL_OFFSET_DECAY_DB = 0.01
+RESIDUAL_OFFSET_MIN_DB = -50.0
+# Rolling copy of frames already pushed to the device, kept so a duck can
+# stash the un-played tail for lossless resume. The device lead is capped by
+# the preroll (<= 0.5 s), so two seconds is comfortably enough.
+PUSHED_TAIL_KEEP_SECONDS = 2.0
 # After a forced listen the model often starts its next utterance one time
 # slice later, talking straight over the still-speaking user (hardware logs
 # 2026-07-21: every ack was followed ~1 s later by a resumed monologue and the
@@ -581,6 +615,18 @@ class RobotIO:
         self._suppress_playback_until = 0.0
         self._discard_turn_active = False
         self._player_clear_pending = False
+        # Duck-and-verify state (all under _playback_lock): while the hold is
+        # active the worker pushes nothing; the resume tail is the un-played
+        # device audio to re-inject if the candidate turns out to be echo.
+        self._playback_hold_active = False
+        self._player_duck_pending = False
+        self._playback_resume_tail: np.ndarray | None = None
+        self._pushed_tail = AudioSampleBuffer(
+            max_samples=round(PUSHED_TAIL_KEEP_SECONDS * INPUT_SAMPLE_RATE)
+        )
+        self._playback_levels: deque[tuple[float, float, float]] = deque(maxlen=256)
+        # Owned by the motion loop; persists across utterances.
+        self._residual_offset_db = RESIDUAL_OFFSET_INIT_DB
         self._force_listen_event = threading.Event()
         self._emit_partial_event = threading.Event()
         self._stop_event = threading.Event()
@@ -778,6 +824,11 @@ class RobotIO:
         with self._playback_lock:
             self._suppress_playback_until = 0.0
             self._discard_turn_active = False
+            self._playback_hold_active = False
+            self._player_duck_pending = False
+            self._playback_resume_tail = None
+            self._pushed_tail.clear()
+            self._playback_levels.clear()
         with self._state_lock:
             self._interrupting = False
         self.flush_audio_input()
@@ -866,11 +917,64 @@ class RobotIO:
         self._emit_partial_event.set()
         log.info("Model talked over the still-speaking user; re-forcing listen")
 
+    def _begin_playback_hold(self, now: float) -> bool:
+        """Silence the speaker without discarding the turn (duck stage).
+
+        Clearing the device queue kills the echo path within the pipeline
+        flush latency; the un-played tail is stashed so a false trigger
+        resumes exactly where the speech stopped instead of losing it.
+        """
+        with self._playback_lock:
+            if self._playback_hold_active or self._discard_turn_active:
+                return False
+            with self._state_lock:
+                pending_seconds = max(0.0, self._speaking_until - now)
+            if pending_seconds <= 0.0 and self._playback_chunks.empty():
+                return False
+            tail = self._pushed_tail.snapshot()
+            keep = min(tail.size, round(pending_seconds * INPUT_SAMPLE_RATE))
+            self._playback_resume_tail = tail[tail.size - keep :] if keep > 0 else None
+            self._playback_hold_active = True
+            self._player_duck_pending = True
+            with self._state_lock:
+                self._speaking_until = now
+                self._interrupt_armed_at = math.inf
+        self._playback_wakeup.set()
+        return True
+
+    def _release_playback_hold(self, *, resume: bool) -> None:
+        """End a duck; the worker re-injects the tail when ``resume`` is set."""
+        with self._playback_lock:
+            self._playback_hold_active = False
+            if not resume:
+                self._playback_resume_tail = None
+        self._playback_wakeup.set()
+
+    def _recent_far_end_db(self, now: float) -> float:
+        """Peak playout level of frames scheduled inside the lookback window."""
+        with self._playback_lock:
+            levels = self._playback_levels
+            while levels and levels[0][0] + levels[0][1] < now - FAR_END_ENVELOPE_KEEP:
+                levels.popleft()
+            loudest = -120.0
+            for start, duration, frame_db in levels:
+                if start > now:
+                    break
+                if start + duration >= now - FAR_END_ENVELOPE_WINDOW:
+                    loudest = max(loudest, frame_db)
+            return loudest
+
     def _request_user_interrupt(self, level_db: float, threshold_db: float) -> bool:
         """Flush current speech and hold force_listen until model acknowledgement."""
         now = time.monotonic()
         with self._state_lock:
-            active = now < self._speaking_until or not self._playback_chunks.empty()
+            active = (
+                now < self._speaking_until
+                or not self._playback_chunks.empty()
+                # A duck already reset _speaking_until; the held turn is
+                # still live and must be interruptible.
+                or self._playback_hold_active
+            )
             self._last_near_end_activity_at = now
         if not active or self._force_listen_event.is_set():
             return False
@@ -904,6 +1008,11 @@ class RobotIO:
         """Invalidate queued/appsrc audio without racing the playback worker."""
         with self._playback_lock:
             self._playback_generation += 1
+            self._playback_hold_active = False
+            self._player_duck_pending = False
+            self._playback_resume_tail = None
+            self._pushed_tail.clear()
+            self._playback_levels.clear()
             if suppress_until_listen:
                 # The backend streams a whole turn in bursts that can run 10+
                 # seconds ahead of playback, so a time window always leaks:
@@ -1059,6 +1168,7 @@ class RobotIO:
         resampler = StreamingAudioResampler()
         output = AudioSampleBuffer()
         generation: int | None = None
+        resume_generation = 0
         response_id = "unknown"
         first_push_pending = False
         startup_deadline = math.inf
@@ -1072,6 +1182,14 @@ class RobotIO:
             with self._playback_lock:
                 clear_pending = self._player_clear_pending
                 self._player_clear_pending = False
+                duck_pending = self._player_duck_pending
+                self._player_duck_pending = False
+                hold_active = self._playback_hold_active
+                resume_tail: np.ndarray | None = None
+                if not hold_active and self._playback_resume_tail is not None:
+                    resume_tail = self._playback_resume_tail
+                    self._playback_resume_tail = None
+                    resume_generation = self._playback_generation
             if clear_pending:
                 output.clear()
                 resampler.reset()
@@ -1082,6 +1200,19 @@ class RobotIO:
                 # Only this thread may cycle the shared pipeline; see
                 # _flush_playback_for_listen.
                 self._clear_player()
+            elif duck_pending:
+                # Duck: silence the device queue but keep the application
+                # FIFO, resampler state and generation — the turn may resume.
+                self._clear_player()
+            if resume_tail is not None and resume_tail.size > 0:
+                # The verify stage cleared the candidate: put the un-played
+                # device tail back in front of whatever arrived meanwhile.
+                held_samples = output.pop(len(output))
+                output.append(resume_tail)
+                if held_samples.size > 0:
+                    output.append(held_samples)
+                generation = resume_generation
+                first_push_pending = False
 
             while len(output) < PLAYBACK_BUFFER_HIGH_SAMPLES:
                 try:
@@ -1130,7 +1261,7 @@ class RobotIO:
                 round(target_ahead * INPUT_SAMPLE_RATE),
             )
 
-            if len(output) > 0 and generation is not None:
+            if len(output) > 0 and generation is not None and not hold_active:
                 if (
                     first_push_pending
                     and ahead_seconds <= 0.0
@@ -1148,12 +1279,23 @@ class RobotIO:
                     push_samples = target_samples if needs_initial_fill else PLAYBACK_FRAME_SAMPLES
                     frame = output.pop(push_samples)
                     try:
-                        pushed, push_ms = self._push_playback_frame(generation, frame)
+                        push_status, push_ms = self._push_playback_frame(generation, frame)
                     except Exception as exc:
                         log.warning("Speaker playback failed: %s", exc)
-                        pushed = False
+                        push_status = "stale"
                         push_ms = 0.0
-                    if not pushed:
+                    if push_status == "held":
+                        # A duck landed between the loop-top snapshot and this
+                        # push. The frame is un-played audio of the held turn:
+                        # append it to the resume tail instead of losing it.
+                        with self._playback_lock:
+                            tail = self._playback_resume_tail
+                            if tail is None or tail.size == 0:
+                                self._playback_resume_tail = frame.copy()
+                            else:
+                                self._playback_resume_tail = np.concatenate((tail, frame))
+                        continue
+                    if push_status != "pushed":
                         output.clear()
                         resampler.reset()
                         generation = None
@@ -1207,6 +1349,7 @@ class RobotIO:
                 and ahead_seconds <= 0.0
                 and model_expects_audio
                 and not starved
+                and not hold_active
             ):
                 starved = True
                 self._playback_underruns += 1
@@ -1222,29 +1365,41 @@ class RobotIO:
         self,
         generation: int,
         frame: np.ndarray,
-    ) -> tuple[bool, float]:
-        """Push one current-generation frame while serializing pipeline flushes."""
+    ) -> tuple[str, float]:
+        """Push one current-generation frame while serializing pipeline flushes.
+
+        Returns ``("pushed", push_ms)`` on success, ``("stale", 0)`` when the
+        frame belongs to an invalidated turn, and ``("held", 0)`` when a duck
+        landed after the caller popped the frame — the frame is still valid
+        turn audio and must be preserved for resume, not discarded.
+        """
         if frame.size == 0:
-            return False, 0.0
+            return "stale", 0.0
         with self._playback_lock:
             now = time.monotonic()
+            if self._playback_hold_active:
+                return "held", 0.0
             if (
                 generation != self._playback_generation
                 or now < self._suppress_playback_until
                 or self._discard_turn_active
                 or self._player_clear_pending
             ):
-                return False, 0.0
+                return "stale", 0.0
             push_started = time.perf_counter()
             self.mini.media.push_audio_sample(frame)
             push_ms = (time.perf_counter() - push_started) * 1_000
+            self._pushed_tail.append(frame)
             with self._state_lock:
                 if now >= self._speaking_until:
                     self._interrupt_armed_at = now + INTERRUPT_ARM_DELAY
                 start = max(now, self._speaking_until)
                 self._speaking_until = start + frame.size / INPUT_SAMPLE_RATE
                 self._model_state = "speaking"
-        return True, push_ms
+            self._playback_levels.append(
+                (start, frame.size / INPUT_SAMPLE_RATE, audio_level_db(frame))
+            )
+        return "pushed", push_ms
 
     def _put_latest(self, chunk: np.ndarray) -> None:
         try:
@@ -1277,6 +1432,10 @@ class RobotIO:
         interrupt_candidate_since: float | None = None
         interrupt_cooldown_until = 0.0
         far_end_floor_db: float | None = None
+        verify_started_at: float | None = None
+        verify_evidence_since: float | None = None
+        verify_trigger_level_db = -120.0
+        verify_far_end_db = -120.0
         started_at = time.monotonic()
         state_entered_at = started_at
         last_tick = started_at
@@ -1312,6 +1471,11 @@ class RobotIO:
             effective_state = effective_conversation_state(state, speaking)
             if interrupting:
                 effective_state = "interrupted"
+            elif verify_started_at is not None and self._playback_hold_active:
+                # A duck-and-verify window: the turn is still live, so keep
+                # the speaking posture instead of flickering to listening
+                # (re-entering "speaking" would also wipe the learned floor).
+                effective_state = "speaking"
 
             if effective_state != last_effective_state:
                 last_effective_state = effective_state
@@ -1337,7 +1501,67 @@ class RobotIO:
                 latest_doa = self._read_doa()
                 next_doa_read = max(next_doa_read + DOA_PERIOD, now + DOA_PERIOD)
             speech_detected = latest_doa is not None and latest_doa[1]
-            if speaking:
+            if verify_started_at is not None:
+                # Duck-and-verify stage two: the speaker was muted with the
+                # turn intact. Echo residual dies with the far end, so any
+                # sustained post-AEC energy now is genuinely the user.
+                if not self._playback_hold_active:
+                    # A listen boundary or session reset released the hold
+                    # underneath us; nothing left to verify.
+                    verify_started_at = None
+                    verify_evidence_since = None
+                elif now - verify_started_at >= INTERRUPT_VERIFY_SECONDS:
+                    # No speech once the speaker went quiet: the candidate was
+                    # our own echo. Resume the held tail and learn from it so
+                    # the same residual level stops re-triggering.
+                    far_end_floor_db = max(
+                        far_end_floor_db if far_end_floor_db is not None else -120.0,
+                        verify_trigger_level_db
+                        - INTERRUPT_MIN_RISE_DB
+                        + INTERRUPT_FALSE_TRIGGER_FLOOR_MARGIN,
+                    )
+                    if verify_far_end_db > -90.0:
+                        self._residual_offset_db = min(
+                            0.0,
+                            max(
+                                self._residual_offset_db,
+                                verify_trigger_level_db
+                                - verify_far_end_db
+                                + INTERRUPT_FALSE_TRIGGER_FLOOR_MARGIN,
+                            ),
+                        )
+                    interrupt_cooldown_until = now + INTERRUPT_COOLDOWN
+                    log.info(
+                        "Barge-in candidate at %.1f dBFS was echo residual "
+                        "(silent within %.0f ms of muting; far-end %.1f dBFS, "
+                        "residual offset now %.1f dB); resuming playback",
+                        verify_trigger_level_db,
+                        INTERRUPT_VERIFY_SECONDS * 1_000,
+                        verify_far_end_db,
+                        self._residual_offset_db,
+                    )
+                    self._release_playback_hold(resume=True)
+                    verify_started_at = None
+                    verify_evidence_since = None
+                elif now - verify_started_at >= INTERRUPT_VERIFY_SETTLE:
+                    if microphone_level_db >= INTERRUPT_MIN_LEVEL_DB:
+                        with self._state_lock:
+                            self._last_near_end_activity_at = now
+                        if verify_evidence_since is None:
+                            verify_evidence_since = now
+                        elif now - verify_evidence_since >= INTERRUPT_CONFIRM_SECONDS:
+                            if self._request_user_interrupt(
+                                microphone_level_db,
+                                INTERRUPT_MIN_LEVEL_DB,
+                            ):
+                                interrupt_cooldown_until = now + INTERRUPT_COOLDOWN
+                            else:
+                                self._release_playback_hold(resume=True)
+                            verify_started_at = None
+                            verify_evidence_since = None
+                    else:
+                        verify_evidence_since = None
+            elif speaking:
                 if now < interrupt_armed_at:
                     # Learn the current far-end residual during the startup
                     # guard instead of treating the first loud speaker frame
@@ -1356,6 +1580,15 @@ class RobotIO:
                     INTERRUPT_MIN_LEVEL_DB,
                     far_end_floor_db + INTERRUPT_MIN_RISE_DB,
                 )
+                far_end_recent_db = self._recent_far_end_db(now)
+                if far_end_recent_db > -90.0:
+                    # The slow floor cannot follow TTS dynamics (a syllable
+                    # swings faster than 9 dB/s); predict the residual from
+                    # the known playout envelope instead.
+                    interrupt_threshold_db = max(
+                        interrupt_threshold_db,
+                        far_end_recent_db + self._residual_offset_db + INTERRUPT_MIN_RISE_DB,
+                    )
                 near_end_candidate = (
                     now >= interrupt_armed_at
                     and now >= interrupt_cooldown_until
@@ -1367,7 +1600,21 @@ class RobotIO:
                     if interrupt_candidate_since is None:
                         interrupt_candidate_since = now
                     elif now - interrupt_candidate_since >= INTERRUPT_CONFIRM_SECONDS:
-                        if self._request_user_interrupt(
+                        if self._begin_playback_hold(now):
+                            verify_started_at = now
+                            verify_evidence_since = None
+                            verify_trigger_level_db = microphone_level_db
+                            verify_far_end_db = far_end_recent_db
+                            log.info(
+                                "Post-AEC double talk candidate at %.1f dBFS "
+                                "(threshold %.1f, floor %.1f, far-end %.1f); "
+                                "muting speaker to verify",
+                                microphone_level_db,
+                                interrupt_threshold_db,
+                                far_end_floor_db,
+                                far_end_recent_db,
+                            )
+                        elif self._request_user_interrupt(
                             microphone_level_db,
                             interrupt_threshold_db,
                         ):
@@ -1375,6 +1622,26 @@ class RobotIO:
                         interrupt_candidate_since = None
                 else:
                     interrupt_candidate_since = None
+                    if now >= interrupt_armed_at and far_end_recent_db > -90.0:
+                        # Echo-only frame: learn the residual-to-far-end ratio
+                        # (fast up, slow down; persists across utterances).
+                        observed = microphone_level_db - far_end_recent_db
+                        if observed > self._residual_offset_db:
+                            self._residual_offset_db = min(
+                                0.0,
+                                min(
+                                    observed,
+                                    self._residual_offset_db + RESIDUAL_OFFSET_RISE_DB,
+                                ),
+                            )
+                        else:
+                            self._residual_offset_db = max(
+                                RESIDUAL_OFFSET_MIN_DB,
+                                max(
+                                    observed,
+                                    self._residual_offset_db - RESIDUAL_OFFSET_DECAY_DB,
+                                ),
+                            )
             else:
                 far_end_floor_db = None
                 interrupt_candidate_since = None
