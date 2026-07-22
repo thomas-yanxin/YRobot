@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import math
 import queue
@@ -12,6 +13,11 @@ from collections.abc import Mapping
 from contextlib import suppress
 
 import numpy as np
+
+try:
+    from PIL import Image
+except ImportError:  # Pillow is optional; frames then upload at native size.
+    Image = None
 from reachy_mini.utils import create_head_pose
 from reachy_mini.utils.interpolation import (
     compose_world_offset,
@@ -54,6 +60,18 @@ MOTION_CONNECTION_GRACE = 2.5
 MOTION_ERROR_LOG_INTERVAL = 5.0
 DOA_PERIOD = 0.05
 CAMERA_PERIOD = 1.0
+# The Omni server never pads the uplink: each one-second input chunk drives
+# exactly one prefill/decode step, so a stalled microphone freezes the model's
+# slice clock (and its sense of elapsed time) until hardware audio returns.
+# After one chunk length without samples the capture loop substitutes silent
+# chunks to keep the session advancing in real time.
+CAPTURE_STALL_TIMEOUT = CHUNK_SAMPLES / INPUT_SAMPLE_RATE
+# MiniCPM's vision front-end rescales every frame to 448 px on its long side
+# (max_slice_nums=1), so a camera-native JPEG only spends Wi-Fi bandwidth and
+# send time on pixels the server immediately throws away. Frames are shrunk on
+# the CM4 before upload; quality 70 matches the official web demo client.
+VIDEO_MAX_DIMENSION = 448
+VIDEO_JPEG_QUALITY = 70
 # Reachy's GStreamer player reanchors its clock after a 200 ms input gap, and
 # TTS arrives as one-second time slices whose boundaries carry real jitter.
 # An utterance therefore starts behind an adaptive jitter buffer: an observed
@@ -136,6 +154,37 @@ def audio_level_db(samples: np.ndarray) -> float:
         return -120.0
     rms = math.sqrt(float(np.dot(audio, audio)) / audio.size)
     return 20.0 * math.log10(max(rms, 1e-6))
+
+
+def downscale_jpeg(
+    frame: bytes,
+    max_dimension: int = VIDEO_MAX_DIMENSION,
+    quality: int = VIDEO_JPEG_QUALITY,
+) -> bytes:
+    """Return the JPEG shrunk so its long side fits ``max_dimension`` pixels.
+
+    Pillow's draft mode performs most of the reduction inside the JPEG decoder,
+    keeping the per-frame cost small on the CM4. Any failure — Pillow missing,
+    an unparseable frame — returns the original bytes unchanged.
+    """
+    if Image is None:
+        return frame
+    try:
+        with Image.open(io.BytesIO(frame)) as image:
+            width, height = image.size
+            longest = max(width, height)
+            if longest <= max_dimension:
+                return frame
+            scale = max_dimension / longest
+            target = (max(1, round(width * scale)), max(1, round(height * scale)))
+            image.draft("RGB", target)
+            resized = image.convert("RGB").resize(target, Image.BILINEAR)
+        buffer = io.BytesIO()
+        resized.save(buffer, format="JPEG", quality=quality)
+        return buffer.getvalue()
+    except Exception as exc:
+        log.debug("Frame downscale failed; sending the original frame: %s", exc)
+        return frame
 
 
 class UplinkAGC:
@@ -458,6 +507,8 @@ class RobotIO:
         self._capture_thread = threading.Thread(
             target=self._capture_loop, name="yrobot-audio", daemon=True
         )
+        if self._capture_video and Image is None:
+            log.warning("Pillow is unavailable; camera frames upload at native resolution")
         if self._capture_video:
             self._camera_thread = threading.Thread(
                 target=self._camera_loop, name="yrobot-camera", daemon=True
@@ -723,12 +774,21 @@ class RobotIO:
         agc = UplinkAGC()
         pending = np.empty(CHUNK_SAMPLES, dtype=np.float32)
         pending_size = 0
+        last_capture_at = time.monotonic()
+        stalled = False
         while not self._stop_event.is_set():
             try:
                 sample = self.mini.media.get_audio_sample()
                 if sample is None:
+                    pending_size, last_capture_at, stalled = self._pad_capture_stall(
+                        agc, pending, pending_size, last_capture_at, stalled
+                    )
                     self._stop_event.wait(0.01)
                     continue
+                if stalled:
+                    stalled = False
+                    log.info("Microphone capture resumed; silence padding stopped")
+                last_capture_at = time.monotonic()
                 mono = to_mono(sample)
                 # The double-talk detector reads the raw post-AEC level; only
                 # the uploaded slice gets the AGC lift. Its estimate adapts
@@ -759,7 +819,43 @@ class RobotIO:
                     pending_size = 0
             except Exception as exc:
                 log.warning("Microphone read failed: %s", exc)
+                pending_size, last_capture_at, stalled = self._pad_capture_stall(
+                    agc, pending, pending_size, last_capture_at, stalled
+                )
                 self._stop_event.wait(1.0)
+
+    def _pad_capture_stall(
+        self,
+        agc: UplinkAGC,
+        pending: np.ndarray,
+        pending_size: int,
+        last_capture_at: float,
+        stalled: bool,
+    ) -> tuple[int, float, bool]:
+        """Substitute one silent chunk per chunk length while the mic is dead.
+
+        The server drives one prefill/decode step per uplink chunk and never
+        pads missing audio itself, so without this the whole conversation
+        freezes (and the model's sense of time drifts) whenever the microphone
+        stops delivering.
+        """
+        now = time.monotonic()
+        if now - last_capture_at < CAPTURE_STALL_TIMEOUT:
+            return pending_size, last_capture_at, stalled
+        if not stalled:
+            log.warning(
+                "Microphone stalled for %.1f s; sending silence to keep the "
+                "Omni slice clock alive",
+                now - last_capture_at,
+            )
+        if pending_size > 0:
+            # Finish the interrupted slice with silence so speech already
+            # captured keeps its place on the timeline.
+            pending[pending_size:] = 0.0
+            self._put_latest(agc.process(pending.copy(), adapt=False))
+        else:
+            self._put_latest(np.zeros(CHUNK_SAMPLES, dtype=np.float32))
+        return 0, now, True
 
     def _camera_loop(self) -> None:
         """Encode stills off the audio sender and expose only the latest frame."""
@@ -768,6 +864,7 @@ class RobotIO:
             try:
                 frame = self.mini.media.get_frame_jpeg()
                 if frame:
+                    frame = downscale_jpeg(frame)
                     with self._camera_lock:
                         self._latest_frame_jpeg = frame
             except Exception as exc:
