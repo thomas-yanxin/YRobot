@@ -1,3 +1,4 @@
+import io
 import logging
 import math
 import threading
@@ -8,6 +9,7 @@ import pytest
 from reachy_mini.utils.interpolation import delta_angle_between_mat_rot
 from scipy.spatial.transform import Rotation
 
+from yrobot import robot as robot_module
 from yrobot.config import CHUNK_SAMPLES
 from yrobot.robot import (
     ANTENNA_POSES,
@@ -25,6 +27,7 @@ from yrobot.robot import (
     UplinkAGC,
     angular_distance,
     doa_world_direction,
+    downscale_jpeg,
     effective_conversation_state,
     gesture_pulse,
     lifelike_motion_overlay,
@@ -592,7 +595,12 @@ def test_camera_jpeg_is_cached_off_the_sender_path() -> None:
     worker.start()
     try:
         assert captured.wait(1.0)
-        assert robot.get_frame_jpeg() == b"latest-jpeg"
+        deadline = time.monotonic() + 1.0
+        frame = robot.get_frame_jpeg()
+        while frame is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            frame = robot.get_frame_jpeg()
+        assert frame == b"latest-jpeg"
     finally:
         robot._stop_event.set()
         worker.join(timeout=1.0)
@@ -632,3 +640,144 @@ def test_brief_sdk_liveness_miss_is_retried_without_warning(
 
     assert mini.command_count >= 4
     assert "Motion command failed" not in caplog.text
+
+
+def test_stalled_microphone_substitutes_silent_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(robot_module, "CAPTURE_STALL_TIMEOUT", 0.05)
+
+    class Media:
+        def get_audio_sample(self) -> None:
+            return None
+
+    class Mini:
+        media = Media()
+
+    robot = RobotIO(Mini())
+    worker = threading.Thread(target=robot._capture_loop, daemon=True)
+    worker.start()
+    try:
+        chunk = robot.next_audio_chunk(1.0)
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
+
+    assert chunk is not None
+    assert chunk.size == CHUNK_SAMPLES
+    assert not chunk.any()
+
+
+def test_capture_stall_pads_the_partial_slice_with_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(robot_module, "CAPTURE_STALL_TIMEOUT", 0.05)
+    speech = np.full(1_000, 0.25, dtype=np.float32)
+    samples = [speech]
+
+    class Media:
+        def get_audio_sample(self) -> np.ndarray | None:
+            return samples.pop() if samples else None
+
+    class Mini:
+        media = Media()
+
+    robot = RobotIO(Mini())
+    worker = threading.Thread(target=robot._capture_loop, daemon=True)
+    worker.start()
+    try:
+        chunk = robot.next_audio_chunk(1.0)
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
+
+    assert chunk is not None
+    assert chunk.size == CHUNK_SAMPLES
+    np.testing.assert_array_equal(chunk[: speech.size], speech)
+    assert not chunk[speech.size :].any()
+
+
+def test_microphone_failure_keeps_the_slice_clock_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(robot_module, "CAPTURE_STALL_TIMEOUT", 0.05)
+
+    class Media:
+        def get_audio_sample(self) -> np.ndarray:
+            raise RuntimeError("usb reset")
+
+    class Mini:
+        media = Media()
+
+    robot = RobotIO(Mini())
+    worker = threading.Thread(target=robot._capture_loop, daemon=True)
+    worker.start()
+    try:
+        # The failure path retries at a one-second cadence before padding.
+        chunk = robot.next_audio_chunk(2.5)
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=2.0)
+
+    assert chunk is not None
+    assert not chunk.any()
+
+
+def test_camera_frames_are_downscaled_to_the_server_vision_size() -> None:
+    pil_image = pytest.importorskip("PIL.Image")
+    buffer = io.BytesIO()
+    pil_image.new("RGB", (1280, 720), (90, 120, 40)).save(buffer, format="JPEG")
+    original = buffer.getvalue()
+
+    shrunk = downscale_jpeg(original)
+
+    with pil_image.open(io.BytesIO(shrunk)) as image:
+        assert image.size == (448, 252)
+    assert len(shrunk) < len(original)
+
+
+def test_small_camera_frames_pass_through_unchanged() -> None:
+    pil_image = pytest.importorskip("PIL.Image")
+    buffer = io.BytesIO()
+    pil_image.new("RGB", (320, 240)).save(buffer, format="JPEG")
+    original = buffer.getvalue()
+
+    assert downscale_jpeg(original) is original
+
+
+def test_unparseable_camera_frame_is_sent_unchanged() -> None:
+    assert downscale_jpeg(b"not-a-jpeg") == b"not-a-jpeg"
+
+
+def test_camera_loop_caches_downscaled_frames() -> None:
+    pil_image = pytest.importorskip("PIL.Image")
+    buffer = io.BytesIO()
+    pil_image.new("RGB", (1280, 720)).save(buffer, format="JPEG")
+    native_frame = buffer.getvalue()
+    captured = threading.Event()
+
+    class Media:
+        def get_frame_jpeg(self) -> bytes:
+            captured.set()
+            return native_frame
+
+    class Mini:
+        media = Media()
+
+    robot = RobotIO(Mini())
+    worker = threading.Thread(target=robot._camera_loop, daemon=True)
+    worker.start()
+    try:
+        assert captured.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        frame = robot.get_frame_jpeg()
+        while frame is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            frame = robot.get_frame_jpeg()
+    finally:
+        robot._stop_event.set()
+        worker.join(timeout=1.0)
+
+    assert frame is not None
+    with pil_image.open(io.BytesIO(frame)) as image:
+        assert max(image.size) == 448
