@@ -9,6 +9,7 @@ import queue
 import random
 import threading
 import time
+from collections import deque
 from collections.abc import Mapping
 from contextlib import suppress
 
@@ -35,6 +36,7 @@ ANTENNA_POSES: Mapping[str, tuple[float, float]] = {
     "idle": (-11.0, 11.0),
     "listening": (-16.0, 16.0),
     "speaking": (-20.0, 20.0),
+    "interrupted": (-14.0, 14.0),
 }
 
 # Reachy conversation-app tuning plus the XVF robust double-talk mode needed
@@ -53,9 +55,10 @@ AUDIO_STARTUP_CONFIG = (
 )
 AUDIO_CONFIG_SETTLE_SECONDS = 0.1
 
-# The official conversation app uses a 60 Hz single-owner motion loop. 50 Hz
-# keeps the same smooth-control regime while leaving a little more CM4 margin.
-MOTION_PERIOD = 0.02
+# Keep one application-level motion owner at the same cadence as the official
+# conversation app. The loop measures elapsed time, so a loaded CM4 degrades
+# gracefully without making movements run faster after a missed tick.
+MOTION_PERIOD = 1.0 / 60.0
 MOTION_CONNECTION_GRACE = 2.5
 MOTION_ERROR_LOG_INTERVAL = 5.0
 DOA_PERIOD = 0.05
@@ -84,22 +87,29 @@ PLAYBACK_PREROLL_MIN = 0.2
 PLAYBACK_PREROLL_MAX = 0.5
 PLAYBACK_PREROLL_MARGIN = 0.1
 PLAYBACK_PREROLL_DECAY = 0.02
+PLAYBACK_FRAME_SECONDS = 0.04
+PLAYBACK_FRAME_SAMPLES = round(PLAYBACK_FRAME_SECONDS * INPUT_SAMPLE_RATE)
+PLAYBACK_BUFFER_HIGH_SECONDS = 1.5
+PLAYBACK_BUFFER_HIGH_SAMPLES = round(PLAYBACK_BUFFER_HIGH_SECONDS * INPUT_SAMPLE_RATE)
+PLAYBACK_QUEUE_MAX_CHUNKS = 24
+PLAYBACK_QUEUE_ITEM_SECONDS = 1.0
+PLAYBACK_QUEUE_ITEM_SAMPLES = round(PLAYBACK_QUEUE_ITEM_SECONDS * OUTPUT_SAMPLE_RATE)
+PLAYBACK_UNDERRUN_LOG_INTERVAL = 5.0
 # Uplink AGC: hardware testing with MiniCPM-o showed the model treats quiet
-# near-end speech as background and never answers, so uploaded slices are
-# lifted toward a fixed speech level. Adaptation freezes while the robot is
-# speaking so residual echo cannot pull the estimate down, and the gain never
-# attenuates.
+# near-end speech as background and never answers, so confirmed near-end
+# slices are lifted toward a fixed speech level. It is fully bypassed while
+# the robot is speaking so residual AEC echo is never multiplied.
 UPLINK_AGC_TARGET_RMS = 0.12
 UPLINK_AGC_MAX_GAIN = 8.0
 UPLINK_AGC_SPEECH_FLOOR_RMS = 0.006
 UPLINK_AGC_SMOOTHING = 0.3
 # The arm delay is dead time in which the user cannot barge in; the XVF AEC
-# filters stay converged between utterances, so 0.4 s of residual-floor
-# learning suffices. Confirmation is a sustained-duration test on the 20 ms
+# filters stay converged between utterances, so a short residual-floor learning
+# window suffices. Confirmation is a sustained-duration test on the 60 Hz
 # motion tick. The XVF "speech" flag is PRE-AEC — it stays high while the
 # robot's own speaker plays — so the post-AEC level test is the only gate.
-INTERRUPT_ARM_DELAY = 0.4
-INTERRUPT_CONFIRM_SECONDS = 0.12
+INTERRUPT_ARM_DELAY = 0.10
+INTERRUPT_CONFIRM_SECONDS = 0.06
 INTERRUPT_COOLDOWN = 1.0
 INTERRUPT_MIN_LEVEL_DB = -38.0
 INTERRUPT_MIN_RISE_DB = 6.0
@@ -118,11 +128,14 @@ INTERRUPT_ACK_TIMEOUT = 3.0
 INTERRUPT_YIELD_HOLD = 0.7
 INTERRUPT_REFORCE_INTERVAL = 1.0
 INTERRUPT_YIELD_MAX = 12.0
+INTERRUPT_PREROLL_SECONDS = 0.35
+INTERRUPT_PREROLL_SAMPLES = round(INTERRUPT_PREROLL_SECONDS * INPUT_SAMPLE_RATE)
 MAX_HEAD_ANGULAR_STEP = math.radians(2.0)
 MAX_HEAD_TRANSLATION_STEP = 0.003
 MAX_HEAD_ANGULAR_SPEED = math.radians(45.0)
 MAX_HEAD_TRANSLATION_SPEED = 0.04
 MAX_ANTENNA_SPEED = math.radians(100.0)
+MAX_BODY_YAW_SPEED = math.radians(12.0)
 HEAD_SERVO_TIME_CONSTANT = 0.22
 USER_SPEECH_HOLD = 0.25
 DOA_TURN_THRESHOLD = math.radians(4.0)
@@ -187,6 +200,61 @@ def downscale_jpeg(
         return frame
 
 
+class AudioSampleBuffer:
+    """Small single-owner FIFO used for paced playback and microphone pre-roll."""
+
+    def __init__(self, max_samples: int | None = None) -> None:
+        if max_samples is not None and max_samples <= 0:
+            raise ValueError("max_samples must be positive")
+        self._chunks: deque[np.ndarray] = deque()
+        self._samples = 0
+        self._max_samples = max_samples
+
+    def __len__(self) -> int:
+        return self._samples
+
+    def append(self, samples: np.ndarray) -> None:
+        audio = np.asarray(samples, dtype=np.float32)
+        if audio.ndim != 1:
+            raise ValueError("buffered audio must be mono")
+        if audio.size == 0:
+            return
+        self._chunks.append(audio.copy())
+        self._samples += audio.size
+        if self._max_samples is not None and self._samples > self._max_samples:
+            self.pop(self._samples - self._max_samples)
+
+    def pop(self, max_samples: int) -> np.ndarray:
+        if max_samples <= 0 or self._samples == 0:
+            return np.empty(0, dtype=np.float32)
+        remaining = min(max_samples, self._samples)
+        parts: list[np.ndarray] = []
+        while remaining > 0:
+            chunk = self._chunks[0]
+            taken = min(remaining, chunk.size)
+            parts.append(chunk[:taken])
+            if taken == chunk.size:
+                self._chunks.popleft()
+            else:
+                self._chunks[0] = chunk[taken:]
+            self._samples -= taken
+            remaining -= taken
+        if len(parts) == 1:
+            return parts[0].copy()
+        return np.concatenate(parts)
+
+    def snapshot(self) -> np.ndarray:
+        if not self._chunks:
+            return np.empty(0, dtype=np.float32)
+        if len(self._chunks) == 1:
+            return self._chunks[0].copy()
+        return np.concatenate(tuple(self._chunks))
+
+    def clear(self) -> None:
+        self._chunks.clear()
+        self._samples = 0
+
+
 class UplinkAGC:
     """Lift quiet near-end speech toward the level MiniCPM answers reliably.
 
@@ -200,6 +268,11 @@ class UplinkAGC:
     def process(self, chunk: np.ndarray, *, adapt: bool = True) -> np.ndarray:
         if chunk.size == 0:
             return chunk
+        # During far-end playback ``adapt=False`` is also a hard bypass. Merely
+        # freezing the estimate still applies its old gain to residual echo,
+        # which can turn a small AEC remainder into apparent near-end speech.
+        if not adapt:
+            return np.asarray(chunk, dtype=np.float32).copy()
         rms = math.sqrt(float(np.dot(chunk, chunk)) / chunk.size)
         if adapt and rms > UPLINK_AGC_SPEECH_FLOOR_RMS:
             self._speech_rms = (
@@ -380,6 +453,8 @@ def lifelike_motion_overlay(
     glance_pulse: float = 0.0,
     glance_yaw_degrees: float = 0.0,
     glance_pitch_degrees: float = 0.0,
+    emphasis_pulse: float = 0.0,
+    emphasis_yaw_degrees: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build a restrained additive head pose and non-repeating antenna pose.
 
@@ -393,9 +468,24 @@ def lifelike_motion_overlay(
 
     # Slow mixed-frequency motion avoids a perfectly periodic "screensaver"
     # look. Speech uses less base motion because the SDK wobbler is additive.
-    z_amplitude = {"idle": 0.0018, "listening": 0.0011, "speaking": 0.0005}[state]
-    roll_amplitude = {"idle": 0.45, "listening": 0.28, "speaking": 0.15}[state]
-    pitch_amplitude = {"idle": 0.28, "listening": 0.18, "speaking": 0.10}[state]
+    z_amplitude = {
+        "idle": 0.0026,
+        "listening": 0.0013,
+        "speaking": 0.0007,
+        "interrupted": 0.0004,
+    }[state]
+    roll_amplitude = {
+        "idle": 0.55,
+        "listening": 0.32,
+        "speaking": 0.18,
+        "interrupted": 0.12,
+    }[state]
+    pitch_amplitude = {
+        "idle": 0.34,
+        "listening": 0.20,
+        "speaking": 0.12,
+        "interrupted": 0.08,
+    }[state]
     z = z_amplitude * (
         0.72 * math.sin(2.0 * math.pi * 0.11 * t) + 0.28 * math.sin(2.0 * math.pi * 0.073 * t + 1.1)
     )
@@ -406,6 +496,13 @@ def lifelike_motion_overlay(
     if state == "speaking":
         pitch -= math.radians(1.1) * transition_pulse
         z += 0.0007 * transition_pulse
+        yaw += math.radians(emphasis_yaw_degrees) * emphasis_pulse
+        pitch -= math.radians(1.2) * emphasis_pulse
+    elif state == "interrupted":
+        # Hold a small lean-in while yielding the floor instead of snapping
+        # back to the neutral listening pose at the moment audio is cut.
+        pitch += math.radians(2.0)
+        z += 0.0012
     pitch += math.radians(1.8) * nod_pulse
     yaw += math.radians(glance_yaw_degrees) * glance_pulse
     pitch += math.radians(glance_pitch_degrees) * glance_pulse
@@ -423,7 +520,12 @@ def lifelike_motion_overlay(
         # The antenna motors sit next to the microphones and speech is the only
         # window where the local double-talk detector runs, so speaking sways
         # stay smaller than the idle animation.
-        sway_amplitude = {"idle": 2.4, "listening": 1.3, "speaking": 0.9}[state]
+        sway_amplitude = {
+            "idle": 3.2,
+            "listening": 1.5,
+            "speaking": 1.0,
+            "interrupted": 0.0,
+        }[state]
         symmetric_sway = math.radians(sway_amplitude) * (
             0.65 * math.sin(2.0 * math.pi * 0.19 * t + 0.2)
             + 0.35 * math.sin(2.0 * math.pi * 0.31 * t + 2.0)
@@ -435,6 +537,17 @@ def lifelike_motion_overlay(
     if state == "speaking":
         antennas = antennas + np.deg2rad([-2.0, 2.0]) * transition_pulse
     return head_offset, antennas
+
+
+def lifelike_body_yaw(elapsed: float, state: str, *, user_speaking: bool) -> float:
+    """Return subtle whole-body follow-through without moving under user speech."""
+    if state not in ANTENNA_POSES:
+        raise ValueError(f"unknown conversation state: {state}")
+    if user_speaking or state == "interrupted":
+        return 0.0
+    amplitude = {"idle": 1.4, "listening": 0.7, "speaking": 0.8}[state]
+    frequency = {"idle": 0.045, "listening": 0.055, "speaking": 0.09}[state]
+    return math.radians(amplitude) * math.sin(2.0 * math.pi * frequency * max(0.0, elapsed))
 
 
 class RobotIO:
@@ -453,11 +566,15 @@ class RobotIO:
         self._capture_video = capture_video
         self._playback_preroll = playback_preroll
         self._audio_chunks: queue.Queue[np.ndarray] = queue.Queue(maxsize=2)
+        self._interrupt_audio_chunks: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
         # Keep network reception independent from GStreamer.  TTS callbacks can
         # arrive in bursts; pushing them from the WebSocket receive loop makes
         # that loop stop reading while the audio backend catches up.
-        self._playback_chunks: queue.Queue[tuple[int, str, np.ndarray, bool]] = queue.Queue()
+        self._playback_chunks: queue.Queue[tuple[int, str, np.ndarray, bool]] = queue.Queue(
+            maxsize=PLAYBACK_QUEUE_MAX_CHUNKS
+        )
         self._playback_lock = threading.Lock()
+        self._playback_wakeup = threading.Event()
         self._camera_lock = threading.Lock()
         self._latest_frame_jpeg: bytes | None = None
         self._playback_generation = 0
@@ -473,6 +590,7 @@ class RobotIO:
         self._motion_thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
         self._model_state = "idle"
+        self._interrupting = False
         self._speaking_until = 0.0
         self._interrupt_armed_at = math.inf
         self._last_near_end_activity_at = -math.inf
@@ -481,6 +599,9 @@ class RobotIO:
         self._interrupt_hold_started_at = -math.inf
         self._microphone_level_db = -120.0
         self._dropped_audio_chunks = 0
+        self._dropped_playback_chunks = 0
+        self._playback_underruns = 0
+        self._last_playback_underrun_log = -math.inf
         self._last_audio_drop_log = 0.0
         self._recording = False
         self._playing = False
@@ -490,6 +611,8 @@ class RobotIO:
         self._target_head = self._command_head.copy()
         self._command_antennas = np.deg2rad(ANTENNA_POSES["idle"])
         self._target_antennas = self._command_antennas.copy()
+        self._command_body_yaw = 0.0
+        self._target_body_yaw = 0.0
 
     def start(self) -> None:
         self.mini.enable_motors()
@@ -528,6 +651,7 @@ class RobotIO:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._playback_wakeup.set()
         for thread in (
             self._capture_thread,
             self._camera_thread,
@@ -560,18 +684,31 @@ class RobotIO:
         log.info("Reachy media and motion stopped")
 
     def next_audio_chunk(self, timeout: float) -> np.ndarray | None:
-        """Return one real post-XVF microphone slice, including during playback."""
-        try:
-            return self._audio_chunks.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
-    def flush_audio_input(self) -> None:
+        """Return interruption pre-roll before normal post-XVF microphone slices."""
+        deadline = time.monotonic() + max(0.0, timeout)
         while True:
             try:
-                self._audio_chunks.get_nowait()
+                return self._interrupt_audio_chunks.get_nowait()
             except queue.Empty:
-                return
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            try:
+                # A short poll lets an interrupt pre-roll overtake stale normal
+                # input without adding meaningful latency to the one-second
+                # uplink cadence.
+                return self._audio_chunks.get(timeout=min(0.02, remaining))
+            except queue.Empty:
+                continue
+
+    def flush_audio_input(self) -> None:
+        for audio_queue in (self._interrupt_audio_chunks, self._audio_chunks):
+            while True:
+                try:
+                    audio_queue.get_nowait()
+                except queue.Empty:
+                    break
 
     def get_frame_jpeg(self) -> bytes | None:
         """Return the latest asynchronously encoded frame without blocking audio send."""
@@ -599,10 +736,27 @@ class RobotIO:
             # and earns the start-of-utterance preroll.
             with self._state_lock:
                 starts_response = self._model_state != "speaking"
-            self._playback_chunks.put(
-                (self._playback_generation, response_id, audio.copy(), starts_response)
-            )
-        return True
+            accepted = False
+            for offset in range(0, audio.size, PLAYBACK_QUEUE_ITEM_SAMPLES):
+                item = (
+                    self._playback_generation,
+                    response_id,
+                    audio[offset : offset + PLAYBACK_QUEUE_ITEM_SAMPLES].copy(),
+                    starts_response and offset == 0,
+                )
+                try:
+                    self._playback_chunks.put_nowait(item)
+                except queue.Full:
+                    self._dropped_playback_chunks += 1
+                    log.warning(
+                        "Playback queue full; dropped %d current-turn chunk(s)",
+                        self._dropped_playback_chunks,
+                    )
+                    break
+                accepted = True
+        if accepted:
+            self._playback_wakeup.set()
+        return accepted
 
     def force_listen_active(self) -> bool:
         """Tell MiniCPM to stop speaking after high-confidence double talk."""
@@ -624,6 +778,9 @@ class RobotIO:
         with self._playback_lock:
             self._suppress_playback_until = 0.0
             self._discard_turn_active = False
+        with self._state_lock:
+            self._interrupting = False
+        self.flush_audio_input()
 
     def note_tts_supply_gap(self, gap_seconds: float) -> None:
         """Grow the playback preroll to cover an observed TTS delivery stall."""
@@ -666,6 +823,8 @@ class RobotIO:
                     return
                 self._discard_turn_active = False
                 self._suppress_playback_until = now + INTERRUPT_POST_LISTEN_GUARD
+                with self._state_lock:
+                    self._interrupting = False
 
         if active and (forced or recent_near_end):
             self._flush_playback_for_listen(now)
@@ -676,6 +835,7 @@ class RobotIO:
         else:
             with self._state_lock:
                 self._model_state = "listening"
+                self._interrupting = False
 
         if forced or recent_near_end:
             with self._playback_lock:
@@ -718,6 +878,11 @@ class RobotIO:
         self._force_requested_at = now
         self._interrupt_hold_started_at = now
         self._force_listen_event.set()
+        with self._state_lock:
+            self._interrupting = True
+        # The interruption pre-roll must be the sender's next slice. Any full
+        # normal slice still waiting here predates the confirmed barge-in.
+        self.flush_audio_input()
         # Ship the user's words already sitting in the capture buffer right
         # away so the model hears WHO interrupted it in the same forced slice
         # instead of a second of silence (which made it resume its own story).
@@ -763,6 +928,7 @@ class RobotIO:
             # thread but the sole pusher can wedge the pipeline for good, so the
             # playback worker executes it.
             self._player_clear_pending = True
+        self._playback_wakeup.set()
 
     def set_conversation_state(self, state: str) -> None:
         if state not in ANTENNA_POSES:
@@ -776,6 +942,7 @@ class RobotIO:
         pending_size = 0
         last_capture_at = time.monotonic()
         stalled = False
+        interrupt_preroll = AudioSampleBuffer(max_samples=INTERRUPT_PREROLL_SAMPLES)
         while not self._stop_event.is_set():
             try:
                 sample = self.mini.media.get_audio_sample()
@@ -790,6 +957,7 @@ class RobotIO:
                     log.info("Microphone capture resumed; silence padding stopped")
                 last_capture_at = time.monotonic()
                 mono = to_mono(sample)
+                interrupt_preroll.append(mono)
                 # The double-talk detector reads the raw post-AEC level; only
                 # the uploaded slice gets the AGC lift. Its estimate adapts
                 # only on frames DoA recently attributed to the user, so
@@ -807,15 +975,19 @@ class RobotIO:
                     pending_size += copied
                     offset += copied
                     if pending_size == CHUNK_SAMPLES:
+                        allow_software_gain = user_recent and not speaking
                         self._put_latest(
-                            agc.process(pending.copy(), adapt=user_recent and not speaking)
+                            agc.process(pending.copy(), adapt=allow_software_gain)
                         )
                         pending_size = 0
-                if self._emit_partial_event.is_set() and pending_size > 0:
-                    # A confirmed interruption must not wait for the slice to
-                    # fill: send the user's words to the model immediately.
+                if self._emit_partial_event.is_set():
+                    # Always send a fixed tail, even if the one-second pending
+                    # buffer just rolled over. This preserves the speech onset
+                    # that caused the interrupt and makes it the priority slice.
                     self._emit_partial_event.clear()
-                    self._put_latest(agc.process(pending[:pending_size].copy(), adapt=False))
+                    preroll = interrupt_preroll.snapshot()
+                    if preroll.size > 0:
+                        self._put_interrupt_audio(agc.process(preroll, adapt=False))
                     pending_size = 0
             except Exception as exc:
                 log.warning("Microphone read failed: %s", exc)
@@ -876,126 +1048,203 @@ class RobotIO:
             self._stop_event.wait(next_capture - now)
 
     def _playback_loop(self) -> None:
-        """Continuously resample TTS and feed a short jitter buffer to GStreamer."""
+        """Clock TTS into GStreamer while retaining only a short device lead.
+
+        MiniCPM can deliver several seconds in one burst. Pushing that burst as
+        one appsrc buffer makes interruption depend on flushing a large device
+        backlog and leaves no useful playout-watermark telemetry. This worker
+        keeps the burst in an application FIFO, primes a small lead, then feeds
+        40 ms frames according to the monotonic playout deadline.
+        """
         resampler = StreamingAudioResampler()
-        resampler_generation: int | None = None
-        deferred_item: tuple[int, str, np.ndarray, bool] | None = None
+        output = AudioSampleBuffer()
+        generation: int | None = None
+        response_id = "unknown"
+        first_push_pending = False
+        startup_deadline = math.inf
+        playback_was_idle = False
+        last_user_speech_at = -math.inf
+        resample_ms = 0.0
+        starved = False
 
         while not self._stop_event.is_set():
+            self._playback_wakeup.clear()
             with self._playback_lock:
                 clear_pending = self._player_clear_pending
                 self._player_clear_pending = False
             if clear_pending:
+                output.clear()
+                resampler.reset()
+                generation = None
+                first_push_pending = False
+                startup_deadline = math.inf
+                starved = False
                 # Only this thread may cycle the shared pipeline; see
                 # _flush_playback_for_listen.
                 self._clear_player()
 
-            if deferred_item is None:
+            while len(output) < PLAYBACK_BUFFER_HIGH_SAMPLES:
                 try:
-                    first_item = self._playback_chunks.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-            else:
-                first_item = deferred_item
-                deferred_item = None
-
-            items = [first_item]
-            generation, response_id, samples, starts_response = first_item
-            with self._state_lock:
-                playback_was_idle = time.monotonic() >= self._speaking_until
-                last_user_speech_at = self._last_user_speech_at
-            # A drained mid-response resume pushes immediately: the hole has
-            # already been heard, and buffering now would only stretch it.
-            should_preroll = playback_was_idle and starts_response
-            buffered_samples = samples.size
-            preroll_samples = round(self._playback_preroll * OUTPUT_SAMPLE_RATE)
-            if should_preroll and buffered_samples < preroll_samples:
-                deadline = time.monotonic() + self._playback_preroll
-                while not self._stop_event.is_set() and buffered_samples < preroll_samples:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    try:
-                        item = self._playback_chunks.get(timeout=remaining)
-                    except queue.Empty:
-                        break
-                    if item[0] != generation:
-                        deferred_item = item
-                        break
-                    items.append(item)
-                    buffered_samples += item[2].size
-
-            try:
-                if generation != resampler_generation or should_preroll:
-                    resampler.reset()
-                    resampler_generation = generation
-
-                audio_parts = [item_samples for _, _, item_samples, _ in items]
-                source = audio_parts[0] if len(audio_parts) == 1 else np.concatenate(audio_parts)
-                resample_started = time.perf_counter()
-                playback = resampler.process(source)
-                resample_ms = (time.perf_counter() - resample_started) * 1_000
-                if playback.size == 0:
-                    continue
-                with self._playback_lock:
-                    now = time.monotonic()
-                    playback_is_current = not (
-                        generation != self._playback_generation
-                        or now < self._suppress_playback_until
+                    item_generation, item_response_id, source, starts_response = (
+                        self._playback_chunks.get_nowait()
                     )
-                    if playback_is_current:
+                except queue.Empty:
+                    break
+                try:
+                    with self._playback_lock:
+                        now = time.monotonic()
+                        item_is_current = not (
+                            item_generation != self._playback_generation
+                            or now < self._suppress_playback_until
+                            or self._discard_turn_active
+                        )
+                        preroll = self._playback_preroll
+                    if not item_is_current:
+                        continue
+                    if item_generation != generation:
+                        output.clear()
+                        resampler.reset()
+                        generation = item_generation
+                        first_push_pending = False
+                    if starts_response:
+                        resampler.reset()
+                        response_id = item_response_id
+                        first_push_pending = True
+                        startup_deadline = now + preroll
                         with self._state_lock:
-                            if now >= self._speaking_until:
-                                self._interrupt_armed_at = now + INTERRUPT_ARM_DELAY
-                            start = max(now, self._speaking_until)
-                            self._speaking_until = start + playback.size / INPUT_SAMPLE_RATE
-                            self._model_state = "speaking"
-                        push_started = time.perf_counter()
-                        self.mini.media.push_audio_sample(playback)
-                        push_ms = (time.perf_counter() - push_started) * 1_000
-                        if should_preroll:
-                            # Every started utterance earns a slightly faster
-                            # first word until a supply gap says otherwise.
+                            playback_was_idle = now >= self._speaking_until
+                            last_user_speech_at = self._last_user_speech_at
+                    resample_started = time.perf_counter()
+                    output.append(resampler.process(source))
+                    resample_ms += (time.perf_counter() - resample_started) * 1_000
+                finally:
+                    self._playback_chunks.task_done()
+
+            now = time.monotonic()
+            with self._state_lock:
+                ahead_seconds = max(0.0, self._speaking_until - now)
+            with self._playback_lock:
+                target_ahead = self._playback_preroll
+            target_samples = max(
+                PLAYBACK_FRAME_SAMPLES,
+                round(target_ahead * INPUT_SAMPLE_RATE),
+            )
+
+            if len(output) > 0 and generation is not None:
+                if (
+                    first_push_pending
+                    and ahead_seconds <= 0.0
+                    and len(output) < target_samples
+                    and now < startup_deadline
+                ):
+                    self._playback_wakeup.wait(
+                        min(PLAYBACK_FRAME_SECONDS, startup_deadline - now)
+                    )
+                    continue
+
+                needs_initial_fill = ahead_seconds <= 0.0
+                needs_frame = ahead_seconds <= target_ahead - PLAYBACK_FRAME_SECONDS / 2.0
+                if needs_initial_fill or needs_frame:
+                    push_samples = target_samples if needs_initial_fill else PLAYBACK_FRAME_SAMPLES
+                    frame = output.pop(push_samples)
+                    try:
+                        pushed, push_ms = self._push_playback_frame(generation, frame)
+                    except Exception as exc:
+                        log.warning("Speaker playback failed: %s", exc)
+                        pushed = False
+                        push_ms = 0.0
+                    if not pushed:
+                        output.clear()
+                        resampler.reset()
+                        generation = None
+                        first_push_pending = False
+                        continue
+
+                    starved = False
+                    if first_push_pending:
+                        with self._playback_lock:
                             self._playback_preroll = max(
                                 PLAYBACK_PREROLL_MIN,
                                 self._playback_preroll - PLAYBACK_PREROLL_DECAY,
                             )
-                if not playback_is_current:
-                    resampler.reset()
-                    resampler_generation = None
-                    continue
-                if playback_was_idle:
-                    # The single end-to-end number every latency tuning knob
-                    # (chunk cadence, preroll, model) must ultimately improve.
-                    turn_gap = time.monotonic() - last_user_speech_at
-                    if starts_response and 0.0 < turn_gap < 10.0:
-                        log.info(
-                            "Turn latency for %s: %.0f ms from last heard user speech",
+                        turn_gap = time.monotonic() - last_user_speech_at
+                        if playback_was_idle and 0.0 < turn_gap < 10.0:
+                            log.info(
+                                "Turn latency for %s: %.0f ms from last heard user speech",
+                                response_id,
+                                turn_gap * 1_000,
+                            )
+                        log.debug(
+                            "Playback %s primed %.0f ms; resample=%.1f ms, push=%.1f ms",
                             response_id,
-                            turn_gap * 1_000,
+                            frame.size / INPUT_SAMPLE_RATE * 1_000,
+                            resample_ms,
+                            push_ms,
                         )
-                    log.debug(
-                        "Playback %s started with %.0f ms buffered; resample=%.1f ms, push=%.1f ms",
-                        response_id,
-                        source.size / OUTPUT_SAMPLE_RATE * 1_000,
-                        resample_ms,
-                        push_ms,
-                    )
-                elif resample_ms + push_ms > 100.0:
-                    # Only a stage cost that threatens the real-time budget of
-                    # a one-second slice is worth a warning; the CM4 routinely
-                    # spends a few tens of ms here under load.
+                        first_push_pending = False
+                        resample_ms = 0.0
+                    elif resample_ms + push_ms > 100.0:
+                        log.warning(
+                            "Slow playback stage for %s: resample=%.1f ms, push=%.1f ms",
+                            response_id,
+                            resample_ms,
+                            push_ms,
+                        )
+                    resample_ms = 0.0
+                    continue
+
+                wait_for_feed = max(
+                    0.001,
+                    ahead_seconds - target_ahead + PLAYBACK_FRAME_SECONDS / 2.0,
+                )
+                self._playback_wakeup.wait(min(PLAYBACK_FRAME_SECONDS, wait_for_feed))
+                continue
+
+            with self._state_lock:
+                model_expects_audio = self._model_state == "speaking"
+            if (
+                generation is not None
+                and ahead_seconds <= 0.0
+                and model_expects_audio
+                and not starved
+            ):
+                starved = True
+                self._playback_underruns += 1
+                if now - self._last_playback_underrun_log >= PLAYBACK_UNDERRUN_LOG_INTERVAL:
                     log.warning(
-                        "Slow playback stage for %s: resample=%.1f ms, push=%.1f ms",
-                        response_id,
-                        resample_ms,
-                        push_ms,
+                        "Playback underrun #%d; waiting for the next MiniCPM audio delta",
+                        self._playback_underruns,
                     )
-            except Exception as exc:
-                log.warning("Speaker playback failed: %s", exc)
-            finally:
-                for _ in items:
-                    self._playback_chunks.task_done()
+                    self._last_playback_underrun_log = now
+            self._playback_wakeup.wait(PLAYBACK_FRAME_SECONDS)
+
+    def _push_playback_frame(
+        self,
+        generation: int,
+        frame: np.ndarray,
+    ) -> tuple[bool, float]:
+        """Push one current-generation frame while serializing pipeline flushes."""
+        if frame.size == 0:
+            return False, 0.0
+        with self._playback_lock:
+            now = time.monotonic()
+            if (
+                generation != self._playback_generation
+                or now < self._suppress_playback_until
+                or self._discard_turn_active
+                or self._player_clear_pending
+            ):
+                return False, 0.0
+            push_started = time.perf_counter()
+            self.mini.media.push_audio_sample(frame)
+            push_ms = (time.perf_counter() - push_started) * 1_000
+            with self._state_lock:
+                if now >= self._speaking_until:
+                    self._interrupt_armed_at = now + INTERRUPT_ARM_DELAY
+                start = max(now, self._speaking_until)
+                self._speaking_until = start + frame.size / INPUT_SAMPLE_RATE
+                self._model_state = "speaking"
+        return True, push_ms
 
     def _put_latest(self, chunk: np.ndarray) -> None:
         try:
@@ -1012,6 +1261,12 @@ class RobotIO:
                     self._dropped_audio_chunks,
                 )
                 self._last_audio_drop_log = now
+
+    def _put_interrupt_audio(self, chunk: np.ndarray) -> None:
+        """Replace any older control slice with the newest interruption pre-roll."""
+        with suppress(queue.Empty):
+            self._interrupt_audio_chunks.get_nowait()
+        self._interrupt_audio_chunks.put_nowait(chunk)
 
     def _motion_loop(self) -> None:
         last_effective_state = ""
@@ -1038,6 +1293,11 @@ class RobotIO:
         glance_yaw = 0.0
         glance_pitch = 0.0
         next_glance_at = started_at + self._motion_rng.uniform(12.0, 20.0)
+        user_speech_started_at = -math.inf
+        emphasis_started_at: float | None = None
+        emphasis_duration = 0.68
+        emphasis_yaw = 0.0
+        next_emphasis_at = math.inf
 
         while not self._stop_event.is_set():
             now = time.monotonic()
@@ -1046,9 +1306,12 @@ class RobotIO:
             with self._state_lock:
                 speaking = now < self._speaking_until
                 state = self._model_state
+                interrupting = self._interrupting
                 interrupt_armed_at = self._interrupt_armed_at
                 microphone_level_db = self._microphone_level_db
             effective_state = effective_conversation_state(state, speaking)
+            if interrupting:
+                effective_state = "interrupted"
 
             if effective_state != last_effective_state:
                 last_effective_state = effective_state
@@ -1059,6 +1322,11 @@ class RobotIO:
                     nod_started_at = None
                     glance_started_at = None
                     next_glance_at = now + self._motion_rng.uniform(12.0, 20.0)
+                    emphasis_started_at = None
+                    next_emphasis_at = now + self._motion_rng.uniform(0.9, 1.8)
+                else:
+                    emphasis_started_at = None
+                    next_emphasis_at = math.inf
 
             # DoA is the gaze source while listening. Its speech bit is PRE-AEC
             # and stays high whenever the robot's own speaker plays, so it takes
@@ -1126,13 +1394,20 @@ class RobotIO:
                             last_doa = angle
                             last_turn = now
 
-            user_speaking = not speaking and now - last_user_speech_at <= USER_SPEECH_HOLD
+            user_speaking = interrupting or (
+                not speaking and now - last_user_speech_at <= USER_SPEECH_HOLD
+            )
             if user_speaking and not user_was_speaking:
+                user_speech_started_at = now
                 listening_antennas = self._command_antennas.copy()
                 next_nod_at = now + self._motion_rng.uniform(2.2, 4.0)
                 next_glance_at = now + self._motion_rng.uniform(12.0, 20.0)
             elif not user_speaking and user_was_speaking:
                 next_nod_at = math.inf
+                # A short acknowledgement at a phrase boundary reads more
+                # naturally than waiting several seconds for a periodic nod.
+                if now - user_speech_started_at >= 0.45:
+                    nod_started_at = now
             user_was_speaking = user_speaking
 
             if user_speaking and nod_started_at is None and now >= next_nod_at:
@@ -1161,6 +1436,23 @@ class RobotIO:
                     glance_started_at = None
                     next_glance_at = now + self._motion_rng.uniform(12.0, 24.0)
 
+            if (
+                effective_state == "speaking"
+                and emphasis_started_at is None
+                and now >= next_emphasis_at
+            ):
+                emphasis_started_at = now
+                emphasis_yaw = self._motion_rng.choice((-1.0, 1.0)) * self._motion_rng.uniform(
+                    1.4, 2.8
+                )
+            emphasis_pulse = 0.0
+            if emphasis_started_at is not None:
+                emphasis_progress = (now - emphasis_started_at) / emphasis_duration
+                emphasis_pulse = gesture_pulse(emphasis_progress)
+                if emphasis_progress > 1.0:
+                    emphasis_started_at = None
+                    next_emphasis_at = now + self._motion_rng.uniform(1.8, 3.6)
+
             transition_pulse = gesture_pulse((now - state_entered_at) / STATE_TRANSITION_DURATION)
             head_offset, animated_antennas = lifelike_motion_overlay(
                 now - started_at,
@@ -1171,6 +1463,8 @@ class RobotIO:
                 glance_pulse=glance_pulse,
                 glance_yaw_degrees=glance_yaw,
                 glance_pitch_degrees=glance_pitch,
+                emphasis_pulse=emphasis_pulse,
+                emphasis_yaw_degrees=emphasis_yaw,
             )
             self._target_antennas = (
                 listening_antennas.copy() if user_speaking else animated_antennas
@@ -1188,11 +1482,24 @@ class RobotIO:
                 MAX_ANTENNA_SPEED * elapsed,
             )
             self._command_antennas = self._command_antennas + antenna_delta
+            self._target_body_yaw = lifelike_body_yaw(
+                now - started_at,
+                effective_state,
+                user_speaking=user_speaking,
+            )
+            body_delta = float(
+                np.clip(
+                    self._target_body_yaw - self._command_body_yaw,
+                    -MAX_BODY_YAW_SPEED * elapsed,
+                    MAX_BODY_YAW_SPEED * elapsed,
+                )
+            )
+            self._command_body_yaw += body_delta
             try:
                 self.mini.set_target(
                     head=commanded_head,
                     antennas=self._command_antennas,
-                    body_yaw=None,
+                    body_yaw=self._command_body_yaw,
                 )
             except Exception as exc:
                 # reachy-mini 1.9 checks liveness in a separate thread. A
@@ -1287,6 +1594,12 @@ class RobotIO:
             log.warning("Could not read initial antenna pose: %s", exc)
             self._command_antennas = np.deg2rad(ANTENNA_POSES["idle"])
         try:
+            head_joints, _ = self.mini.get_current_joint_positions()
+            self._command_body_yaw = float(head_joints[0])
+        except Exception as exc:
+            log.debug("Could not read initial body yaw: %s", exc)
+            self._command_body_yaw = 0.0
+        try:
             self._target_head = create_head_pose(
                 pitch=NATURAL_HEAD_PITCH_DEGREES,
                 degrees=True,
@@ -1295,6 +1608,7 @@ class RobotIO:
             log.warning("Could not create natural head target: %s", exc)
             self._target_head = np.eye(4, dtype=np.float64)
         self._target_antennas = self._command_antennas.copy()
+        self._target_body_yaw = self._command_body_yaw
 
     def _return_to_neutral(self) -> None:
         try:
@@ -1302,6 +1616,7 @@ class RobotIO:
 
             start_head = self._command_head.copy()
             start_antennas = self._command_antennas.copy()
+            start_body_yaw = self._command_body_yaw
             duration = 0.8
             steps = round(duration / MOTION_PERIOD)
             for index in range(1, steps + 1):
@@ -1311,9 +1626,11 @@ class RobotIO:
                     start_antennas
                     + (np.asarray(INIT_ANTENNAS_JOINT_POSITIONS) - start_antennas) * fraction
                 )
-                self.mini.set_target(head=head, antennas=antennas, body_yaw=None)
+                body_yaw = start_body_yaw * (1.0 - fraction)
+                self.mini.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
                 time.sleep(MOTION_PERIOD)
             self._command_head = np.asarray(INIT_HEAD_POSE).copy()
             self._command_antennas = np.asarray(INIT_ANTENNAS_JOINT_POSITIONS).copy()
+            self._command_body_yaw = 0.0
         except Exception as exc:
             log.warning("Could not return Reachy to neutral: %s", exc)

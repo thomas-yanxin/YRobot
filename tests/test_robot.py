@@ -15,13 +15,16 @@ from yrobot.robot import (
     ANTENNA_POSES,
     DOA_GAZE_ELEVATION,
     INTERRUPT_ACK_TIMEOUT,
+    INTERRUPT_PREROLL_SAMPLES,
     MAX_HEAD_ANGULAR_SPEED,
     MAX_HEAD_ANGULAR_STEP,
     MAX_HEAD_TRANSLATION_SPEED,
     MAX_HEAD_TRANSLATION_STEP,
+    PLAYBACK_FRAME_SAMPLES,
     PLAYBACK_PREROLL_DECAY,
     PLAYBACK_PREROLL_MARGIN,
     PLAYBACK_PREROLL_SECONDS,
+    AudioSampleBuffer,
     RobotIO,
     StreamingAudioResampler,
     UplinkAGC,
@@ -30,11 +33,22 @@ from yrobot.robot import (
     downscale_jpeg,
     effective_conversation_state,
     gesture_pulse,
+    lifelike_body_yaw,
     lifelike_motion_overlay,
     smooth_pose_step,
     step_pose,
     to_mono,
 )
+
+
+def test_audio_sample_buffer_preserves_fifo_and_bounded_tail() -> None:
+    audio = AudioSampleBuffer(max_samples=5)
+    audio.append(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+    audio.append(np.array([4.0, 5.0, 6.0, 7.0], dtype=np.float32))
+
+    np.testing.assert_array_equal(audio.snapshot(), [3.0, 4.0, 5.0, 6.0, 7.0])
+    np.testing.assert_array_equal(audio.pop(2), [3.0, 4.0])
+    np.testing.assert_array_equal(audio.snapshot(), [5.0, 6.0, 7.0])
 
 
 def test_stereo_microphone_uses_xvf_processed_channel_zero() -> None:
@@ -300,9 +314,10 @@ def test_uplink_agc_freezes_its_estimate_while_the_robot_speaks() -> None:
     agc.process(np.full(16_000, 0.05, dtype=np.float32))
     residual_echo = np.full(16_000, 0.01, dtype=np.float32)
 
-    agc.process(residual_echo, adapt=False)
+    bypassed = agc.process(residual_echo, adapt=False)
 
     assert agc._speech_rms == pytest.approx(0.05)
+    np.testing.assert_array_equal(bypassed, residual_echo)
 
 
 def test_new_session_clears_stale_interruption_state() -> None:
@@ -355,6 +370,18 @@ def test_interrupt_ships_the_partial_microphone_slice_immediately() -> None:
 
     assert chunk is not None
     assert 0 < chunk.size < CHUNK_SAMPLES
+    assert chunk.size <= INTERRUPT_PREROLL_SAMPLES
+
+
+def test_interrupt_preroll_overtakes_normal_uplink_audio() -> None:
+    robot = RobotIO(object())
+    normal = np.full(16_000, 0.1, dtype=np.float32)
+    interruption = np.full(5_600, 0.2, dtype=np.float32)
+    robot._put_latest(normal)
+    robot._put_interrupt_audio(interruption)
+
+    np.testing.assert_array_equal(robot.next_audio_chunk(0.01), interruption)
+    np.testing.assert_array_equal(robot.next_audio_chunk(0.01), normal)
 
 
 def test_slice_boundaries_within_one_utterance_do_not_restart_playback() -> None:
@@ -540,6 +567,22 @@ def test_lifelike_overlay_is_restrained_and_listening_antennas_can_hold() -> Non
     np.testing.assert_allclose(held_antennas, base_listening)
 
 
+def test_interrupted_motion_yields_and_whole_body_freezes_for_user_speech() -> None:
+    interrupted_head, interrupted_antennas = lifelike_motion_overlay(
+        2.0,
+        "interrupted",
+        user_speaking=True,
+    )
+
+    assert delta_angle_between_mat_rot(np.eye(3), interrupted_head[:3, :3]) > 0.0
+    np.testing.assert_allclose(
+        interrupted_antennas,
+        np.deg2rad(ANTENNA_POSES["interrupted"]),
+    )
+    assert lifelike_body_yaw(3.0, "speaking", user_speaking=False) != 0.0
+    assert lifelike_body_yaw(3.0, "speaking", user_speaking=True) == 0.0
+
+
 def test_playback_deadline_clears_a_late_stale_speaking_state() -> None:
     assert effective_conversation_state("speaking", speaking=True) == "speaking"
     assert effective_conversation_state("listening", speaking=True) == "speaking"
@@ -576,6 +619,39 @@ def test_omni_audio_is_played_by_dedicated_worker() -> None:
     finally:
         robot._stop_event.set()
         worker.join(timeout=1.0)
+
+
+def test_playback_worker_paces_a_burst_instead_of_dumping_it_to_appsrc() -> None:
+    pushed_twice = threading.Event()
+
+    class Media:
+        def __init__(self) -> None:
+            self.samples: list[np.ndarray] = []
+
+        def push_audio_sample(self, samples: np.ndarray) -> None:
+            self.samples.append(samples.copy())
+            if len(self.samples) >= 2:
+                pushed_twice.set()
+
+    class Mini:
+        def __init__(self) -> None:
+            self.media = Media()
+
+    mini = Mini()
+    robot = RobotIO(mini)
+    worker = threading.Thread(target=robot._playback_loop, name="yrobot-playback", daemon=True)
+    worker.start()
+    try:
+        robot.play_omni_audio(np.zeros(24_000, dtype=np.float32), "burst")
+        assert pushed_twice.wait(1.0)
+    finally:
+        robot._stop_event.set()
+        robot._playback_wakeup.set()
+        worker.join(timeout=1.0)
+
+    assert mini.media.samples[0].size == round(PLAYBACK_PREROLL_SECONDS * 16_000)
+    assert mini.media.samples[1].size == PLAYBACK_FRAME_SAMPLES
+    assert sum(part.size for part in mini.media.samples[:2]) < 16_000
 
 
 def test_camera_jpeg_is_cached_off_the_sender_path() -> None:

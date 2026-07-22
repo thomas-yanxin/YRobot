@@ -90,7 +90,7 @@ The setup script creates `.venv`, installs the app, and creates `.env` from `.en
 The default endpoint is already:
 
 ```text
-wss://10.0.16.187:28099/backend
+wss://10.0.16.184:28099/backend
 ```
 
 The certificate is currently treated as self-signed (`OMNI_TLS_VERIFY=0`). Enable verification

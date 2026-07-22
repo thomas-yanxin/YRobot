@@ -7,7 +7,7 @@
 把 YRobot 从零重构为一个小而可靠的 Reachy Mini Python 应用：
 
 - 直连已经部署好的 `llama-omni-server`：
-  `wss://10.0.16.187:28099/backend`。
+  `wss://10.0.16.184:28099/backend`。
 - 以 `full_duplex` 模式持续上传 Reachy 的麦克风和摄像头数据。
 - 实时播放 MiniCPM-o 4.5 返回的语音；模型负责听、说切换和打断语义。
 - 对话时让机器人有自然动作：朝向说话人、说话时随语音轻微摆动、在监听/空闲时保持
@@ -108,7 +108,7 @@ yrobot/
 4. 删除旧包、旧前端和过时测试，保证仓库只剩必需内容。
 5. 运行 `pytest`、`ruff` 和 `reachy-mini-app-assistant check`。
 6. 用 fake Reachy/fake Omni 做自动化 smoke test。
-7. 最后连接真实 `wss://10.0.16.187:28099/backend` 做协议 smoke test；物理音频、DoA 和动作
+7. 最后连接真实 `wss://10.0.16.184:28099/backend` 做协议 smoke test；物理音频、DoA 和动作
    由你在真实机器人旁确认，测试时先使用低音量和小幅动作。
 
 ## 7. 已确认的选择
@@ -119,7 +119,7 @@ Reachy Mini 是哪一版，YRobot 准备运行在哪里？
 
 答案：`Wireless 的 CM4`
 
-建议：如果是 Wireless 且与 `10.0.16.187` 同一局域网，优先运行在 CM4；机器人只做 I/O，
+建议：如果是 Wireless 且与 `10.0.16.184` 同一局域网，优先运行在 CM4；机器人只做 I/O，
 模型推理在远端服务器。
 
 ### Q2：第一版动作范围

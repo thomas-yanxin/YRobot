@@ -69,7 +69,7 @@ async def probe(url: str, tls_verify: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="wss://10.0.16.187:28099/backend")
+    parser.add_argument("--url", default="wss://10.0.16.184:28099/backend")
     parser.add_argument("--tls-verify", action="store_true")
     args = parser.parse_args()
     asyncio.run(probe(args.url, args.tls_verify))

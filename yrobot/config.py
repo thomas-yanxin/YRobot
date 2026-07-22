@@ -81,7 +81,7 @@ class Config:
         prompt = os.getenv("OMNI_SYSTEM_PROMPT", "").strip() or DEFAULT_SYSTEM_PROMPT
         return cls(
             omni_url=normalize_backend_url(
-                os.getenv("OMNI_WS_URL", "wss://10.0.16.187:28099/backend")
+                os.getenv("OMNI_WS_URL", "wss://10.0.16.184:28099/backend")
             ),
             tls_verify=_bool_env("OMNI_TLS_VERIFY", False),
             send_video=_bool_env("OMNI_SEND_VIDEO", True),
