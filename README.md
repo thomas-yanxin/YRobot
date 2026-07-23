@@ -1,103 +1,115 @@
+---
+title: YRobot
+description: MiniCPM-o 4.5 full-duplex conversation for Reachy Mini Wireless
+tags:
+  - reachy_mini
+  - reachy_mini_python_app
+---
+
 # YRobot
 
-面向 Reachy Mini Wireless 的 MiniCPM-o 4.5 实时语音、视觉与动作交互应用。
-默认连接：
+YRobot 是为 Reachy Mini Wireless（CM4）重写的实时视听对话应用。它直接使用
+MiniCPM-o 4.5 Video Realtime API，不经过级联 ASR/LLM/TTS，也不复用旧版 YRobot
+的音频、会话或动作实现。
 
-```text
-wss://10.0.16.184:8006/v1/realtime?mode=video
-```
+核心保证：
 
-## 这版解决了什么
+- 麦克风持续采集，严格按官方格式发送 16 kHz、mono、F32LE、1 秒音频单元；
+- 服务器音频一到即进入独立播放线程，24 kHz 重采样到 Reachy 本地媒体的 16 kHz；
+- 用户插话先在本地执行 `clear_player()`，再用 epoch 栅栏丢弃旧响应，并持续发送
+  `force_listen=true`，直到收到 `kind=listen`；
+- 回声参考只记录真正交给扬声器的音频，配合 XVF3800 硬件 AEC、WebRTC VAD 和
+  自适应噪声门，避免机器人被自己的声音打断；
+- DoA、相机、网络、采集、播放和动作各自独立；只有一个 50 Hz 控制器可以写电机；
+- DoA 按官方示例用实时完整头部姿态变换到世界坐标，不用“最后一次指令角”冒充实测姿态；
+- 视觉固定为最新 640 px JPEG、最多 1 fps；网络拥塞时只保留最新输入，不补发旧音频。
 
-- 16 kHz 麦克风按 500 ms 上行，插话控制仍按 20 ms 检测并立即发出；
-- 插话、断线和 session rollover 都会递增 playback epoch，同时清空应用队列和
-  Reachy GStreamer player，旧回答无法跨 turn 或 session 恢复；
-- 使用 AEC 后的第 0 通道、WebRTC VAD 和近期播放 PCM 相关性共同抑制自回声误打断；
-- 麦克风、相机、DoA、扬声器、WebSocket 和动作控制互相隔离，慢相机/USB 调用不会
-  阻塞音频热路径；
-- 始终使用 `mode=video`，每张新 JPEG 只随一个音频单元发送，避免音频模式忽略图像
-  或重复图像消耗上下文；
-- WebSocket sender 在 `session.close` 前停止并 await，客户端等待关闭确认；在 video
-  模式 300 秒硬上限前主动 rollover，并根据 `kv_cache_length` 提前保护上下文；
-- 唯一 50 Hz 动作 owner 使用真实 `dt`、限速和限加速度，DoA 在独立线程采样。
+## 安装与运行
 
-```text
-mic/AEC ──20 ms VAD──► bounded 500 ms uplink ──┐
-camera ──latest JPEG, adaptive cadence─────────┼──► MiniCPM-o video realtime
-DoA ──latest bearing──► 50 Hz motion owner     │
-speaker ◄──20 ms bounded playback + epoch──────┘
-```
-
-## 安装
-
-在 Reachy Mini Wireless CM4 上：
+目标环境是 Reachy Mini Wireless 的 CM4，Python 3.11/3.12，Reachy Mini SDK 1.9.0；
+建议将机器人固件升级到 2.1.4，以使用当前的音频、DoA 与动作修复。
 
 ```bash
-./scripts/setup_cm4.sh
+bash scripts/setup_cm4.sh
 source .venv/bin/activate
-```
-
-或者手动安装：
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e .
 cp .env.example .env
-```
-
-项目固定使用 `reachy-mini==1.9.0`。应用请求 Reachy 的 `local` media backend，并以
-`localhost_only` 方式连接 Wireless daemon。
-
-## 运行
-
-```bash
-source .venv/bin/activate
 yrobot
 ```
 
-也可以从 Reachy dashboard 启动注册的 `yrobot` 应用。主要配置见
-[.env.example](.env.example)；旧的 `OMNI_*`、`AUDIO_*` 和 `MOTION_*` 变量不会参与
-新运行时配置。
+也可由 Reachy Mini dashboard 启动 `YRobot` 应用。应用强制申请 `local` media
+backend，以保留 Wireless 的 XVF3800 硬件 AEC 和扬声器远端参考；不要改为独立的
+`sounddevice` 输入/输出。
 
-关键默认值：
+默认连接官方端点：
 
-| 配置 | 默认值 | 说明 |
-|---|---:|---|
-| `YROBOT_CHUNK_MS` | `500` | 500–1000 ms，20 ms 的整数倍 |
-| `YROBOT_PLAYBACK_LEAD_S` | `0.120` | 有界首播缓冲 |
-| `YROBOT_FRAME_ACTIVE_S` | `1.0` | 用户说话及其后 3 秒的图像间隔 |
-| `YROBOT_FRAME_IDLE_S` | `5.0` | 空闲图像间隔 |
-| `YROBOT_KV_SOFT` / `YROBOT_KV_HARD` | `6500` / `7800` | 8192 KV 上限前软/硬切换 |
-| `YROBOT_SESSION_ROLLOVER` | `280` | 300 秒硬上限前的软切换点 |
+```text
+wss://minicpmo45.modelbest.cn/v1/realtime?mode=video
+```
 
-`YROBOT_SYSTEM_PROMPT` 必须保持 MiniCPM-o duplex 模板使用的精确句子：
-`You are a helpful assistant.`。不要追加长 persona；行为引导应放在用户对话中。
+若使用同协议的局域网 Gateway，只需修改：
+
+```dotenv
+YROBOT_REALTIME_URL=wss://gateway.local:8006/v1/realtime?mode=video
+YROBOT_TLS_VERIFY=0
+```
+
+其余可调项见 [.env.example](.env.example)。协议采样率、1 秒上行单元、640 px /
+1 fps 视频、50 Hz 动作和 300 秒会话上限是刻意固定的，不提供偏离官方协议或硬件
+控制频率的配置。
+
+## 运行结构
+
+```text
+XVF3800 mic ─┬─ 20 ms VAD + echo guard ── local barge-in ── clear_player()
+             └─ exact 1 s F32LE units ─── MiniCPM-o Realtime
+camera ───────── latest JPEG @ 1 fps ────────┘
+
+MiniCPM-o audio ─ epoch fence ─ 24→16 kHz ─ bounded player ─ Reachy speaker
+local VAD + DoA ─ smoothed attention target ─ 50 Hz single motion writer
+```
+
+MiniCPM-o 会话严格遵循：
+
+```text
+session.queue_done → session.init → session.created
+input.append* ↔ response.output.delta(listen|text|audio)
+session.close → session.closed
+```
+
+Video session 在 300 秒处会被服务器关闭。YRobot 在 285 秒主动结束并创建新会话；
+Realtime API 没有上下文迁移接口，因此跨会话不会伪造“无缝续接”。
+
+## DoA 的物理边界
+
+Wireless 麦克风阵列只返回水平角，`0=左、π/2=正前/正后、π=右`。线阵本身无法仅靠
+DoA 区分正前和正后，也无法估计俯仰角。YRobot 会用本地近端语音门控、稳健平滑和
+短时保持提高灵敏度与稳定性，但不会把硬件不存在的信息包装成精确 3D 定位；需要时
+应再接视觉人脸方向消除前后歧义。
 
 ## 验证
 
-无硬件单元与并发回归：
-
 ```bash
-pip install -e '.[dev]'
-pytest
+source .venv/bin/activate
 ruff check .
+ruff format --check .
+pytest
+reachy-mini-app-assistant check .
+python scripts/probe_realtime.py --seconds 5
 ```
 
-Gateway 协议探针：
+上机验收重点：
 
-```bash
-python scripts/probe_realtime.py --tls-no-verify
-```
+1. 连续对话时没有旧输入突发补发，首段下行音频立即播放；
+2. 播放期间持续说话约 100 ms 后，扬声器立即清空，旧 response 不再复活；
+3. 只播放机器人语音时不会触发插话；
+4. 动作循环维持 50 Hz，网络抖动和 JPEG 编码不造成运动卡顿；
+5. 左右说话位置改变时头部方向稳定跟随，静音后平滑回中。
 
-带一张 JPEG 检查 video 输入：
+协议依据：
 
-```bash
-python scripts/minicpmo_video_smoke.py \
-  --tls-no-verify \
-  --image /path/to/frame.jpg
-```
-
-video Realtime API 的单 session 硬上限是 300 秒。YRobot 可以自动、干净地恢复持续
-服务，但服务端如果只有一个 worker，创建下一 session 的模型初始化空窗无法仅靠客户端
-完全消除；要无缝切换需要 Gateway 提供并行预热或 session resume。
+- [MiniCPM-o Realtime API overview](https://minicpmo45.modelbest.cn/docs/en/realtime-api/overview/)
+- [MiniCPM-o Video full-duplex](https://minicpmo45.modelbest.cn/docs/en/realtime-api/video/)
+- [MiniCPM-o Realtime examples](https://minicpmo45.modelbest.cn/docs/zh/realtime-api/examples/)
+- [Reachy Mini Python SDK](https://huggingface.co/docs/reachy_mini/SDK/python-sdk)
+- [Reachy Mini sound DoA example](https://github.com/pollen-robotics/reachy_mini/blob/950c29eacfedd439595f7b62e9ae60f27c9096d4/docs/source/examples/sound_doa.md)
+- [Reachy Mini contributor instructions](https://github.com/pollen-robotics/reachy_mini/blob/main/AGENTS.md)

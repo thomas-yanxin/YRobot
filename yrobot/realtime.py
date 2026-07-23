@@ -1,752 +1,839 @@
-"""MiniCPM-o Realtime Gateway protocol and bounded reconnecting client."""
+"""Reconnectable MiniCPM-o Realtime transport with a latest-only uplink."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import json
 import logging
-import math
-import queue
 import random
+import ssl
 import threading
 import time
-from collections.abc import Mapping
-from enum import StrEnum
-from typing import Any, Protocol
-from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
+from typing import Any
+from urllib.parse import urlsplit
 
 import numpy as np
-import websockets
+from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
-from .config import INPUT_SAMPLE_RATE, Config
+from .config import Settings
+from .protocol import (
+    Phase,
+    ProtocolState,
+    QueueDone,
+    QueueStatus,
+    ResponseDelta,
+    ServerError,
+    SessionClosed,
+    SessionCreated,
+    input_append,
+    parse_server_event,
+    serialize_client_event,
+    session_close,
+    session_init,
+    transition_client,
+    transition_server,
+    validate_video_url,
+)
+from .state import TurnCoordinator
 
 log = logging.getLogger(__name__)
 
-SESSION_CLOSE_START_SECONDS = 294.0
-SENDER_STOP_TIMEOUT = 0.5
-MIN_INPUT_SAMPLES = INPUT_SAMPLE_RATE // 2
-MAX_INPUT_SAMPLES = INPUT_SAMPLE_RATE
-INPUT_FRAME_SAMPLES = INPUT_SAMPLE_RATE // 50
+
+class RealtimeError(RuntimeError):
+    """The Realtime peer or transport cannot continue the current session."""
 
 
-class RealtimePort(Protocol):
-    """Fast synchronous boundary implemented by the robot audio/runtime layer."""
-
-    def next_audio_unit(
-        self,
-        timeout: float,
-    ) -> tuple[np.ndarray, bool] | None:
-        """Return one 500-1000 ms 16 kHz unit and its force-listen latch."""
-
-    def latest_frame_jpeg(self) -> bytes | None:
-        """Return an already-encoded latest-frame snapshot without blocking."""
-
-    def handle_audio_delta(
-        self,
-        samples: np.ndarray,
-        response_id: str,
-        metrics: Mapping[str, Any],
-    ) -> None: ...
-
-    def handle_listen(
-        self,
-        response_id: str,
-        metrics: Mapping[str, Any],
-    ) -> None: ...
-
-    def handle_text(self, text: str, response_id: str) -> None: ...
-
-    def handle_session_ready(self) -> None:
-        """Begin accepting microphone input after the backend is initialized."""
-
-    def invalidate_session(self, reason: str) -> None:
-        """Atomically invalidate stale playback and interruption state."""
-
-    def ready_for_rollover(self) -> bool:
-        """Return true at a locally idle conversation boundary."""
+class _StopRequested(Exception):
+    pass
 
 
-class SessionOutcome(StrEnum):
-    STOP = "stop"
-    ROLLOVER = "rollover"
+@dataclass(frozen=True, slots=True)
+class UplinkUnit:
+    sequence: int
+    captured_at: float
+    pcm_f32le: bytes
 
 
-class RealtimeProtocolError(RuntimeError):
-    """The peer violated the documented Realtime Gateway protocol."""
+@dataclass(frozen=True, slots=True)
+class TimingSummary:
+    count: int
+    minimum_ms: float | None
+    p50_ms: float | None
+    p95_ms: float | None
+    maximum_ms: float | None
 
 
-def gateway_default_ref_audio_url(realtime_url: str) -> str:
-    """Return the HTTP companion endpoint for a WS Realtime URL."""
-
-    parsed = urlsplit(realtime_url)
-    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme)
-    if scheme is None or not parsed.netloc:
-        raise ValueError("Realtime URL must use ws:// or wss://")
-    return urlunsplit((scheme, parsed.netloc, "/api/default_ref_audio", "", ""))
-
-
-def load_gateway_ref_audio(config: Config) -> str:
-    """Load and validate the Gateway's default 16 kHz float32 voice prompt."""
-
-    url = gateway_default_ref_audio_url(config.realtime_url)
-    request = Request(url, headers={"Accept": "application/json"})
-    options: dict[str, Any] = {"timeout": 20.0}
-    if url.startswith("https://"):
-        options["context"] = config.ssl_context()
-    with urlopen(request, **options) as response:  # noqa: S310 - URL is operator config.
-        payload = json.load(response)
-
-    value = payload.get("base64") if isinstance(payload, dict) else None
-    if not isinstance(value, str) or not value:
-        raise RealtimeProtocolError("Gateway default reference audio is missing base64")
-    try:
-        raw = base64.b64decode(value, validate=True)
-    except (ValueError, TypeError) as exc:
-        raise RealtimeProtocolError("Gateway default reference audio is invalid base64") from exc
-    if len(raw) == 0 or len(raw) % 4 or len(raw) > 16 * 1024 * 1024:
-        raise RealtimeProtocolError("Gateway reference audio must be bounded float32 PCM")
-    sample_rate = payload.get("sample_rate")
-    if sample_rate not in {None, 16_000}:
-        raise RealtimeProtocolError("Gateway reference audio must be 16 kHz")
-    samples = np.frombuffer(raw, dtype="<f4")
-    if not np.all(np.isfinite(samples)):
-        raise RealtimeProtocolError("Gateway reference audio contains non-finite samples")
-    return value
+@dataclass(frozen=True, slots=True)
+class RealtimeMetrics:
+    connections: int
+    reconnects: int
+    input_units: int
+    dropped_input_units: int
+    audio_deltas: int
+    text_deltas: int
+    listen_deltas: int
+    capture_to_send: TimingSummary
+    send_interval: TimingSummary
+    input_to_first_audio: TimingSummary
 
 
-def encode_input_audio(samples: np.ndarray) -> str:
-    pcm = np.asarray(samples, dtype="<f4")
-    if (
-        pcm.ndim != 1
-        or not MIN_INPUT_SAMPLES <= pcm.size <= MAX_INPUT_SAMPLES
-        or pcm.size % INPUT_FRAME_SAMPLES
-    ):
-        raise ValueError(
-            "Realtime input must contain 500-1000 ms of 16 kHz mono audio "
-            "in 20 ms increments"
-        )
-    if not np.all(np.isfinite(pcm)):
-        raise ValueError("Realtime input contains non-finite samples")
-    return base64.b64encode(pcm.tobytes()).decode("ascii")
-
-
-def decode_output_audio(value: str) -> np.ndarray:
-    try:
-        raw = base64.b64decode(value, validate=True)
-    except (ValueError, TypeError) as exc:
-        raise ValueError("Realtime audio payload is not valid base64") from exc
-    if not raw or len(raw) % 4:
-        raise ValueError("Realtime audio payload is not float32 PCM")
-    samples = np.frombuffer(raw, dtype="<f4").copy()
-    if not np.all(np.isfinite(samples)):
-        raise ValueError("Realtime audio payload contains non-finite samples")
-    return samples
-
-
-def build_session_init(
-    system_prompt: str,
-    *,
-    length_penalty: float = 1.1,
-    force_listen_count: int = 1,
-    enable_tts: bool = True,
-    ref_audio_base64: str | None = None,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "system_prompt": system_prompt,
-        "config": {
-            "generate_audio": enable_tts,
-            "length_penalty": length_penalty,
-            "force_listen_count": force_listen_count,
-        },
-        # Use the canonical public protocol shape. The current comni parser
-        # reads reference audio only from payload.voice; its web frontend's
-        # historical root-level alias is not accepted by that backend.
-        "use_tts": enable_tts,
-    }
-    if enable_tts:
-        if not ref_audio_base64:
-            raise ValueError("ref_audio_base64 is required when TTS is enabled")
-        payload["voice"] = {
-            "ref_audio_base64": ref_audio_base64,
-            "tts_ref_audio_base64": ref_audio_base64,
+class _Counters:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.connections = 0
+        self.reconnects = 0
+        self.input_units = 0
+        self.dropped_input_units = 0
+        self.audio_deltas = 0
+        self.text_deltas = 0
+        self.listen_deltas = 0
+        self.timings: dict[str, deque[float]] = {
+            "capture_to_send": deque(maxlen=256),
+            "send_interval": deque(maxlen=256),
+            "input_to_first_audio": deque(maxlen=256),
         }
-    return {
-        "type": "session.init",
-        "payload": payload,
-    }
+
+    def add(self, name: str, amount: int = 1) -> None:
+        with self.lock:
+            setattr(self, name, getattr(self, name) + amount)
+
+    def observe(self, name: str, milliseconds: float) -> None:
+        if milliseconds < 0 or not np.isfinite(milliseconds):
+            return
+        with self.lock:
+            self.timings[name].append(float(milliseconds))
+
+    def snapshot(self) -> RealtimeMetrics:
+        with self.lock:
+            return RealtimeMetrics(
+                connections=self.connections,
+                reconnects=self.reconnects,
+                input_units=self.input_units,
+                dropped_input_units=self.dropped_input_units,
+                audio_deltas=self.audio_deltas,
+                text_deltas=self.text_deltas,
+                listen_deltas=self.listen_deltas,
+                capture_to_send=_timing_summary(self.timings["capture_to_send"]),
+                send_interval=_timing_summary(self.timings["send_interval"]),
+                input_to_first_audio=_timing_summary(self.timings["input_to_first_audio"]),
+            )
 
 
-def build_input_append(
-    audio: np.ndarray,
-    frame_jpeg: bytes | None,
-    *,
-    force_listen: bool,
-) -> dict[str, Any]:
-    model_input: dict[str, Any] = {
-        "audio": encode_input_audio(audio),
-        "force_listen": bool(force_listen),
-        "max_slice_nums": 1,
-    }
-    if frame_jpeg:
-        model_input["video_frames"] = [base64.b64encode(frame_jpeg).decode("ascii")]
-    return {"type": "input.append", "input": model_input}
+def _timing_summary(values: deque[float]) -> TimingSummary:
+    if not values:
+        return TimingSummary(0, None, None, None, None)
+    ordered = sorted(values)
+
+    def percentile(fraction: float) -> float:
+        index = round((len(ordered) - 1) * fraction)
+        return round(ordered[index], 1)
+
+    return TimingSummary(
+        count=len(ordered),
+        minimum_ms=round(ordered[0], 1),
+        p50_ms=percentile(0.50),
+        p95_ms=percentile(0.95),
+        maximum_ms=round(ordered[-1], 1),
+    )
 
 
-def _parse_event(raw: str | bytes) -> dict[str, Any]:
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
-    event = json.loads(raw)
-    if not isinstance(event, dict) or not isinstance(event.get("type"), str):
-        raise RealtimeProtocolError("Realtime event must be an object with a string type")
-    return event
+class _Lifecycle:
+    """Serialize wire sends and lifecycle transitions across async tasks."""
 
+    def __init__(self) -> None:
+        self.state = ProtocolState()
+        self.lock = asyncio.Lock()
 
-def _metrics(event: Mapping[str, Any]) -> Mapping[str, Any]:
-    value = event.get("metrics")
-    metrics = dict(value) if isinstance(value, Mapping) else {}
-    for field in ("input_id", "server_send_ts"):
-        if field in event:
-            metrics[field] = event[field]
-    return metrics
+    async def send(self, websocket: ClientConnection, event: dict[str, Any]) -> None:
+        await self.send_then(websocket, event)
+
+    async def send_then(
+        self,
+        websocket: ClientConnection,
+        event: dict[str, Any],
+        after_send: Callable[[], None] | None = None,
+    ) -> None:
+        async with self.lock:
+            next_state = transition_client(self.state, event)  # type: ignore[arg-type]
+            await websocket.send(serialize_client_event(event))  # type: ignore[arg-type]
+            self.state = next_state
+            if after_send is not None:
+                after_send()
+
+    async def receive(self, raw: str | bytes) -> object:
+        event = parse_server_event(raw)  # type: ignore[arg-type]
+        async with self.lock:
+            # A best-effort close may race already-buffered output. It is
+            # neither a new turn nor a lifecycle violation; callers discard it.
+            if self.state.phase is Phase.CLOSE and isinstance(event, ResponseDelta):
+                return event
+            self.state = transition_server(self.state, event)
+        return event
 
 
 class RealtimeClient:
-    """Maintain MiniCPM-o video sessions with bounded tasks and reconnects."""
+    """Own the official MiniCPM-o video Realtime session lifecycle.
 
-    def __init__(self, config: Config) -> None:
-        self.config = config
-        self._ref_audio_base64: str | None = None
+    Microphone workers submit exact one-second units synchronously. Only the
+    newest unsent unit is retained, so a stalled socket can never replay a
+    burst of stale microphone audio after reconnecting.
+    """
 
-    async def run(
+    def __init__(
         self,
-        port: RealtimePort,
-        stop_event: threading.Event,
+        settings: Settings,
+        coordinator: TurnCoordinator,
+        *,
+        latest_frame: Callable[[], bytes | None],
+        on_audio: Callable[[np.ndarray, int, str | None], None],
+        on_listen: Callable[[int], None],
+        on_text: Callable[[str, int, str | None], None],
+        on_session: Callable[[bool, int], None],
     ) -> None:
-        backoff = self.config.reconnect_initial_delay
-        while not stop_event.is_set():
-            started_at = time.monotonic()
-            try:
-                outcome = await self.run_session(port, stop_event)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if stop_event.is_set():
-                    return
-                lived_for = time.monotonic() - started_at
-                if lived_for >= self.config.reconnect_reset_after:
-                    backoff = self.config.reconnect_initial_delay
-                delay = random.uniform(backoff * 0.75, backoff)
-                log.warning(
-                    "Realtime session failed (%s); reconnecting in %.1fs",
-                    exc,
-                    delay,
-                )
-                await self._wait_or_stop(stop_event, delay)
-                backoff = min(self.config.reconnect_max_delay, backoff * 2.0)
-                continue
+        validate_video_url(settings.realtime_url)
+        self.settings = settings
+        self.coordinator = coordinator
+        self.latest_frame = latest_frame
+        self.on_audio = on_audio
+        self.on_listen = on_listen
+        self.on_text = on_text
+        self.on_session = on_session
+        self._input_lock = threading.Lock()
+        self._latest_input: UplinkUnit | None = None
+        self._input_loop: asyncio.AbstractEventLoop | None = None
+        self._input_event: asyncio.Event | None = None
+        self._sequence = 0
+        self._sequence_lock = threading.Lock()
+        self._metrics = _Counters()
+        self._last_wire_send_at: float | None = None
+        self._last_input_send_at: float | None = None
+        self._last_audio_response_id: str | None = None
+        self._seen_audio_since_listen = False
+        self._input_send_timeout = 2.0
 
-            if outcome is SessionOutcome.STOP:
-                return
+    @property
+    def metrics(self) -> RealtimeMetrics:
+        return self._metrics.snapshot()
 
-            # A planned rollover is healthy and should not inherit an error
-            # backoff. The backend has no resume API, so the new session still
-            # resets context and incurs its normal initialization window.
-            backoff = self.config.reconnect_initial_delay
-            log.info("Realtime session reached rollover deadline; reconnecting")
-
-    async def run_session(
+    def submit_audio(
         self,
-        port: RealtimePort,
-        stop_event: threading.Event,
-    ) -> SessionOutcome:
-        invalidation_reason = "reconnect"
-        port_invalidated = False
-        websocket: Any | None = None
-        sender: asyncio.Task[Any] | None = None
-        receiver: asyncio.Task[Any] | None = None
-        tasks: set[asyncio.Task[Any]] = set()
-        closing = asyncio.Event()
-        kv_soft_reached = asyncio.Event()
-        kv_hard_reached = asyncio.Event()
+        samples: np.ndarray | bytes | bytearray | memoryview,
+        *,
+        captured_at: float | None = None,
+        sequence: int | None = None,
+    ) -> None:
+        """Publish one exact 16 kHz, mono, one-second F32LE input unit."""
+
+        if isinstance(samples, np.ndarray):
+            pcm = np.asarray(samples, dtype="<f4")
+            if pcm.ndim != 1 or pcm.size != self.settings.input_sample_rate:
+                raise ValueError("uplink audio must be exactly one second of mono 16 kHz")
+            if not np.all(np.isfinite(pcm)):
+                raise ValueError("uplink audio contains non-finite samples")
+            payload = np.ascontiguousarray(pcm).tobytes()
+        else:
+            payload = bytes(samples)
+            expected = self.settings.input_sample_rate * np.dtype("<f4").itemsize
+            if len(payload) != expected:
+                raise ValueError("uplink F32LE payload must contain exactly 16000 samples")
+            if not np.all(np.isfinite(np.frombuffer(payload, dtype="<f4"))):
+                raise ValueError("uplink audio contains non-finite samples")
+
+        if sequence is None:
+            with self._sequence_lock:
+                self._sequence += 1
+                sequence = self._sequence
+        unit = UplinkUnit(
+            sequence=sequence,
+            captured_at=time.monotonic() if captured_at is None else captured_at,
+            pcm_f32le=payload,
+        )
+        with self._input_lock:
+            if self._latest_input is not None:
+                self._metrics.add("dropped_input_units")
+            self._latest_input = unit
+            loop = self._input_loop
+            event = self._input_event
+        if loop is not None and event is not None:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(event.set)
+
+    async def run(self, stop_event: threading.Event) -> None:
+        """Reconnect until the app stops; sessions roll before the 300 s limit."""
+
+        self._bind_input_loop()
+        backoff = 0.25
+        reconnecting = False
+        try:
+            while not stop_event.is_set():
+                if reconnecting:
+                    self._metrics.add("reconnects")
+                try:
+                    should_stop = await self._run_session(stop_event)
+                    if should_stop:
+                        return
+                    backoff = 0.25
+                except asyncio.CancelledError:
+                    raise
+                except _StopRequested:
+                    return
+                except Exception as exc:
+                    if stop_event.is_set():
+                        return
+                    delay = random.uniform(backoff * 0.75, backoff)
+                    log.warning(
+                        "Realtime session failed (%s); retrying in %.2fs",
+                        exc,
+                        delay,
+                    )
+                    await self._wait_or_stop(stop_event, delay)
+                    backoff = min(self.settings.reconnect_max_seconds, backoff * 2.0)
+                reconnecting = True
+        finally:
+            self._unbind_input_loop()
+
+    async def _run_session(self, stop_event: threading.Event) -> bool:
+        activated = False
+        lifecycle = _Lifecycle()
+        ssl_context = self._ssl_context()
+        options: dict[str, Any] = {
+            "open_timeout": 10,
+            "close_timeout": 3,
+            "max_size": 16 * 1024 * 1024,
+            "max_queue": 4,
+            "compression": None,
+            "ping_interval": 20,
+            "ping_timeout": 20,
+            "proxy": None,
+        }
+        if ssl_context is not None:
+            options["ssl"] = ssl_context
 
         try:
-            if stop_event.is_set():
-                invalidation_reason = "stop"
-                return SessionOutcome.STOP
-
-            port.invalidate_session("connecting")
-            stopper = asyncio.create_task(
-                self._stop_waiter(stop_event),
-                name="realtime-stop",
-            )
-            tasks.add(stopper)
-            ref_audio_base64 = await self._ensure_ref_audio(stop_event)
-            if stop_event.is_set():
-                invalidation_reason = "stop"
-                port.invalidate_session(invalidation_reason)
-                port_invalidated = True
-                return SessionOutcome.STOP
-
-            connect = asyncio.ensure_future(
-                websockets.connect(
-                    self.config.realtime_url,
-                    ssl=self.config.ssl_context(),
-                    open_timeout=10,
-                    close_timeout=3,
-                    max_size=self.config.max_message_size,
-                    max_queue=8,
-                    compression=None,
-                    ping_interval=20,
-                    ping_timeout=20,
+            async with connect(self.settings.realtime_url, **options) as websocket:
+                self._metrics.add("connections")
+                await self._wait_for_queue(websocket, lifecycle, stop_event)
+                session_deadline = asyncio.get_running_loop().time() + self.settings.session_seconds
+                init = session_init(
+                    self.settings.system_prompt,
+                    length_penalty=self.settings.length_penalty,
                 )
-            )
-            connect_started_at = asyncio.get_running_loop().time()
-            connect.set_name("realtime-connect")
-            tasks.add(connect)
-            connected, _ = await asyncio.wait(
-                {connect, stopper},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if stopper in connected or stop_event.is_set():
-                invalidation_reason = "stop"
-                port.invalidate_session(invalidation_reason)
-                port_invalidated = True
-                connect.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await connect
-                return SessionOutcome.STOP
-            websocket = connect.result()
-            connected_at = asyncio.get_running_loop().time()
-
-            handshake = asyncio.create_task(
-                self._handshake(websocket, ref_audio_base64),
-                name="realtime-handshake",
-            )
-            tasks.update({stopper, handshake})
-            ready, _ = await asyncio.wait(
-                {handshake, stopper},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if stopper in ready or stop_event.is_set():
-                invalidation_reason = "stop"
-                port.invalidate_session(invalidation_reason)
-                port_invalidated = True
-                handshake.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await handshake
-                await self._send_close(websocket, "user_stop")
-                return SessionOutcome.STOP
-
-            session_id, assigned_at = handshake.result()
-            created_at = asyncio.get_running_loop().time()
-            port.handle_session_ready()
-            log.info(
-                "Realtime session ready: %s (connect %.1f ms, queue %.1f ms, init %.1f ms)",
-                session_id,
-                (connected_at - connect_started_at) * 1000.0,
-                (assigned_at - connected_at) * 1000.0,
-                (created_at - assigned_at) * 1000.0,
-            )
-
-            sender = asyncio.create_task(
-                self._send_loop(websocket, port, stop_event, closing),
-                name="realtime-send",
-            )
-            receiver = asyncio.create_task(
-                self._receive_loop(
+                await self._send_init(
                     websocket,
-                    port,
-                    kv_soft_reached=kv_soft_reached,
-                    kv_hard_reached=kv_hard_reached,
-                ),
-                name="realtime-receive",
-            )
-            elapsed_since_assignment = asyncio.get_running_loop().time() - assigned_at
-            rollover = asyncio.create_task(
-                asyncio.sleep(max(0.0, self.config.session_rollover - elapsed_since_assignment)),
-                name="realtime-rollover",
-            )
-            kv_soft_rollover = asyncio.create_task(
-                kv_soft_reached.wait(),
-                name="realtime-kv-soft-rollover",
-            )
-            kv_hard_rollover = asyncio.create_task(
-                kv_hard_reached.wait(),
-                name="realtime-kv-hard-rollover",
-            )
-            tasks.update(
-                {
-                    sender,
-                    receiver,
-                    stopper,
-                    rollover,
-                    kv_soft_rollover,
-                    kv_hard_rollover,
-                }
-            )
+                    lifecycle,
+                    init,
+                    stop_event,
+                    session_deadline,
+                )
+                created = await self._wait_for_created(
+                    websocket,
+                    lifecycle,
+                    stop_event,
+                    session_deadline,
+                )
 
-            watched = {
-                sender,
-                receiver,
-                stopper,
-                rollover,
-                kv_soft_rollover,
-                kv_hard_rollover,
-            }
-            done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+                self._last_wire_send_at = None
+                self._last_input_send_at = None
+                self._last_audio_response_id = None
+                self._seen_audio_since_listen = False
+                epoch = self.coordinator.new_session()
+                self.on_session(True, epoch)
+                activated = True
+                log.info("MiniCPM-o session ready: %s", created.session_id)
+                return await self._stream(
+                    websocket,
+                    lifecycle,
+                    stop_event,
+                    session_deadline,
+                )
+        except ConnectionClosed as exc:
+            if stop_event.is_set():
+                return True
+            raise RealtimeError(
+                f"WebSocket closed ({exc.code}: {exc.reason or 'no reason'})"
+            ) from exc
+        finally:
+            if activated:
+                epoch = self.coordinator.session_lost()
+                self.on_session(False, epoch)
 
-            if stopper in done or stop_event.is_set():
-                invalidation_reason = "stop"
-                port.invalidate_session(invalidation_reason)
-                port_invalidated = True
-                await self._stop_sender(sender, closing)
-                await self._close_and_wait(websocket, receiver, "user_stop")
-                return SessionOutcome.STOP
-            if done.intersection({rollover, kv_soft_rollover, kv_hard_rollover}):
-                hard_kv_limit = kv_hard_rollover in done
-                if hard_kv_limit:
-                    log.warning(
-                        "Forcing realtime rollover at kv_cache_length >= %d",
-                        self.config.kv_hard_limit,
-                    )
-                elif kv_soft_rollover in done:
-                    log.info(
-                        "MiniCPM kv cache reached %d; waiting for a clean turn boundary",
-                        self.config.kv_soft_limit,
-                    )
-                hard_deadline = assigned_at + SESSION_CLOSE_START_SECONDS
-                while not hard_kv_limit and not port.ready_for_rollover():
-                    remaining = hard_deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0.0:
-                        log.warning("Forcing realtime rollover at the hard deadline")
-                        break
-                    lifecycle_done, _ = await asyncio.wait(
-                        {sender, receiver, stopper, kv_hard_rollover},
-                        timeout=min(0.05, remaining),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if kv_hard_rollover in lifecycle_done:
-                        hard_kv_limit = True
-                        log.warning(
-                            "Forcing realtime rollover at kv_cache_length >= %d",
-                            self.config.kv_hard_limit,
-                        )
-                        break
-                    if stopper in lifecycle_done or stop_event.is_set():
-                        invalidation_reason = "stop"
-                        port.invalidate_session(invalidation_reason)
-                        port_invalidated = True
-                        await self._stop_sender(sender, closing)
-                        await self._close_and_wait(websocket, receiver, "user_stop")
-                        return SessionOutcome.STOP
-                    completed_io = lifecycle_done.intersection({sender, receiver})
-                    if completed_io:
-                        completed = next(iter(completed_io))
-                        error = completed.exception()
-                        if error is not None:
-                            raise error
-                        raise ConnectionError(f"{completed.get_name()} ended unexpectedly")
+    async def _wait_for_queue(
+        self,
+        websocket: ClientConnection,
+        lifecycle: _Lifecycle,
+        stop_event: threading.Event,
+    ) -> None:
+        while True:
+            event = await self._receive_one(websocket, lifecycle, stop_event)
+            if isinstance(event, QueueDone):
+                return
+            if isinstance(event, QueueStatus):
+                log.info(
+                    "MiniCPM-o queue position %d%s",
+                    event.position,
+                    (
+                        f", estimated {event.estimated_wait_s:.1f}s"
+                        if event.estimated_wait_s is not None
+                        else ""
+                    ),
+                )
+                continue
+            if isinstance(event, ServerError):
+                raise RealtimeError(f"MiniCPM-o queue error: {event.error}")
+            raise RealtimeError(f"unexpected event before queue_done: {event!r}")
 
-                invalidation_reason = "rollover"
-                port.invalidate_session(invalidation_reason)
-                port_invalidated = True
-                await self._stop_sender(sender, closing)
-                await self._close_and_wait(websocket, receiver, "client_rollover")
-                return SessionOutcome.ROLLOVER
+    async def _wait_for_created(
+        self,
+        websocket: ClientConnection,
+        lifecycle: _Lifecycle,
+        stop_event: threading.Event,
+        session_deadline: float,
+    ) -> SessionCreated:
+        while True:
+            if asyncio.get_running_loop().time() >= session_deadline:
+                raise RealtimeError("session initialization exceeded its video budget")
+            try:
+                event = await self._receive_one(
+                    websocket,
+                    lifecycle,
+                    stop_event,
+                    deadline=session_deadline,
+                )
+            except TimeoutError as exc:
+                raise RealtimeError("session initialization exceeded its video budget") from exc
+            if isinstance(event, SessionCreated):
+                return event
+            if isinstance(event, ServerError):
+                raise RealtimeError(f"MiniCPM-o init error: {event.error}")
+            raise RealtimeError(f"unexpected event before session.created: {event!r}")
 
-            completed = next(task for task in done if task in {sender, receiver})
-            error = completed.exception()
-            if error is not None:
-                raise error
-            raise ConnectionError(f"{completed.get_name()} ended unexpectedly")
+    async def _send_init(
+        self,
+        websocket: ClientConnection,
+        lifecycle: _Lifecycle,
+        event: dict[str, Any],
+        stop_event: threading.Event,
+        session_deadline: float,
+    ) -> None:
+        """Bound the initialization write without cancelling an active send first."""
+
+        loop = asyncio.get_running_loop()
+        write_deadline = min(session_deadline, loop.time() + 5.0)
+        sending = asyncio.create_task(
+            lifecycle.send(websocket, event),
+            name="minicpmo-session-init",
+        )
+        failure: Exception | None = None
+        try:
+            while not sending.done():
+                if stop_event.is_set():
+                    failure = _StopRequested()
+                    break
+                remaining = write_deadline - loop.time()
+                if remaining <= 0:
+                    failure = RealtimeError("session.init send timed out")
+                    break
+                await asyncio.wait({sending}, timeout=min(0.05, remaining))
         except asyncio.CancelledError:
-            invalidation_reason = "cancelled"
-            port.invalidate_session(invalidation_reason)
-            port_invalidated = True
-            await self._stop_sender(sender, closing)
-            if websocket is not None:
-                await self._close_and_wait(websocket, receiver, "client_cancelled")
+            await self._abort_send(
+                websocket,
+                sending,
+                code=1000,
+                reason="init_cancelled",
+            )
             raise
+        if failure is None:
+            await sending
+            return
+
+        await self._abort_send(
+            websocket,
+            sending,
+            code=1000,
+            reason="init_aborted",
+        )
+        raise failure
+
+    async def _receive_one(
+        self,
+        websocket: ClientConnection,
+        lifecycle: _Lifecycle,
+        stop_event: threading.Event,
+        *,
+        deadline: float | None = None,
+    ) -> object:
+        loop = asyncio.get_running_loop()
+        while not stop_event.is_set():
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError
+                receive_timeout = min(0.25, remaining)
+            else:
+                receive_timeout = 0.25
+            try:
+                raw = await asyncio.wait_for(
+                    websocket.recv(),
+                    timeout=receive_timeout,
+                )
+            except TimeoutError:
+                if deadline is not None and loop.time() >= deadline:
+                    raise
+                continue
+            return await lifecycle.receive(raw)
+        raise _StopRequested
+
+    async def _stream(
+        self,
+        websocket: ClientConnection,
+        lifecycle: _Lifecycle,
+        stop_event: threading.Event,
+        session_deadline: float,
+    ) -> bool:
+        closed = asyncio.Event()
+        sender_stop = asyncio.Event()
+        sender = asyncio.create_task(
+            self._sender(websocket, lifecycle, stop_event, sender_stop),
+            name="minicpmo-uplink",
+        )
+        receiver = asyncio.create_task(
+            self._receiver(websocket, lifecycle, closed),
+            name="minicpmo-downlink",
+        )
+        stopper = asyncio.create_task(
+            self._stop_waiter(stop_event),
+            name="minicpmo-stop",
+        )
+        rollover = asyncio.create_task(
+            asyncio.sleep(max(0.0, session_deadline - asyncio.get_running_loop().time())),
+            name="minicpmo-rollover",
+        )
+        tasks = {sender, receiver, stopper, rollover}
+        reason = "session_rollover"
+        should_stop = False
+
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if receiver in done:
+                error = receiver.exception()
+                if error is not None:
+                    raise error
+                return stop_event.is_set()
+            if stopper in done or (sender in done and stop_event.is_set()):
+                reason = "user_stop"
+                should_stop = True
+            elif sender in done:
+                error = sender.exception()
+                if error is not None:
+                    raise error
+                raise RealtimeError("microphone sender stopped unexpectedly")
+
+            sender_stop.set()
+            if self._input_event is not None:
+                self._input_event.set()
+            try:
+                await asyncio.wait_for(asyncio.shield(sender), timeout=1.0)
+            except TimeoutError:
+                log.warning("uplink did not stop cooperatively; closing the WebSocket")
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        websocket.close(code=1000, reason=reason),
+                        timeout=1.0,
+                    )
+                if not sender.done():
+                    sender.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await sender
+                return should_stop
+
+            if lifecycle.state.phase in {Phase.CREATED, Phase.STREAMING} and not receiver.done():
+                close_send = asyncio.create_task(
+                    lifecycle.send(websocket, session_close(reason)),
+                    name="minicpmo-session-close",
+                )
+                try:
+                    await asyncio.wait_for(asyncio.shield(close_send), timeout=1.0)
+                except asyncio.CancelledError:
+                    await self._abort_send(
+                        websocket,
+                        close_send,
+                        code=1000,
+                        reason=reason,
+                    )
+                    raise
+                except TimeoutError:
+                    log.warning("session.close send timed out; closing the WebSocket")
+                    await self._abort_send(
+                        websocket,
+                        close_send,
+                        code=1000,
+                        reason=reason,
+                    )
+                    return should_stop
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(closed.wait(), timeout=2.0)
+            return should_stop
         finally:
             for task in tasks:
-                task.cancel()
-            for task in tasks:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            if websocket is not None:
-                with contextlib.suppress(Exception):
-                    await websocket.close()
-            if not port_invalidated:
-                try:
-                    port.invalidate_session(invalidation_reason)
-                except Exception:
-                    log.exception("Realtime port session invalidation failed")
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _ensure_ref_audio(self, stop_event: threading.Event) -> str | None:
-        if not self.config.enable_tts:
-            return None
-        if self._ref_audio_base64 is None:
-            result: queue.SimpleQueue[tuple[bool, str | BaseException]] = queue.SimpleQueue()
-
-            def load() -> None:
-                try:
-                    result.put((True, load_gateway_ref_audio(self.config)))
-                except BaseException as exc:
-                    result.put((False, exc))
-
-            threading.Thread(
-                target=load,
-                name="yrobot-reference-voice",
-                daemon=True,
-            ).start()
-            while not stop_event.is_set():
-                try:
-                    succeeded, value = result.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(0.02)
-                    continue
-                if not succeeded:
-                    assert isinstance(value, BaseException)
-                    raise value
-                assert isinstance(value, str)
-                self._ref_audio_base64 = value
-                break
-            if stop_event.is_set():
-                return None
-            log.info("Loaded and cached the Gateway default reference voice")
-        return self._ref_audio_base64
-
-    async def _handshake(
+    async def _sender(
         self,
-        websocket: Any,
-        ref_audio_base64: str | None = None,
-    ) -> tuple[str, float]:
-        queue_done = False
-        init_sent = False
-        assigned_at = 0.0
-
-        async with asyncio.timeout(self.config.handshake_timeout):
-            while True:
-                event = _parse_event(await websocket.recv())
-                event_type = event["type"]
-
-                if event_type in {"session.queued", "session.queue_update"}:
-                    position = event.get("position")
-                    eta = event.get("estimated_wait_seconds")
-                    log.info("Realtime queue: position=%s eta=%s", position, eta)
-                    continue
-                if event_type == "session.queue_done":
-                    if not init_sent:
-                        queue_done = True
-                        assigned_at = asyncio.get_running_loop().time()
-                        await websocket.send(
-                            json.dumps(
-                                build_session_init(
-                                    self.config.system_prompt,
-                                    length_penalty=self.config.length_penalty,
-                                    force_listen_count=self.config.force_listen_count,
-                                    enable_tts=self.config.enable_tts,
-                                    ref_audio_base64=ref_audio_base64,
-                                ),
-                                separators=(",", ":"),
-                            )
-                        )
-                        init_sent = True
-                    continue
-                if event_type == "session.created":
-                    if not queue_done or not init_sent:
-                        raise RealtimeProtocolError(
-                            "session.created arrived before session.queue_done"
-                        )
-                    return str(event.get("session_id") or "unknown"), assigned_at
-                if event_type == "error":
-                    raise RealtimeProtocolError(json.dumps(event, ensure_ascii=False))
-                if event_type == "session.closed":
-                    raise ConnectionError(
-                        str(event.get("reason") or "session closed during handshake")
-                    )
-                log.debug("Ignoring handshake event: %s", event_type)
-
-    async def _send_loop(
-        self,
-        websocket: Any,
-        port: RealtimePort,
+        websocket: ClientConnection,
+        lifecycle: _Lifecycle,
         stop_event: threading.Event,
-        closing: asyncio.Event,
+        session_stop: asyncio.Event | None = None,
     ) -> None:
-        while not stop_event.is_set() and not closing.is_set():
-            item = await asyncio.to_thread(port.next_audio_unit, 0.25)
-            if item is None or closing.is_set():
-                continue
-            audio, force_listen = item
-            # The media layer owns camera capture/JPEG encoding and exposes one
-            # immutable latest-only slot, so this read cannot backpressure audio.
-            frame = port.latest_frame_jpeg() if self.config.send_video else None
-            if frame is not None and not isinstance(frame, bytes):
-                raise TypeError("latest_frame_jpeg() must return bytes or None")
-            message = await asyncio.to_thread(
-                build_input_append,
-                audio,
-                frame,
-                force_listen=force_listen,
-            )
-            if closing.is_set():
+        self._bind_input_loop()
+        if session_stop is None:
+            session_stop = asyncio.Event()
+        next_send_at = 0.0
+        send_period = self.settings.input_unit_ms / 1_000
+        while not stop_event.is_set() and not session_stop.is_set():
+            await self._wait_until(stop_event, next_send_at, session_stop)
+            if stop_event.is_set() or session_stop.is_set():
                 return
-            await websocket.send(json.dumps(message, separators=(",", ":")))
+            unit = await self._next_input(stop_event, session_stop)
+            if unit is None:
+                continue
+            age = time.monotonic() - unit.captured_at
+            if age > 1.5:
+                self._metrics.add("dropped_input_units")
+                continue
+            snapshot = self.coordinator.snapshot()
+            frame = self.latest_frame()
+            if stop_event.is_set() or session_stop.is_set():
+                return
+            event = input_append(
+                unit.pcm_f32le,
+                video_frames=(frame,) if frame else (),
+                force_listen=snapshot.force_listen,
+                max_slice_nums=1,
+            )
+            send_started_at = asyncio.get_running_loop().time()
+            after_send = (
+                partial(self.coordinator.force_listen_sent, snapshot.epoch)
+                if snapshot.force_listen
+                else None
+            )
+            await self._send_input(
+                websocket,
+                lifecycle,
+                event,
+                after_send,
+            )
+            sent_at = time.monotonic()
+            self._metrics.observe(
+                "capture_to_send",
+                (sent_at - unit.captured_at) * 1_000,
+            )
+            if self._last_wire_send_at is not None:
+                self._metrics.observe(
+                    "send_interval",
+                    (sent_at - self._last_wire_send_at) * 1_000,
+                )
+            self._last_wire_send_at = sent_at
+            self._last_input_send_at = sent_at
+            self._metrics.add("input_units")
+            completed_at = asyncio.get_running_loop().time()
+            next_send_at = send_started_at + send_period
+            if next_send_at <= completed_at:
+                next_send_at = completed_at + send_period
 
-    @staticmethod
-    async def _stop_sender(
-        sender: asyncio.Task[Any] | None,
-        closing: asyncio.Event,
+    async def _send_input(
+        self,
+        websocket: ClientConnection,
+        lifecycle: _Lifecycle,
+        event: dict[str, Any],
+        after_send: Callable[[], None] | None,
     ) -> None:
-        """Finish or cancel the sole input producer before session.close."""
-
-        closing.set()
-        if sender is None:
-            return
+        sending = asyncio.create_task(
+            lifecycle.send_then(websocket, event, after_send),
+            name="minicpmo-input-send",
+        )
         try:
             await asyncio.wait_for(
-                asyncio.shield(sender),
-                timeout=SENDER_STOP_TIMEOUT,
+                asyncio.shield(sending),
+                timeout=self._input_send_timeout,
             )
-        except TimeoutError:
-            sender.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await sender
-        except Exception:
-            # A shutdown path still owns transport cleanup; input must remain
-            # stopped even if its final send failed.
-            return
-
-    async def _receive_loop(
-        self,
-        websocket: Any,
-        port: RealtimePort,
-        *,
-        kv_soft_reached: asyncio.Event | None = None,
-        kv_hard_reached: asyncio.Event | None = None,
-    ) -> None:
-        session_closed_seen = False
-        try:
-            while True:
-                event = _parse_event(await websocket.recv())
-                event_type = event["type"]
-
-                if event_type == "response.output.delta":
-                    kind = event.get("kind")
-                    response_id = str(event.get("response_id") or "")
-                    metrics = _metrics(event)
-                    self._observe_kv_budget(
-                        metrics,
-                        kv_soft_reached=kv_soft_reached,
-                        kv_hard_reached=kv_hard_reached,
-                    )
-                    if kind == "audio":
-                        audio = event.get("audio")
-                        if isinstance(audio, str) and audio:
-                            port.handle_audio_delta(
-                                decode_output_audio(audio),
-                                response_id,
-                                metrics,
-                            )
-                    elif kind == "listen":
-                        port.handle_listen(response_id, metrics)
-                    elif kind == "text":
-                        text = event.get("text")
-                        if isinstance(text, str) and text:
-                            port.handle_text(text, response_id)
-                    else:
-                        log.debug("Ignoring Realtime output kind: %s", kind)
-                    continue
-
-                if event_type == "error":
-                    raise RealtimeProtocolError(json.dumps(event, ensure_ascii=False))
-                if event_type == "session.closed":
-                    # This Gateway releases its worker only after closing the
-                    # internal Worker WebSocket, then closes this transport.
-                    # Waiting for that close avoids the immutable deployment's
-                    # early-session.closed / next-session HTTP 403 race.
-                    session_closed_seen = True
-                    log.debug(
-                        "Realtime session.closed received; waiting for transport cleanup: %s",
-                        event.get("reason"),
-                    )
-                    continue
-                if event_type == "response.done":
-                    # Full-duplex turn boundaries are kind=listen. Some backend
-                    # versions still emit response.done; it has no state effect.
-                    log.debug("Ignoring chat-only response.done in duplex session")
-                    continue
-                log.debug("Ignoring Realtime event: %s", event_type)
-        except ConnectionClosed as exc:
-            if session_closed_seen:
-                return
-            raise ConnectionError("Realtime WebSocket transport closed") from exc
-
-    def _observe_kv_budget(
-        self,
-        metrics: Mapping[str, Any],
-        *,
-        kv_soft_reached: asyncio.Event | None,
-        kv_hard_reached: asyncio.Event | None,
-    ) -> None:
-        raw = metrics.get("kv_cache_length")
-        if isinstance(raw, bool) or not isinstance(raw, int | float):
-            return
-        value = float(raw)
-        if not math.isfinite(value) or value < 0.0:
-            return
-        if value >= self.config.kv_hard_limit:
-            if kv_soft_reached is not None:
-                kv_soft_reached.set()
-            if kv_hard_reached is not None:
-                kv_hard_reached.set()
-        elif value >= self.config.kv_soft_limit and kv_soft_reached is not None:
-            kv_soft_reached.set()
-
-    @staticmethod
-    async def _send_close(websocket: Any, reason: str) -> None:
-        with contextlib.suppress(Exception):
-            await websocket.send(
-                json.dumps(
-                    {"type": "session.close", "reason": reason},
-                    separators=(",", ":"),
-                )
+        except asyncio.CancelledError:
+            await self._abort_send(
+                websocket,
+                sending,
+                code=1000,
+                reason="input_send_cancelled",
             )
+            raise
+        except TimeoutError as exc:
+            log.warning("input.append send timed out; closing the WebSocket")
+            await self._abort_send(
+                websocket,
+                sending,
+                code=1011,
+                reason="input_send_timeout",
+            )
+            raise RealtimeError("input.append send timed out") from exc
 
-    async def _close_and_wait(
+    async def _abort_send(
         self,
-        websocket: Any,
-        receiver: asyncio.Task[Any] | None,
+        websocket: ClientConnection,
+        sending: asyncio.Task[None],
+        *,
+        code: int,
         reason: str,
     ) -> None:
-        """Ask every server layer to finish cleanup before closing transport."""
-
-        await self._send_close(websocket, reason)
-        if receiver is None or receiver.done():
-            return
-        try:
+        with contextlib.suppress(Exception):
             await asyncio.wait_for(
-                asyncio.shield(receiver),
-                timeout=self.config.close_ack_timeout,
+                websocket.close(code=code, reason=reason),
+                timeout=1.0,
             )
-        except (TimeoutError, ConnectionError):
-            log.warning(
-                "Realtime close acknowledgement timed out or disconnected after %.1fs",
-                self.config.close_ack_timeout,
-            )
+        if not sending.done():
+            sending.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
 
-    @staticmethod
-    async def _stop_waiter(stop_event: threading.Event) -> None:
+    async def _next_input(
+        self,
+        stop_event: threading.Event,
+        session_stop: asyncio.Event | None = None,
+    ) -> UplinkUnit | None:
+        if stop_event.is_set() or (session_stop is not None and session_stop.is_set()):
+            return None
+        self._bind_input_loop()
+        assert self._input_event is not None
+        self._input_event.clear()
+        with self._input_lock:
+            unit = self._latest_input
+            self._latest_input = None
+        if unit is not None:
+            return unit
+        try:
+            await asyncio.wait_for(self._input_event.wait(), timeout=0.1)
+        except TimeoutError:
+            return None
+        if stop_event.is_set() or (session_stop is not None and session_stop.is_set()):
+            return None
+        with self._input_lock:
+            unit = self._latest_input
+            self._latest_input = None
+        return unit
+
+    async def _receiver(
+        self,
+        websocket: ClientConnection,
+        lifecycle: _Lifecycle,
+        closed: asyncio.Event,
+    ) -> None:
+        while True:
+            raw = await websocket.recv()
+            event = await lifecycle.receive(raw)
+            if isinstance(event, SessionClosed):
+                closed.set()
+                return
+            if isinstance(event, ServerError):
+                raise RealtimeError(f"MiniCPM-o server error: {event.error}")
+            if not isinstance(event, ResponseDelta):
+                raise RealtimeError(f"unexpected streaming event: {event!r}")
+            if lifecycle.state.phase is Phase.CLOSE:
+                continue
+
+            if event.kind == "listen":
+                epoch = self.coordinator.model_listening()
+                if epoch is None:
+                    continue
+                self._last_audio_response_id = None
+                self._seen_audio_since_listen = False
+                self._metrics.add("listen_deltas")
+                self.on_listen(epoch)
+                continue
+            if event.kind == "text":
+                self._metrics.add("text_deltas")
+                snapshot = self.coordinator.snapshot()
+                if not snapshot.drop_output and event.text is not None:
+                    self.on_text(event.text, snapshot.epoch, event.response_id)
+                continue
+
+            assert event.audio is not None
+            epoch = self.coordinator.accept_audio(event.response_id)
+            if epoch is None:
+                continue
+            samples = np.frombuffer(event.audio.pcm_f32le, dtype="<f4").copy()
+            if not np.all(np.isfinite(samples)):
+                raise RealtimeError("MiniCPM-o output contains non-finite samples")
+            is_first = (
+                event.response_id != self._last_audio_response_id
+                if event.response_id is not None
+                else not self._seen_audio_since_listen
+            )
+            if is_first and self._last_input_send_at is not None:
+                self._metrics.observe(
+                    "input_to_first_audio",
+                    (time.monotonic() - self._last_input_send_at) * 1_000,
+                )
+            self._last_audio_response_id = event.response_id
+            self._seen_audio_since_listen = True
+            self._metrics.add("audio_deltas")
+            self.on_audio(samples, epoch, event.response_id)
+
+    async def _stop_waiter(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
             await asyncio.sleep(0.05)
 
-    @staticmethod
-    async def _wait_or_stop(stop_event: threading.Event, delay: float) -> None:
-        deadline = asyncio.get_running_loop().time() + delay
+    async def _wait_or_stop(
+        self,
+        stop_event: threading.Event,
+        seconds: float,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + seconds
         while not stop_event.is_set() and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.05)
+
+    async def _wait_until(
+        self,
+        stop_event: threading.Event,
+        deadline: float,
+        session_stop: asyncio.Event | None = None,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        while (
+            not stop_event.is_set()
+            and (session_stop is None or not session_stop.is_set())
+            and loop.time() < deadline
+        ):
+            await asyncio.sleep(min(0.05, deadline - loop.time()))
+
+    def _bind_input_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._input_lock:
+            if self._input_loop is loop and self._input_event is not None:
+                return
+            if self._input_loop is not None and not self._input_loop.is_closed():
+                raise RuntimeError("RealtimeClient is already bound to another event loop")
+            event = asyncio.Event()
+            self._input_loop = loop
+            self._input_event = event
+            pending = self._latest_input is not None
+        if pending:
+            event.set()
+
+    def _unbind_input_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._input_lock:
+            if self._input_loop is loop:
+                self._input_loop = None
+                self._input_event = None
+
+    def _ssl_context(self) -> ssl.SSLContext | None:
+        if urlsplit(self.settings.realtime_url).scheme != "wss":
+            return None
+        context = ssl.create_default_context()
+        if not self.settings.tls_verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        return context

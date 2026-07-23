@@ -1,216 +1,75 @@
-import ssl
+from __future__ import annotations
+
+from dataclasses import replace
 
 import pytest
 
-from yrobot.config import DEFAULT_SYSTEM_PROMPT, Config, normalize_realtime_url
+from yrobot.config import OFFICIAL_REALTIME_URL, Settings
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (
-            "10.0.16.184:8006",
-            "wss://10.0.16.184:8006/v1/realtime?mode=video",
-        ),
-        (
-            "10.0.16.184:8006/v1/realtime?mode=video",
-            "wss://10.0.16.184:8006/v1/realtime?mode=video",
-        ),
-        (
-            "http://brain.local:8006",
-            "ws://brain.local:8006/v1/realtime?mode=video",
-        ),
-        (
-            "https://brain.local/v1/realtime?mode=audio",
-            "wss://brain.local/v1/realtime?mode=video",
-        ),
-        (
-            "ws://brain.local:8006/v1/realtime/",
-            "ws://brain.local:8006/v1/realtime?mode=video",
-        ),
-        (
-            "wss://brain.local",
-            "wss://brain.local/v1/realtime?mode=video",
-        ),
-    ],
-)
-def test_normalize_realtime_url(value: str, expected: str) -> None:
-    assert normalize_realtime_url(value) == expected
+def test_official_realtime_defaults_are_fixed_to_video_duplex() -> None:
+    settings = Settings()
+    settings.validate()
+
+    assert settings.realtime_url == OFFICIAL_REALTIME_URL
+    assert settings.input_sample_rate == 16_000
+    assert settings.output_sample_rate == 24_000
+    assert settings.input_unit_ms == 1_000
+    assert settings.camera_width == 640
+    assert settings.camera_fps == 1.0
+    assert settings.motion_hz == 50.0
+    assert settings.session_seconds < 300
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        "ws://brain.local:28099/backend",
-        "https://brain.local/some/backend",
-        "ftp://brain.local",
-        "ws://brain.local/not-realtime",
-        "ws://brain.local/v1/realtime?token=secret",
-        "ws://brain.local/v1/realtime#fragment",
-        "ws://brain.local:not-a-port",
-        "",
-    ],
-)
-def test_normalize_realtime_url_rejects_legacy_or_invalid_values(value: str) -> None:
-    with pytest.raises(ValueError):
-        normalize_realtime_url(value)
-
-
-def test_config_loads_yrobot_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("YROBOT_REALTIME_URL", "https://brain.local:8006")
-    monkeypatch.setenv("YROBOT_TLS_VERIFY", "0")
-    monkeypatch.setenv("YROBOT_SEND_VIDEO", "false")
-    monkeypatch.setenv("YROBOT_ENABLE_TTS", "false")
-    monkeypatch.setenv("YROBOT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
-    monkeypatch.setenv("YROBOT_LENGTH_PENALTY", "1.25")
-    monkeypatch.setenv("YROBOT_FORCE_LISTEN_COUNT", "1")
-    monkeypatch.setenv("YROBOT_CHUNK_MS", "600")
-    monkeypatch.setenv("YROBOT_FRAME_ACTIVE_S", "0.75")
-    monkeypatch.setenv("YROBOT_FRAME_IDLE_S", "6")
-    monkeypatch.setenv("YROBOT_PLAYBACK_LEAD_S", "0.1")
-    monkeypatch.setenv("YROBOT_KV_SOFT", "6000")
-    monkeypatch.setenv("YROBOT_KV_HARD", "7600")
-    monkeypatch.setenv("YROBOT_RECONNECT_INITIAL", "0.25")
-    monkeypatch.setenv("YROBOT_RECONNECT_MAX", "4")
-    monkeypatch.setenv("YROBOT_SESSION_ROLLOVER", "280")
-
-    config = Config.load()
-
-    assert config.realtime_url == "wss://brain.local:8006/v1/realtime?mode=video"
-    assert config.tls_verify is False
-    assert config.send_video is False
-    assert config.enable_tts is False
-    assert config.system_prompt == DEFAULT_SYSTEM_PROMPT
-    assert config.length_penalty == 1.25
-    assert config.force_listen_count == 1
-    assert config.audio_chunk_ms == 600
-    assert config.audio_unit_samples == 9_600
-    assert config.frame_active_interval == 0.75
-    assert config.frame_idle_interval == 6.0
-    assert config.playback_lead_seconds == 0.1
-    assert config.kv_soft_limit == 6_000
-    assert config.kv_hard_limit == 7_600
-    assert config.reconnect_initial_delay == 0.25
-    assert config.reconnect_max_delay == 4.0
-    assert config.session_rollover == 280.0
-
-
-def test_config_defaults_use_minicpm_realtime_gateway(
+def test_environment_only_exposes_operational_tuning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    names = [
+    monkeypatch.setattr("yrobot.config.load_dotenv", lambda: None)
+    monkeypatch.setenv(
         "YROBOT_REALTIME_URL",
-        "YROBOT_TLS_VERIFY",
-        "YROBOT_SEND_VIDEO",
-        "YROBOT_ENABLE_TTS",
-        "YROBOT_SYSTEM_PROMPT",
-        "YROBOT_LENGTH_PENALTY",
-        "YROBOT_FORCE_LISTEN_COUNT",
-        "YROBOT_CHUNK_MS",
-        "YROBOT_FRAME_ACTIVE_S",
-        "YROBOT_FRAME_IDLE_S",
-        "YROBOT_PLAYBACK_LEAD_S",
-        "YROBOT_KV_SOFT",
-        "YROBOT_KV_HARD",
-        "YROBOT_RECONNECT_INITIAL",
-        "YROBOT_RECONNECT_MAX",
-        "YROBOT_SESSION_ROLLOVER",
-    ]
-    for name in names:
-        monkeypatch.delenv(name, raising=False)
+        "wss://brain.local:8006/v1/realtime?mode=video",
+    )
+    monkeypatch.setenv("YROBOT_TLS_VERIFY", "false")
+    monkeypatch.setenv("YROBOT_VAD_MODE", "3")
+    monkeypatch.setenv("YROBOT_BARGE_ATTACK_MS", "80")
+    monkeypatch.setenv("YROBOT_DOA_HZ", "15")
 
-    # Legacy variables are deliberately ignored by the clean 2.0 boundary.
-    monkeypatch.setenv("OMNI_WS_URL", "ws://legacy.invalid/backend")
-    monkeypatch.setenv("OMNI_FORCE_LISTEN_COUNT", "9")
+    settings = Settings.from_env()
 
-    config = Config.load()
-
-    assert config.realtime_url == ("wss://10.0.16.184:8006/v1/realtime?mode=video")
-    assert config.tls_verify is False
-    assert config.send_video is True
-    assert config.enable_tts is True
-    assert config.system_prompt == DEFAULT_SYSTEM_PROMPT
-    assert config.length_penalty == 1.1
-    assert config.force_listen_count == 1
-    assert config.audio_chunk_ms == 500
-    assert config.audio_unit_samples == 8_000
-    assert config.frame_active_interval == 1.0
-    assert config.frame_idle_interval == 5.0
-    assert config.playback_lead_seconds == 0.120
-    assert config.kv_soft_limit == 6_500
-    assert config.kv_hard_limit == 7_800
-    assert config.session_rollover == 280.0
+    assert settings.realtime_url == ("wss://brain.local:8006/v1/realtime?mode=video")
+    assert settings.tls_verify is False
+    assert settings.vad_mode == 3
+    assert settings.barge_attack_ms == 80
+    assert settings.doa_hz == 15
 
 
 @pytest.mark.parametrize(
-    ("name", "value"),
+    "settings",
     [
-        ("YROBOT_TLS_VERIFY", "maybe"),
-        ("YROBOT_LENGTH_PENALTY", "nan"),
-        ("YROBOT_LENGTH_PENALTY", "5.1"),
-        ("YROBOT_FORCE_LISTEN_COUNT", "-1"),
-        ("YROBOT_FORCE_LISTEN_COUNT", "not-an-integer"),
-        ("YROBOT_CHUNK_MS", "480"),
-        ("YROBOT_CHUNK_MS", "510"),
-        ("YROBOT_FRAME_ACTIVE_S", "0.1"),
-        ("YROBOT_PLAYBACK_LEAD_S", "0.5"),
-        ("YROBOT_KV_SOFT", "999"),
-        ("YROBOT_KV_HARD", "8193"),
-        ("YROBOT_SESSION_ROLLOVER", "299"),
-        ("YROBOT_SYSTEM_PROMPT", "unsupported persona"),
+        replace(Settings(), realtime_url="https://example/v1/realtime?mode=video"),
+        replace(Settings(), realtime_url="wss://example/v1/realtime?mode=audio"),
+        replace(Settings(), realtime_url="wss://example/v1/realtime?mode=video&x=1"),
+        replace(Settings(), input_unit_ms=500),
+        replace(Settings(), input_sample_rate=24_000),
+        replace(Settings(), output_sample_rate=16_000),
+        replace(Settings(), session_seconds=300),
+        replace(Settings(), camera_width=800),
+        replace(Settings(), camera_fps=2),
+        replace(Settings(), motion_hz=40),
+        replace(Settings(), barge_attack_ms=90),
+        replace(Settings(), echo_correlation=1),
     ],
 )
-def test_config_rejects_invalid_environment(
-    monkeypatch: pytest.MonkeyPatch,
-    name: str,
-    value: str,
-) -> None:
-    monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match=name):
-        Config.load()
+def test_invalid_protocol_or_control_tuning_is_rejected(settings: Settings) -> None:
+    with pytest.raises(ValueError):
+        settings.validate()
 
 
-def test_config_rejects_inverted_reconnect_bounds(
+def test_invalid_boolean_has_actionable_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("YROBOT_RECONNECT_INITIAL", "4")
-    monkeypatch.setenv("YROBOT_RECONNECT_MAX", "1")
-    with pytest.raises(ValueError, match="YROBOT_RECONNECT_MAX"):
-        Config.load()
+    monkeypatch.setattr("yrobot.config.load_dotenv", lambda: None)
+    monkeypatch.setenv("YROBOT_TLS_VERIFY", "sometimes")
 
-
-def test_config_rejects_idle_camera_faster_than_active(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("YROBOT_FRAME_ACTIVE_S", "4")
-    monkeypatch.setenv("YROBOT_FRAME_IDLE_S", "2")
-    with pytest.raises(ValueError, match="YROBOT_FRAME_IDLE_S"):
-        Config.load()
-
-
-def test_config_rejects_inverted_kv_limits(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("YROBOT_KV_SOFT", "7000")
-    monkeypatch.setenv("YROBOT_KV_HARD", "7000")
-    with pytest.raises(ValueError, match="YROBOT_KV_HARD"):
-        Config.load()
-
-
-def test_ssl_context_follows_normalized_transport() -> None:
-    plain = Config(
-        realtime_url="ws://brain.local/v1/realtime?mode=video",
-        tls_verify=True,
-        send_video=True,
-        system_prompt="test",
-    )
-    assert plain.ssl_context() is None
-
-    secure = Config(
-        realtime_url="wss://brain.local/v1/realtime?mode=video",
-        tls_verify=False,
-        send_video=True,
-        system_prompt="test",
-    )
-    context = secure.ssl_context()
-    assert context is not None
-    assert context.verify_mode == ssl.CERT_NONE
-    assert context.check_hostname is False
+    with pytest.raises(ValueError, match="YROBOT_TLS_VERIFY"):
+        Settings.from_env()

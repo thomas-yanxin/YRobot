@@ -1,712 +1,650 @@
+from __future__ import annotations
+
 import asyncio
 import base64
-import io
 import json
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import pytest
-import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.asyncio.server import serve
 
-from yrobot.config import AUDIO_UNIT_SAMPLES, OUTPUT_SAMPLE_RATE, Config
-from yrobot.realtime import (
-    RealtimeClient,
-    RealtimeProtocolError,
-    SessionOutcome,
-    build_input_append,
-    build_session_init,
-    decode_output_audio,
-    encode_input_audio,
-    gateway_default_ref_audio_url,
-    load_gateway_ref_audio,
-)
+from yrobot.config import Settings
+from yrobot.protocol import Phase, ProtocolState, session_init
+from yrobot.realtime import RealtimeClient, RealtimeError, _Lifecycle
+from yrobot.state import InteractionPhase, TurnCoordinator
 
 
-def make_config(url: str, **overrides: Any) -> Config:
-    values: dict[str, Any] = {
-        "realtime_url": url,
-        "tls_verify": True,
-        "send_video": False,
-        "system_prompt": "test prompt",
-        "enable_tts": False,
-        "handshake_timeout": 1.0,
-        "session_rollover": 10.0,
-    }
-    values.update(overrides)
-    return Config(**values)
+def make_client(
+    coordinator: TurnCoordinator | None = None,
+    *,
+    latest_frame: Callable[[], bytes | None] = lambda: None,
+    on_audio: Callable[[np.ndarray, int, str | None], None] = lambda *_: None,
+    on_listen: Callable[[int], None] = lambda *_: None,
+) -> RealtimeClient:
+    return RealtimeClient(
+        Settings(realtime_url="ws://brain.local/v1/realtime?mode=video"),
+        coordinator or TurnCoordinator(),
+        latest_frame=latest_frame,
+        on_audio=on_audio,
+        on_listen=on_listen,
+        on_text=lambda *_: None,
+        on_session=lambda *_: None,
+    )
 
 
-class FakePort:
+class FakeWebSocket:
     def __init__(
         self,
+        events: list[dict[str, Any]] | None = None,
         *,
-        audio: np.ndarray | None = None,
-        force_listen: bool = False,
-        frame_delay: float = 0.0,
+        on_send: Callable[[], None] | None = None,
     ) -> None:
-        self.audio = audio
-        self.force_listen = force_listen
-        self.frame_delay = frame_delay
-        self.audio_sent = False
-        self.audio_deltas: list[tuple[np.ndarray, str, Mapping[str, Any]]] = []
-        self.listens: list[tuple[str, Mapping[str, Any]]] = []
-        self.texts: list[tuple[str, str]] = []
-        self.ready_count = 0
-        self.invalidations: list[str] = []
-        self.rollover_ready = True
+        self.events = [json.dumps(event) for event in events or []]
+        self.sent: list[dict[str, Any]] = []
+        self.on_send = on_send
 
-    def next_audio_unit(self, timeout: float) -> tuple[np.ndarray, bool] | None:
-        if self.audio is not None and not self.audio_sent:
-            self.audio_sent = True
-            return self.audio, self.force_listen
-        time.sleep(min(timeout, 0.005))
-        return None
+    async def recv(self) -> str:
+        await asyncio.sleep(0)
+        return self.events.pop(0)
 
-    def latest_frame_jpeg(self) -> bytes:
-        time.sleep(self.frame_delay)
-        return b"jpeg"
-
-    def handle_audio_delta(
-        self,
-        samples: np.ndarray,
-        response_id: str,
-        metrics: Mapping[str, Any],
-    ) -> None:
-        self.audio_deltas.append((samples, response_id, metrics))
-
-    def handle_listen(
-        self,
-        response_id: str,
-        metrics: Mapping[str, Any],
-    ) -> None:
-        self.listens.append((response_id, metrics))
-
-    def handle_text(self, text: str, response_id: str) -> None:
-        self.texts.append((text, response_id))
-
-    def handle_session_ready(self) -> None:
-        self.ready_count += 1
-
-    def invalidate_session(self, reason: str) -> None:
-        self.invalidations.append(reason)
-
-    def ready_for_rollover(self) -> bool:
-        return self.rollover_ready
+    async def send(self, raw: str) -> None:
+        self.sent.append(json.loads(raw))
+        if self.on_send:
+            self.on_send()
 
 
-def test_audio_codec_accepts_500_to_1000_ms_little_endian_units() -> None:
-    for sample_count in (8_000, AUDIO_UNIT_SAMPLES):
-        samples = np.linspace(-1.0, 1.0, sample_count, dtype=np.float32)
-        encoded = encode_input_audio(samples)
-        assert base64.b64decode(encoded) == samples.astype("<f4").tobytes()
+def test_uplink_is_exact_and_latest_only() -> None:
+    client = make_client()
+    first = np.zeros(16_000, dtype=np.float32)
+    second = np.full(16_000, 0.25, dtype=np.float32)
 
-    output = np.linspace(-0.5, 0.5, OUTPUT_SAMPLE_RATE // 10, dtype=np.float32)
-    decoded = decode_output_audio(base64.b64encode(output.astype("<f4").tobytes()).decode("ascii"))
-    np.testing.assert_array_equal(decoded, output)
-    assert OUTPUT_SAMPLE_RATE == 24_000
+    client.submit_audio(first, sequence=1)
+    client.submit_audio(second, sequence=2)
 
-
-def test_audio_codec_rejects_bad_units_and_payloads() -> None:
-    with pytest.raises(ValueError, match="500-1000 ms"):
-        encode_input_audio(np.zeros(7_999, dtype=np.float32))
-    with pytest.raises(ValueError, match="20 ms"):
-        encode_input_audio(np.zeros(8_001, dtype=np.float32))
-    with pytest.raises(ValueError, match="non-finite"):
-        encode_input_audio(np.full(AUDIO_UNIT_SAMPLES, np.nan, dtype=np.float32))
-    with pytest.raises(ValueError, match="base64"):
-        decode_output_audio("not base64!")
-    with pytest.raises(ValueError, match="float32"):
-        decode_output_audio(base64.b64encode(b"abc").decode("ascii"))
-
-
-def test_gateway_reference_voice_is_loaded_and_validated(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    samples = np.linspace(-0.2, 0.2, 160, dtype="<f4")
-    voice = base64.b64encode(samples.tobytes()).decode("ascii")
-    body = json.dumps({"base64": voice, "sample_rate": 16_000}).encode()
-    captured: dict[str, Any] = {}
-
-    class Response(io.BytesIO):
-        def __enter__(self) -> io.BytesIO:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            self.close()
-
-    def fake_urlopen(request: Any, **options: Any) -> Response:
-        captured["url"] = request.full_url
-        captured.update(options)
-        return Response(body)
-
-    monkeypatch.setattr("yrobot.realtime.urlopen", fake_urlopen)
-    config = make_config(
-        "wss://brain.local:8006/v1/realtime?mode=video",
-        enable_tts=True,
-        tls_verify=False,
-    )
-
-    assert gateway_default_ref_audio_url(config.realtime_url) == (
-        "https://brain.local:8006/api/default_ref_audio"
-    )
-    assert load_gateway_ref_audio(config) == voice
-    assert captured["url"] == "https://brain.local:8006/api/default_ref_audio"
-    assert captured["timeout"] == 20.0
-    assert captured["context"].verify_mode == 0
-
-
-def test_protocol_messages_match_video_duplex_gateway() -> None:
-    assert build_session_init("hello", ref_audio_base64="voice") == {
-        "type": "session.init",
-        "payload": {
-            "system_prompt": "hello",
-            "config": {
-                "generate_audio": True,
-                "length_penalty": 1.1,
-                "force_listen_count": 1,
-            },
-            "use_tts": True,
-            "voice": {
-                "ref_audio_base64": "voice",
-                "tts_ref_audio_base64": "voice",
-            },
-        },
-    }
-    assert build_session_init("hello", enable_tts=False) == {
-        "type": "session.init",
-        "payload": {
-            "system_prompt": "hello",
-            "config": {
-                "generate_audio": False,
-                "length_penalty": 1.1,
-                "force_listen_count": 1,
-            },
-            "use_tts": False,
-        },
-    }
-    with pytest.raises(ValueError, match="ref_audio_base64"):
-        build_session_init("hello")
-
-    audio = np.linspace(-0.25, 0.25, AUDIO_UNIT_SAMPLES, dtype=np.float32)
-    append = build_input_append(audio, b"jpeg", force_listen=True)
-    assert append["type"] == "input.append"
-    assert append["input"]["force_listen"] is True
-    assert append["input"]["max_slice_nums"] == 1
-    assert base64.b64decode(append["input"]["video_frames"][0]) == b"jpeg"
+    retained = asyncio.run(client._next_input(threading.Event()))
+    assert retained is not None
+    assert retained.sequence == 2
     np.testing.assert_array_equal(
-        np.frombuffer(base64.b64decode(append["input"]["audio"]), dtype="<f4"),
-        audio,
+        np.frombuffer(retained.pcm_f32le, dtype="<f4"),
+        second,
+    )
+    assert client.metrics.dropped_input_units == 1
+
+
+def test_empty_uplink_poll_is_bounded_for_session_cancellation() -> None:
+    client = make_client()
+    started = time.monotonic()
+
+    assert asyncio.run(client._next_input(threading.Event())) is None
+    assert time.monotonic() - started < 0.2
+
+
+def test_handshake_waits_for_queue_then_init_then_created() -> None:
+    websocket = FakeWebSocket(
+        [
+            {"type": "session.queued", "position": 1},
+            {"type": "session.queue_done"},
+            {
+                "type": "session.created",
+                "session_id": "sess-1",
+                "mode": "full_duplex",
+                "metrics": {},
+                "server_send_ts": 123.0,
+            },
+        ]
+    )
+    client = make_client()
+    lifecycle = _Lifecycle()
+
+    async def scenario() -> None:
+        await client._wait_for_queue(
+            websocket,  # type: ignore[arg-type]
+            lifecycle,
+            threading.Event(),
+        )
+        init = session_init("test", length_penalty=1.1)
+        await lifecycle.send(websocket, init)  # type: ignore[arg-type]
+        created = await client._wait_for_created(
+            websocket,  # type: ignore[arg-type]
+            lifecycle,
+            threading.Event(),
+            asyncio.get_running_loop().time() + 10,
+        )
+        assert created.session_id == "sess-1"
+
+    asyncio.run(scenario())
+
+    assert [event["type"] for event in websocket.sent] == ["session.init"]
+    assert lifecycle.state.phase is Phase.CREATED
+
+
+def test_session_created_wait_obeys_the_video_budget_when_server_is_silent() -> None:
+    class SilentWebSocket:
+        async def recv(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    client = make_client()
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.INIT)
+
+    async def scenario() -> None:
+        with pytest.raises(RealtimeError, match="initialization exceeded"):
+            await client._wait_for_created(
+                SilentWebSocket(),  # type: ignore[arg-type]
+                lifecycle,
+                threading.Event(),
+                asyncio.get_running_loop().time() + 0.05,
+            )
+
+    asyncio.run(asyncio.wait_for(scenario(), timeout=0.2))
+
+
+def test_sender_carries_force_listen_and_latest_jpeg() -> None:
+    stop = threading.Event()
+    websocket = FakeWebSocket(on_send=stop.set)
+    turns = TurnCoordinator()
+    turns.new_session()
+    turns.accept_audio("old")
+    turns.interrupt()
+    client = make_client(turns, latest_frame=lambda: b"\xff\xd8jpeg\xff\xd9")
+    client.submit_audio(
+        np.zeros(16_000, dtype=np.float32),
+        captured_at=time.monotonic(),
+        sequence=9,
+    )
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+
+    asyncio.run(
+        client._sender(  # type: ignore[arg-type]
+            websocket,
+            lifecycle,
+            stop,
+        )
     )
 
-    audio_only = build_input_append(audio, None, force_listen=False)
-    assert audio_only["input"]["force_listen"] is False
-    assert "video_frames" not in audio_only["input"]
+    event = websocket.sent[0]
+    assert event["type"] == "input.append"
+    assert event["input"]["force_listen"] is True
+    assert event["input"]["max_slice_nums"] == 1
+    assert base64.b64decode(event["input"]["video_frames"][0]) == b"\xff\xd8jpeg\xff\xd9"
+    assert len(base64.b64decode(event["input"]["audio"])) == 16_000 * 4
+    assert turns.snapshot().force_listen_sent is True
 
 
-def test_handshake_waits_for_queue_done_before_init_and_then_created() -> None:
-    class WebSocket:
+def test_sender_never_compresses_two_one_second_units() -> None:
+    stop = threading.Event()
+    send_times: list[float] = []
+    turns = TurnCoordinator()
+    turns.new_session()
+    turns.accept_audio("old")
+    turns.interrupt()
+    client = make_client(turns)
+
+    def after_send() -> None:
+        send_times.append(time.monotonic())
+        if len(send_times) == 1:
+            client.submit_audio(
+                np.zeros(16_000, dtype=np.float32),
+                captured_at=time.monotonic(),
+                sequence=2,
+            )
+        else:
+            stop.set()
+
+    websocket = FakeWebSocket(on_send=after_send)
+    client.submit_audio(
+        np.zeros(16_000, dtype=np.float32),
+        captured_at=time.monotonic(),
+        sequence=1,
+    )
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+
+    asyncio.run(
+        client._sender(  # type: ignore[arg-type]
+            websocket,
+            lifecycle,
+            stop,
+        )
+    )
+
+    assert len(send_times) == 2
+    assert send_times[1] - send_times[0] >= 0.98
+    assert all(event["input"]["force_listen"] for event in websocket.sent)
+    assert client.metrics.capture_to_send.count == 2
+    assert client.metrics.send_interval.minimum_ms >= 980
+
+
+def test_sender_keeps_absolute_cadence_across_normal_write_latency() -> None:
+    class DelayedWebSocket(FakeWebSocket):
+        async def send(self, raw: str) -> None:
+            await asyncio.sleep(0.2)
+            await super().send(raw)
+
+    stop = threading.Event()
+    send_times: list[float] = []
+    client = make_client()
+
+    def after_send() -> None:
+        send_times.append(time.monotonic())
+        if len(send_times) == 1:
+            client.submit_audio(
+                np.zeros(16_000, dtype=np.float32),
+                captured_at=time.monotonic(),
+                sequence=2,
+            )
+        else:
+            stop.set()
+
+    websocket = DelayedWebSocket(on_send=after_send)
+    client.submit_audio(
+        np.zeros(16_000, dtype=np.float32),
+        captured_at=time.monotonic(),
+        sequence=1,
+    )
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+
+    asyncio.run(
+        client._sender(  # type: ignore[arg-type]
+            websocket,
+            lifecycle,
+            stop,
+        )
+    )
+
+    assert 0.98 <= send_times[1] - send_times[0] < 1.1
+
+
+def test_input_send_timeout_closes_and_reconnects_without_acknowledging_force() -> None:
+    class StalledInputWebSocket:
         def __init__(self) -> None:
-            self.events = [
-                {"type": "session.queued", "position": 1},
-                {"type": "session.queue_update", "position": 0},
-                {"type": "session.queue_done"},
-                {"type": "session.created", "session_id": "session-1"},
-            ]
-            self.sent: list[dict[str, Any]] = []
-            self.index = 0
-
-        async def recv(self) -> str:
-            event = self.events[self.index]
-            self.index += 1
-            if event["type"] == "session.queue_done":
-                assert self.sent == []
-            if event["type"] == "session.created":
-                assert [message["type"] for message in self.sent] == ["session.init"]
-            return json.dumps(event)
+            self.close_called = False
 
         async def send(self, raw: str) -> None:
-            self.sent.append(json.loads(raw))
+            assert json.loads(raw)["type"] == "input.append"
+            await asyncio.Event().wait()
 
-    async def scenario() -> None:
-        websocket = WebSocket()
-        client = RealtimeClient(make_config("ws://unused.local"))
-        session_id, assigned_at = await client._handshake(websocket)
-        assert session_id == "session-1"
-        assert assigned_at > 0
-        assert websocket.sent[0] == build_session_init("test prompt", enable_tts=False)
+        async def close(self, *, code: int, reason: str) -> None:
+            del code, reason
+            self.close_called = True
 
-    asyncio.run(scenario())
+    async def scenario() -> tuple[StalledInputWebSocket, TurnCoordinator]:
+        turns = TurnCoordinator()
+        turns.new_session()
+        turns.accept_audio("old")
+        turns.interrupt()
+        client = make_client(turns)
+        client._input_send_timeout = 0.05
+        client.submit_audio(
+            np.zeros(16_000, dtype=np.float32),
+            captured_at=time.monotonic(),
+        )
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        websocket = StalledInputWebSocket()
+        with pytest.raises(RealtimeError, match="input.append send timed out"):
+            await client._sender(  # type: ignore[arg-type]
+                websocket,
+                lifecycle,
+                threading.Event(),
+            )
+        return websocket, turns
+
+    websocket, turns = asyncio.run(asyncio.wait_for(scenario(), timeout=0.3))
+    assert websocket.close_called
+    assert turns.snapshot().force_listen_sent is False
 
 
-def test_handshake_rejects_created_before_queue_done() -> None:
-    class WebSocket:
-        async def recv(self) -> str:
-            return json.dumps({"type": "session.created", "session_id": "bad"})
-
-    async def scenario() -> None:
-        client = RealtimeClient(make_config("ws://unused.local"))
-        with pytest.raises(RealtimeProtocolError, match="before session.queue_done"):
-            await client._handshake(WebSocket())
-
-    asyncio.run(scenario())
-
-
-def test_receiver_dispatches_all_duplex_kinds_and_ignores_response_done() -> None:
-    output = np.linspace(-0.2, 0.2, 240, dtype=np.float32)
-    encoded = base64.b64encode(output.astype("<f4").tobytes()).decode("ascii")
-
-    class WebSocket:
+def test_stream_stop_cleans_up_a_shielded_stalled_input_send() -> None:
+    class StalledWebSocket:
         def __init__(self) -> None:
-            self.events: list[str | Exception] = [
+            self.input_started = asyncio.Event()
+
+        async def send(self, raw: str) -> None:
+            assert json.loads(raw)["type"] == "input.append"
+            self.input_started.set()
+            await asyncio.Event().wait()
+
+        async def recv(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def close(self, *, code: int, reason: str) -> None:
+            del code, reason
+
+    async def scenario() -> list[str]:
+        client = make_client()
+        client._input_send_timeout = 10.0
+        client.submit_audio(
+            np.zeros(16_000, dtype=np.float32),
+            captured_at=time.monotonic(),
+        )
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        stop = threading.Event()
+        websocket = StalledWebSocket()
+        streaming = asyncio.create_task(
+            client._stream(
+                websocket,  # type: ignore[arg-type]
+                lifecycle,
+                stop,
+                asyncio.get_running_loop().time() + 10,
+            )
+        )
+        await websocket.input_started.wait()
+        stop.set()
+        assert await asyncio.wait_for(streaming, timeout=1.5)
+        await asyncio.sleep(0)
+        return [
+            task.get_name()
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task() and not task.done()
+        ]
+
+    names = asyncio.run(scenario())
+    assert "minicpmo-input-send" not in names
+
+
+def test_stop_before_first_input_still_sends_session_close() -> None:
+    class ClosingWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+            self.events: asyncio.Queue[str] = asyncio.Queue()
+
+        async def send(self, raw: str) -> None:
+            event = json.loads(raw)
+            self.sent.append(event)
+            if event["type"] == "session.close":
+                await self.events.put(
+                    json.dumps(
+                        {
+                            "type": "session.closed",
+                            "session_id": "sess-1",
+                            "reason": "user_stop",
+                        }
+                    )
+                )
+
+        async def recv(self) -> str:
+            return await self.events.get()
+
+    client = make_client()
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+    stop = threading.Event()
+    stop.set()
+
+    async def scenario() -> tuple[bool, list[dict[str, Any]]]:
+        websocket = ClosingWebSocket()
+        result = await client._stream(
+            websocket,  # type: ignore[arg-type]
+            lifecycle,
+            stop,
+            asyncio.get_running_loop().time() + 10,
+        )
+        return result, websocket.sent
+
+    stopped, sent = asyncio.run(scenario())
+
+    assert stopped is True
+    assert [event["type"] for event in sent] == ["session.close"]
+
+
+def test_stop_lets_an_inflight_input_send_finish_before_session_close() -> None:
+    class SlowClosingWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+            self.events: asyncio.Queue[str] = asyncio.Queue()
+            self.input_started = asyncio.Event()
+            self.release_input = asyncio.Event()
+            self.input_cancelled = False
+
+        async def send(self, raw: str) -> None:
+            event = json.loads(raw)
+            self.sent.append(event)
+            if event["type"] == "input.append":
+                self.input_started.set()
+                try:
+                    await self.release_input.wait()
+                except asyncio.CancelledError:
+                    self.input_cancelled = True
+                    raise
+            elif event["type"] == "session.close":
+                await self.events.put(
+                    json.dumps(
+                        {
+                            "type": "session.closed",
+                            "session_id": "sess-1",
+                            "reason": event["reason"],
+                        }
+                    )
+                )
+
+        async def recv(self) -> str:
+            return await self.events.get()
+
+    async def scenario() -> tuple[bool, SlowClosingWebSocket]:
+        client = make_client()
+        client.submit_audio(
+            np.zeros(16_000, dtype=np.float32),
+            captured_at=time.monotonic(),
+        )
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        stop = threading.Event()
+        websocket = SlowClosingWebSocket()
+        streaming = asyncio.create_task(
+            client._stream(
+                websocket,  # type: ignore[arg-type]
+                lifecycle,
+                stop,
+                asyncio.get_running_loop().time() + 10,
+            )
+        )
+        await websocket.input_started.wait()
+        stop.set()
+        await asyncio.sleep(0.06)
+        websocket.release_input.set()
+        return await streaming, websocket
+
+    stopped, websocket = asyncio.run(scenario())
+
+    assert stopped is True
+    assert websocket.input_cancelled is False
+    assert [event["type"] for event in websocket.sent] == [
+        "input.append",
+        "session.close",
+    ]
+
+
+def test_session_close_send_is_bounded_when_the_socket_stalls() -> None:
+    class StalledCloseWebSocket:
+        def __init__(self) -> None:
+            self.close_called = False
+
+        async def send(self, raw: str) -> None:
+            assert json.loads(raw)["type"] == "session.close"
+            await asyncio.Event().wait()
+
+        async def recv(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def close(self, *, code: int, reason: str) -> None:
+            del code, reason
+            self.close_called = True
+
+    async def scenario() -> StalledCloseWebSocket:
+        client = make_client()
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        stop = threading.Event()
+        stop.set()
+        websocket = StalledCloseWebSocket()
+        assert await client._stream(
+            websocket,  # type: ignore[arg-type]
+            lifecycle,
+            stop,
+            asyncio.get_running_loop().time() + 10,
+        )
+        return websocket
+
+    websocket = asyncio.run(asyncio.wait_for(scenario(), timeout=1.5))
+    assert websocket.close_called
+
+
+def test_interrupted_audio_is_dropped_until_listen_boundary() -> None:
+    pcm = np.linspace(-0.1, 0.1, 240, dtype="<f4").tobytes()
+    encoded = base64.b64encode(pcm).decode("ascii")
+    websocket = FakeWebSocket(
+        [
+            {
+                "type": "response.output.delta",
+                "kind": "audio",
+                "session_id": "sess-1",
+                "response_id": "old",
+                "audio": encoded,
+                "metrics": {},
+            },
+            {
+                "type": "response.output.delta",
+                "kind": "listen",
+                "session_id": "sess-1",
+                "response_id": "old",
+                "metrics": {},
+            },
+            {
+                "type": "response.output.delta",
+                "kind": "audio",
+                "session_id": "sess-1",
+                "response_id": "new",
+                "audio": encoded,
+                "metrics": {},
+            },
+            {
+                "type": "session.closed",
+                "session_id": "sess-1",
+                "reason": "test",
+            },
+        ]
+    )
+    turns = TurnCoordinator()
+    turns.new_session()
+    turns.accept_audio("old")
+    interrupted_epoch = turns.interrupt()
+    assert interrupted_epoch is not None
+    assert turns.force_listen_sent(interrupted_epoch)
+    received: list[tuple[int, str | None]] = []
+    listens: list[int] = []
+    client = make_client(
+        turns,
+        on_audio=lambda _samples, epoch, response: received.append((epoch, response)),
+        on_listen=listens.append,
+    )
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.STREAMING, "sess-1")
+    closed = asyncio.Event()
+
+    asyncio.run(
+        client._receiver(  # type: ignore[arg-type]
+            websocket,
+            lifecycle,
+            closed,
+        )
+    )
+
+    assert received == [(interrupted_epoch, "new")]
+    assert listens == [interrupted_epoch]
+    assert turns.snapshot().phase is InteractionPhase.SPEAKING
+    assert lifecycle.state.phase is Phase.CLOSED
+
+
+def test_real_websockets15_full_lifecycle() -> None:
+    async def scenario() -> tuple[list[str], list[str]]:
+        server_events: list[str] = []
+        received_audio: list[str] = []
+        stop = threading.Event()
+
+        async def handler(websocket: Any) -> None:
+            await websocket.send('{"type":"session.queue_done"}')
+            init = json.loads(await websocket.recv())
+            server_events.append(init["type"])
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "session.created",
+                        "session_id": "sess-local",
+                        "mode": "full_duplex",
+                        "metrics": {},
+                        "server_send_ts": time.time(),
+                    }
+                )
+            )
+            append = json.loads(await websocket.recv())
+            server_events.append(append["type"])
+            audio = base64.b64encode(np.zeros(240, dtype="<f4").tobytes()).decode("ascii")
+            await websocket.send(
                 json.dumps(
                     {
                         "type": "response.output.delta",
                         "kind": "audio",
-                        "audio": encoded,
-                        "response_id": "r1",
-                        "metrics": {"latency_ms": 12},
+                        "session_id": "sess-local",
+                        "response_id": "resp-local",
+                        "audio": audio,
+                        "metrics": {},
                     }
-                ),
-                json.dumps({"type": "response.done", "response_id": "r1"}),
-                json.dumps(
-                    {
-                        "type": "response.output.delta",
-                        "kind": "text",
-                        "text": "你好",
-                        "response_id": "r1",
-                    }
-                ),
+                )
+            )
+            await websocket.send(
                 json.dumps(
                     {
                         "type": "response.output.delta",
                         "kind": "listen",
-                        "response_id": "r2",
-                        "metrics": {"kv_cache_length": 32},
+                        "session_id": "sess-local",
+                        "response_id": "resp-local",
+                        "metrics": {},
                     }
-                ),
-                ConnectionClosed(None, None),
-            ]
-
-        async def recv(self) -> str:
-            event = self.events.pop(0)
-            if isinstance(event, Exception):
-                raise event
-            return event
-
-    async def scenario() -> None:
-        port = FakePort()
-        client = RealtimeClient(make_config("ws://unused.local"))
-        with pytest.raises(ConnectionError, match="transport closed"):
-            await client._receive_loop(WebSocket(), port)
-        assert len(port.audio_deltas) == 1
-        np.testing.assert_allclose(port.audio_deltas[0][0], output)
-        assert port.audio_deltas[0][1:] == ("r1", {"latency_ms": 12})
-        assert port.texts == [("你好", "r1")]
-        assert port.listens == [("r2", {"kv_cache_length": 32})]
-
-    asyncio.run(scenario())
-
-
-def test_receiver_waits_for_transport_cleanup_after_session_closed() -> None:
-    class WebSocket:
-        def __init__(self) -> None:
-            self.events: list[str | Exception] = [
-                json.dumps({"type": "session.closed", "reason": "client_rollover"}),
-                ConnectionClosed(None, None),
-            ]
-            self.recv_count = 0
-
-        async def recv(self) -> str:
-            self.recv_count += 1
-            event = self.events.pop(0)
-            if isinstance(event, Exception):
-                raise event
-            return event
-
-    async def scenario() -> None:
-        websocket = WebSocket()
-        client = RealtimeClient(make_config("ws://unused.local"))
-        await client._receive_loop(websocket, FakePort())
-        assert websocket.recv_count == 2
-
-    asyncio.run(scenario())
-
-
-def test_session_is_full_duplex_with_latest_only_video() -> None:
-    asyncio.run(_full_duplex_session_scenario())
-
-
-async def _full_duplex_session_scenario() -> None:
-    stop_event = threading.Event()
-    observed: list[dict[str, Any]] = []
-    output = np.linspace(-0.2, 0.2, 240, dtype=np.float32)
-
-    async def handler(websocket: Any) -> None:
-        await websocket.send(json.dumps({"type": "session.queued", "position": 1}))
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(websocket.recv(), timeout=0.03)
-
-        await websocket.send(json.dumps({"type": "session.queue_done"}))
-        init = json.loads(await asyncio.wait_for(websocket.recv(), timeout=0.5))
-        observed.append(init)
-        await websocket.send(json.dumps({"type": "session.created", "session_id": "session-1"}))
-
-        append = json.loads(await asyncio.wait_for(websocket.recv(), timeout=0.25))
-        observed.append(append)
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "response.output.delta",
-                    "kind": "audio",
-                    "audio": base64.b64encode(output.astype("<f4").tobytes()).decode("ascii"),
-                    "response_id": "r1",
-                    "metrics": {"latency_ms": 10},
-                }
+                )
             )
-        )
-        await websocket.send(json.dumps({"type": "response.done", "response_id": "r1"}))
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "response.output.delta",
-                    "kind": "text",
-                    "text": "你好",
-                    "response_id": "r1",
-                }
+            close = json.loads(await websocket.recv())
+            server_events.append(close["type"])
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "session.closed",
+                        "session_id": "sess-local",
+                        "reason": close["reason"],
+                    }
+                )
             )
-        )
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "response.output.delta",
-                    "kind": "listen",
-                    "response_id": "r2",
-                    "metrics": {"kv_cache_length": 64},
-                }
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            turns = TurnCoordinator()
+            client = RealtimeClient(
+                Settings(realtime_url=(f"ws://127.0.0.1:{port}/v1/realtime?mode=video")),
+                turns,
+                latest_frame=lambda: None,
+                on_audio=lambda _samples, _epoch, response: received_audio.append(str(response)),
+                on_listen=lambda _epoch: stop.set(),
+                on_text=lambda *_: None,
+                on_session=lambda *_: None,
             )
-        )
-        await asyncio.sleep(0.02)
-        stop_event.set()
-        close = json.loads(await asyncio.wait_for(websocket.recv(), timeout=1.0))
-        observed.append(close)
-        await websocket.send(json.dumps({"type": "session.closed", "reason": "user_stop"}))
-
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        server_port = server.sockets[0].getsockname()[1]
-        config = make_config(
-            f"ws://127.0.0.1:{server_port}/v1/realtime?mode=video",
-            send_video=True,
-        )
-        microphone = np.linspace(-0.5, 0.5, AUDIO_UNIT_SAMPLES, dtype=np.float32)
-        port = FakePort(audio=microphone, force_listen=True)
-        outcome = await RealtimeClient(config).run_session(port, stop_event)
-
-    assert outcome is SessionOutcome.STOP
-    assert observed[0] == build_session_init("test prompt", enable_tts=False)
-    assert observed[1]["type"] == "input.append"
-    assert observed[1]["input"]["force_listen"] is True
-    assert observed[1]["input"]["max_slice_nums"] == 1
-    assert base64.b64decode(observed[1]["input"]["video_frames"][0]) == b"jpeg"
-    np.testing.assert_array_equal(
-        np.frombuffer(base64.b64decode(observed[1]["input"]["audio"]), dtype="<f4"),
-        microphone,
-    )
-    assert observed[2] == {"type": "session.close", "reason": "user_stop"}
-    assert port.texts == [("你好", "r1")]
-    assert port.listens == [("r2", {"kv_cache_length": 64})]
-    assert port.audio_deltas[0][1:] == ("r1", {"latency_ms": 10})
-    np.testing.assert_allclose(port.audio_deltas[0][0], output)
-    assert port.ready_count == 1
-    assert port.invalidations == ["connecting", "stop"]
-
-
-def test_session_rolls_proactively_and_invalidates_old_playback() -> None:
-    asyncio.run(_rollover_scenario())
-
-
-async def _rollover_scenario() -> None:
-    observed: list[dict[str, Any]] = []
-    elapsed = 0.0
-
-    async def handler(websocket: Any) -> None:
-        await websocket.send(json.dumps({"type": "session.queue_done"}))
-        observed.append(json.loads(await websocket.recv()))
-        await websocket.send(json.dumps({"type": "session.created", "session_id": "roll"}))
-        observed.append(json.loads(await asyncio.wait_for(websocket.recv(), timeout=1.0)))
-        await websocket.send(json.dumps({"type": "session.closed", "reason": "client_rollover"}))
-
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        server_port = server.sockets[0].getsockname()[1]
-        config = make_config(
-            f"ws://127.0.0.1:{server_port}/v1/realtime?mode=video",
-            session_rollover=0.05,
-        )
-        port = FakePort()
-        port.rollover_ready = False
-        loop = asyncio.get_running_loop()
-        loop.call_later(0.12, setattr, port, "rollover_ready", True)
-        started = loop.time()
-        outcome = await RealtimeClient(config).run_session(port, threading.Event())
-        elapsed = loop.time() - started
-
-    assert outcome is SessionOutcome.ROLLOVER
-    assert elapsed >= 0.10
-    assert observed[0]["type"] == "session.init"
-    assert observed[1] == {"type": "session.close", "reason": "client_rollover"}
-    assert port.ready_count == 1
-    assert port.invalidations == ["connecting", "rollover"]
-
-
-def test_kv_soft_limit_rolls_at_the_next_clean_turn() -> None:
-    asyncio.run(_kv_soft_rollover_scenario())
-
-
-async def _kv_soft_rollover_scenario() -> None:
-    observed: list[dict[str, Any]] = []
-
-    async def handler(websocket: Any) -> None:
-        await websocket.send(json.dumps({"type": "session.queue_done"}))
-        await websocket.recv()
-        await websocket.send(json.dumps({"type": "session.created", "session_id": "kv"}))
-        await websocket.send(
-            json.dumps(
-                {
-                    "type": "response.output.delta",
-                    "kind": "listen",
-                    "response_id": "listen",
-                    "metrics": {"kv_cache_length": 100},
-                }
+            client.submit_audio(
+                np.zeros(16_000, dtype=np.float32),
+                captured_at=time.monotonic(),
             )
-        )
-        observed.append(json.loads(await asyncio.wait_for(websocket.recv(), timeout=1.0)))
-        await websocket.send(json.dumps({"type": "session.closed", "reason": "client_rollover"}))
+            await asyncio.wait_for(client.run(stop), timeout=3.0)
+        return server_events, received_audio
 
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        server_port = server.sockets[0].getsockname()[1]
-        config = make_config(
-            f"ws://127.0.0.1:{server_port}/v1/realtime?mode=video",
-            session_rollover=10.0,
-            kv_soft_limit=100,
-            kv_hard_limit=200,
-        )
-        port = FakePort()
-        port.rollover_ready = False
-        loop = asyncio.get_running_loop()
-        loop.call_later(0.10, setattr, port, "rollover_ready", True)
-        started = loop.time()
-        outcome = await RealtimeClient(config).run_session(port, threading.Event())
-        elapsed = loop.time() - started
+    events, audio = asyncio.run(scenario())
 
-    assert outcome is SessionOutcome.ROLLOVER
-    assert elapsed >= 0.09
-    assert observed == [{"type": "session.close", "reason": "client_rollover"}]
-    assert port.listens == [("listen", {"kv_cache_length": 100})]
-
-
-def test_kv_hard_limit_sets_immediate_rollover_signal() -> None:
-    async def scenario() -> None:
-        config = make_config(
-            "ws://unused.local",
-            kv_soft_limit=100,
-            kv_hard_limit=200,
-        )
-        soft = asyncio.Event()
-        hard = asyncio.Event()
-        RealtimeClient(config)._observe_kv_budget(
-            {"kv_cache_length": 200},
-            kv_soft_reached=soft,
-            kv_hard_reached=hard,
-        )
-        assert soft.is_set()
-        assert hard.is_set()
-
-    asyncio.run(scenario())
-
-
-def test_stop_cancels_a_queued_handshake_without_waiting_for_server() -> None:
-    asyncio.run(_stop_during_queue_scenario())
-
-
-async def _stop_during_queue_scenario() -> None:
-    stop_event = threading.Event()
-    close_messages: list[dict[str, Any]] = []
-
-    async def handler(websocket: Any) -> None:
-        await websocket.send(json.dumps({"type": "session.queued", "position": 10}))
-        close_messages.append(json.loads(await asyncio.wait_for(websocket.recv(), timeout=0.5)))
-
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        server_port = server.sockets[0].getsockname()[1]
-        config = make_config(
-            f"ws://127.0.0.1:{server_port}/v1/realtime?mode=video",
-            handshake_timeout=5.0,
-        )
-        port = FakePort()
-        loop = asyncio.get_running_loop()
-        loop.call_later(0.05, stop_event.set)
-        started = loop.time()
-        outcome = await RealtimeClient(config).run_session(port, stop_event)
-        elapsed = loop.time() - started
-
-    assert outcome is SessionOutcome.STOP
-    assert elapsed < 0.3
-    assert close_messages == [{"type": "session.close", "reason": "user_stop"}]
-    assert port.invalidations == ["connecting", "stop"]
-
-
-def test_stop_during_reference_voice_fetch_is_immediate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    release_fetch = threading.Event()
-
-    def blocked_fetch(_config: Config) -> str:
-        release_fetch.wait(1.0)
-        return "unused"
-
-    monkeypatch.setattr("yrobot.realtime.load_gateway_ref_audio", blocked_fetch)
-
-    async def scenario() -> tuple[SessionOutcome, float, FakePort]:
-        stop_event = threading.Event()
-        port = FakePort()
-        config = make_config(
-            "ws://unused.local/v1/realtime?mode=video",
-            enable_tts=True,
-        )
-        loop = asyncio.get_running_loop()
-        loop.call_later(0.05, stop_event.set)
-        started = loop.time()
-        outcome = await RealtimeClient(config).run_session(port, stop_event)
-        return outcome, loop.time() - started, port
-
-    try:
-        outcome, elapsed, port = asyncio.run(scenario())
-    finally:
-        release_fetch.set()
-
-    assert outcome is SessionOutcome.STOP
-    assert elapsed < 0.3
-    assert port.invalidations == ["connecting", "stop"]
-
-
-def test_sender_is_quiescent_before_close_and_playback_invalidates_first() -> None:
-    asyncio.run(_close_order_scenario())
-
-
-async def _close_order_scenario() -> None:
-    stop_event = threading.Event()
-    observed: list[dict[str, Any]] = []
-    no_message_after_close = False
-    close_seen_at = 0.0
-
-    class StreamingPort(FakePort):
-        def __init__(self) -> None:
-            super().__init__()
-            self.invalidation_times: dict[str, float] = {}
-
-        def next_audio_unit(self, timeout: float) -> tuple[np.ndarray, bool] | None:
-            time.sleep(min(timeout, 0.01))
-            return np.zeros(AUDIO_UNIT_SAMPLES, dtype=np.float32), False
-
-        def invalidate_session(self, reason: str) -> None:
-            super().invalidate_session(reason)
-            self.invalidation_times[reason] = time.monotonic()
-
-    async def handler(websocket: Any) -> None:
-        nonlocal no_message_after_close, close_seen_at
-        await websocket.send(json.dumps({"type": "session.queue_done"}))
-        await websocket.recv()
-        await websocket.send(json.dumps({"type": "session.created", "session_id": "close-order"}))
-
-        first = json.loads(await asyncio.wait_for(websocket.recv(), timeout=0.5))
-        assert first["type"] == "input.append"
-        observed.append(first)
-        stop_event.set()
-
-        while True:
-            message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=1.0))
-            observed.append(message)
-            if message["type"] == "session.close":
-                close_seen_at = time.monotonic()
-                break
-        try:
-            await asyncio.wait_for(websocket.recv(), timeout=0.12)
-        except TimeoutError:
-            no_message_after_close = True
-        await websocket.send(json.dumps({"type": "session.closed", "reason": "user_stop"}))
-
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        server_port = server.sockets[0].getsockname()[1]
-        config = make_config(
-            f"ws://127.0.0.1:{server_port}/v1/realtime?mode=video",
-            close_ack_timeout=1.0,
-        )
-        port = StreamingPort()
-        outcome = await RealtimeClient(config).run_session(port, stop_event)
-
-    assert outcome is SessionOutcome.STOP
-    assert no_message_after_close
-    assert observed[-1] == {"type": "session.close", "reason": "user_stop"}
-    assert port.invalidation_times["stop"] <= close_seen_at
-
-
-def test_failed_session_invalidates_before_reconnect() -> None:
-    asyncio.run(_failed_session_scenario())
-
-
-async def _failed_session_scenario() -> None:
-    async def handler(websocket: Any) -> None:
-        await websocket.send(json.dumps({"type": "session.queue_done"}))
-        await websocket.recv()
-        await websocket.send(json.dumps({"type": "error", "error": {"message": "worker failed"}}))
-
-    async with websockets.serve(handler, "127.0.0.1", 0) as server:
-        server_port = server.sockets[0].getsockname()[1]
-        config = make_config(f"ws://127.0.0.1:{server_port}/v1/realtime?mode=video")
-        port = FakePort()
-        with pytest.raises(RealtimeProtocolError, match="worker failed"):
-            await RealtimeClient(config).run_session(port, threading.Event())
-
-    assert port.invalidations == ["connecting", "reconnect"]
-
-
-def test_reconnect_uses_bounded_exponential_backoff() -> None:
-    class FailingClient(RealtimeClient):
-        def __init__(self, config: Config) -> None:
-            super().__init__(config)
-            self.delays: list[float] = []
-
-        async def run_session(
-            self,
-            port: FakePort,
-            stop_event: threading.Event,
-        ) -> SessionOutcome:
-            del port, stop_event
-            raise ConnectionError("offline")
-
-        async def _wait_or_stop(
-            self,
-            stop_event: threading.Event,
-            delay: float,
-        ) -> None:
-            self.delays.append(delay)
-            if len(self.delays) == 4:
-                stop_event.set()
-
-    async def scenario() -> None:
-        config = make_config(
-            "ws://unused.local",
-            reconnect_initial_delay=0.1,
-            reconnect_max_delay=0.25,
-        )
-        client = FailingClient(config)
-        await client.run(FakePort(), threading.Event())
-        expected = [0.1, 0.2, 0.25, 0.25]
-        assert len(client.delays) == len(expected)
-        for delay, maximum in zip(client.delays, expected, strict=True):
-            assert maximum * 0.75 <= delay <= maximum
-
-    asyncio.run(scenario())
+    assert events == ["session.init", "input.append", "session.close"]
+    assert audio == ["resp-local"]

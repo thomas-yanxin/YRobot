@@ -1,143 +1,146 @@
+from __future__ import annotations
+
 import asyncio
 import threading
 from typing import Any
 
-from yrobot.audio import PlayerClearError
-from yrobot.config import Config
-from yrobot.main import YRobotRuntime, app_main, cli
+import numpy as np
+
+from yrobot.config import Settings
+from yrobot.main import Yrobot, cli
+from yrobot.runtime import YRobotRuntime
 
 
-def make_config() -> Config:
-    return Config(
-        realtime_url="ws://127.0.0.1:8006/v1/realtime?mode=video",
-        tls_verify=True,
-        send_video=True,
-        system_prompt="test",
-    )
+class FakeAudioBackend:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.max_buffers = 0
+
+    def set_max_output_buffers(self, value: int) -> None:
+        self.max_buffers = value
+        self.events.append("audio.buffers")
+
+    def clear_player(self) -> None:
+        self.events.append("audio.clear")
 
 
-def test_runtime_starts_media_before_motion_and_stops_in_dependency_order(
+class FakeMedia:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.audio = FakeAudioBackend(events)
+
+    def start_playing(self) -> None:
+        self.events.append("media.play")
+
+    def start_recording(self) -> None:
+        self.events.append("media.record")
+
+    def stop_playing(self) -> None:
+        self.events.append("media.stop_play")
+
+    def stop_recording(self) -> None:
+        self.events.append("media.stop_record")
+
+    def get_audio_sample(self) -> None:
+        return None
+
+    def push_audio_sample(self, _samples: np.ndarray) -> None: ...
+
+    def get_frame(self) -> None:
+        return None
+
+    def get_DoA(self) -> None:  # noqa: N802
+        return None
+
+
+class FakeMini:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.media = FakeMedia(events)
+
+    def enable_motors(self) -> None:
+        self.events.append("motors.enable")
+
+    def enable_wobbling(self) -> None:
+        self.events.append("wobble.enable")
+
+    def disable_wobbling(self) -> None:
+        self.events.append("wobble.disable")
+
+    def get_current_head_pose(self) -> np.ndarray:
+        return np.eye(4)
+
+    def get_present_antenna_joint_positions(self) -> list[float]:
+        return [0.0, 0.0]
+
+    def set_target(self, **_kwargs: Any) -> None:
+        self.events.append("motion.target")
+
+
+def test_runtime_owns_media_once_and_stops_in_dependency_order(
     monkeypatch: Any,
 ) -> None:
     events: list[str] = []
-    audio_options: dict[str, Any] = {}
-
-    class Audio:
-        def __init__(self, _mini: object, **kwargs: Any) -> None:
-            audio_options.update(kwargs)
-            self.state_callback = kwargs["state_callback"]
-            self.error_callback = kwargs["error_callback"]
-            self.metrics = {"ok": 1}
-
-        def start(self, *, session_ready: bool) -> None:
-            assert session_ready is False
-            events.append("audio.start")
-
-        def stop(self) -> None:
-            events.append("audio.stop")
-
-        def invalidate_session(self, _reason: str) -> None: ...
-
-    class Motion:
-        def __init__(self, _mini: object, **_kwargs: Any) -> None: ...
-
-        def start(self) -> None:
-            events.append("motion.start")
-
-        def stop(self) -> None:
-            events.append("motion.stop")
-
-        def set_state(self, _state: object) -> None: ...
 
     class Client:
-        def __init__(self, _config: Config) -> None: ...
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.metrics = {"sessions": 1}
 
-        async def run(self, _port: object, stop_event: threading.Event) -> None:
+        async def run(self, stop_event: threading.Event) -> None:
             events.append("client.run")
             stop_event.set()
             await asyncio.sleep(0)
 
-    monkeypatch.setattr("yrobot.main.AudioEngine", Audio)
-    monkeypatch.setattr("yrobot.main.MotionController", Motion)
-    monkeypatch.setattr("yrobot.main.RealtimeClient", Client)
+        def submit_audio(self, *_args: Any, **_kwargs: Any) -> None: ...
 
-    runtime = YRobotRuntime(object(), make_config(), threading.Event())
+    monkeypatch.setattr("yrobot.runtime.RealtimeClient", Client)
+    runtime = YRobotRuntime(
+        FakeMini(events),
+        Settings(realtime_url="ws://brain.local/v1/realtime?mode=video"),
+        threading.Event(),
+    )
     runtime.run()
 
-    assert events == [
-        "audio.start",
-        "motion.start",
-        "client.run",
-        "audio.stop",
-        "motion.stop",
-    ]
-    assert audio_options["uplink_unit_samples"] == 8_000
-    assert audio_options["camera_fps"] == 1.0
-    assert audio_options["camera_idle_fps"] == 0.2
-    assert audio_options["playback_lead_seconds"] == 0.120
+    assert events.index("motors.enable") < events.index("media.play")
+    assert events.index("media.play") < events.index("media.record")
+    assert events.index("media.record") < events.index("client.run")
+    assert events.index("client.run") < events.index("media.stop_play")
+    assert events.index("wobble.disable") < events.index("media.stop_play")
+    assert events[-2:] == ["media.stop_play", "media.stop_record"]
+    assert events.count("media.play") == 1
+    assert events.count("media.record") == 1
+    assert "audio.clear" in events
 
 
-def test_player_clear_failure_stops_the_runtime(monkeypatch: Any) -> None:
-    class Audio:
-        def __init__(self, _mini: object, **_kwargs: Any) -> None:
-            self.metrics: dict[str, int] = {}
-
-    class Motion:
-        def __init__(self, _mini: object, **_kwargs: Any) -> None: ...
-
-    monkeypatch.setattr("yrobot.main.AudioEngine", Audio)
-    monkeypatch.setattr("yrobot.main.MotionController", Motion)
-
-    stop_event = threading.Event()
-    runtime = YRobotRuntime(object(), make_config(), stop_event)
-    runtime._handle_media_error(PlayerClearError("flush failed"))
-
-    assert stop_event.is_set()
+def test_reachy_app_requests_the_wireless_local_media_backend() -> None:
+    assert Yrobot.request_media_backend == "local"
+    assert Yrobot.dont_start_webserver is True
+    assert Yrobot.custom_app_url is None
 
 
-def test_cli_uses_wireless_local_media_path(monkeypatch: Any) -> None:
+def test_cli_connects_locally_with_automatic_body_yaw(monkeypatch: Any) -> None:
     seen: dict[str, Any] = {}
+    settings = Settings(realtime_url="ws://brain.local/v1/realtime?mode=video")
 
-    class Mini:
+    class MiniContext:
         def __init__(self, **kwargs: Any) -> None:
             seen.update(kwargs)
 
-        def __enter__(self) -> "Mini":
-            return self
+        def __enter__(self) -> object:
+            return object()
 
-        def __exit__(self, *_args: object) -> None: ...
+        def __exit__(self, *_args: Any) -> None: ...
 
-    monkeypatch.setattr("yrobot.main.ReachyMini", Mini)
-    monkeypatch.setattr("yrobot.main.Config.load", staticmethod(make_config))
+    monkeypatch.setattr("yrobot.main.ReachyMini", MiniContext)
+    monkeypatch.setattr("yrobot.main.Settings.from_env", lambda: settings)
     monkeypatch.setattr(
         "yrobot.main.run_conversation",
-        lambda _mini, config, _stop, **kwargs: seen.update(
-            config=config,
-            runtime_options=kwargs,
-        ),
+        lambda _mini, selected, _stop: seen.update(settings=selected),
     )
 
-    cli(["--no-video", "--force-listen-count", "0"])
+    cli(["--url", "ws://other.local/v1/realtime?mode=video"])
 
     assert seen["connection_mode"] == "localhost_only"
     assert seen["media_backend"] == "local"
     assert seen["automatic_body_yaw"] is True
-    assert seen["config"].send_video is False
-    assert seen["config"].force_listen_count == 0
-    assert seen["runtime_options"] == {"neutral_transitions": True}
-
-
-def test_dashboard_entry_uses_reachy_app_lifecycle(monkeypatch: Any) -> None:
-    events: list[str] = []
-
-    class App:
-        def wrapped_run(self) -> None:
-            events.append("wrapped_run")
-
-        def stop(self) -> None:
-            events.append("stop")
-
-    monkeypatch.setattr("yrobot.main.Yrobot", App)
-    app_main()
-
-    assert events == ["wrapped_run"]
+    assert seen["settings"].realtime_url == "ws://other.local/v1/realtime?mode=video"

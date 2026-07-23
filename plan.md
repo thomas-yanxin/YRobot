@@ -1,44 +1,64 @@
-# YRobot MiniCPM-o 4.5 实时交互修复计划
+# YRobot blank-slate rebuild plan
 
-状态：代码修复与自动化验证已完成；等待 Reachy Mini Wireless 真机体验复测。
+Status: implemented and locally verified on 2026-07-23. Physical Wireless acceptance
+remains intentionally separate because this workstation has no connected Reachy Mini.
 
-## 已确认环境
+## Product target
 
-- 目标硬件：Reachy Mini Wireless（CM4）。
-- MiniCPM-o Realtime Gateway：
-  `wss://10.0.16.184:8006/v1/realtime?mode=video`。
-- 应用类型：需要本机媒体与确定性动作控制循环的 Python 应用。
-- Reachy Mini SDK：1.9.0。
-- 服务端采用 OpenBMB/MiniCPM-o-Demo Realtime API。
+- Hardware: Reachy Mini Wireless, application running on its CM4.
+- Model: MiniCPM-o 4.5 public Realtime API in `mode=video`.
+- Experience: continuous audio/video input, concurrent speech output, immediate local
+  barge-in, echo-resistant near-end detection, sound-oriented attention, and smooth motion.
+- Constraint: do not derive the design from the previous YRobot implementation.
 
-## 用户目标
+## Protocol contract
 
-1. 降低用户说完到首个可闻回复的端到端延迟。
-2. 插话后立即物理静音，任何旧回答音频都不能恢复；机器人自身播放不能误触发插话。
-3. 动作控制保持固定频率、单一 owner、平滑且拟人。
-4. 修复音视频输入、会话状态与回复 turn 错配导致的答非所问。
-5. 在协议的 300 秒 video session 上限下自动、干净地重建会话并持续服务。
+- Wait for `session.queue_done`, send one `session.init`, then wait for
+  `session.created`.
+- Send one real-time-paced `input.append` per second: 16 kHz mono little-endian
+  float32 PCM plus at most one 640 px JPEG and `max_slice_nums=1`.
+- Consume independent `response.output.delta` branches: `listen`, `text`, and 24 kHz
+  mono float32 `audio`. Full-duplex mode does not use per-turn `response.done`.
+- On barge-in, flush Reachy's player locally, invalidate all older playback epochs, drop
+  further old output, and set `force_listen=true` on input units until `kind=listen`.
+- Stop input before `session.close`; treat `session.closed`, WebSocket close, and `error`
+  as terminal. Recreate video sessions before the 300 second hard limit.
 
-## 技术方案
+## Runtime architecture
 
-- 严格保持 URL mode、视频上传行为、session 生命周期三者一致。
-- 使用有界、带 epoch 的输入/播放队列；session 或插话切换时原子失效旧数据。
-- 音频采集、摄像头、DoA、播放、WebSocket 和动作控制各自隔离，慢设备调用不阻塞音频热路径。
-- 用短启动缓冲和绝对播放时钟降低首响并避免音频 underrun。
-- 使用 AEC 后 VAD，加播放参考相关性防护；插话立即清空应用队列和 GStreamer player。
-- 显式处理 `session.closed`、WebSocket close、close acknowledgement、超时与带抖动重连。
-- 动作由唯一 50 Hz 控制器合成，DoA 独立采样，所有轴限速/限加速度。
-- 补齐协议、并发、音频 epoch、回声保护、重连和动作周期回归测试。
+- Keep Reachy's LOCAL media backend so the XVF3800 hardware AEC remains in the path.
+- Split microphone samples into 20 ms frames for local VAD while aggregating exactly one
+  second for the model. Never wait for an utterance to end before uploading.
+- Give capture, playback, camera, DoA, WebSocket, and motion independent bounded workers.
+  A slow camera or USB read must never block the audio hot path.
+- Use Reachy's `clear_player()` for physical barge-in; never use the deprecated no-op
+  `clear_output_buffer()`.
+- Use AEC output plus WebRTC VAD, adaptive energy gating, and recent playback correlation
+  to distinguish near-end speech from the robot's own voice.
+- Poll hardware DoA independently, circularly smooth it, and accept a bearing when either
+  XVF3800 speech detection or the local near-end detector is active. The linear array's
+  documented front/back ambiguity remains a hardware limitation.
+- Keep one fixed-rate motion owner. It composes DoA attention, low-amplitude idle motion,
+  speaking state, antenna motion, and rate/acceleration limiting before the only
+  `set_target()` call. Reachy's daemon-side speech wobble remains an additive offset.
+- Record monotonic latency and drop/interrupt counters without logging audio, images, or
+  secrets.
 
-## 阻塞问题
+## Acceptance
 
-无。用户已明确硬件、Gateway、目标模式和需要直接修复当前应用。
+- Protocol payloads and lifecycle match the public MiniCPM-o 4.5 documentation.
+- Stale audio cannot cross an interruption or session boundary.
+- A synthetic echo does not trigger barge-in; independent near-end speech does.
+- Uplink units are exactly 16,000 float32 samples and are sent at monotonic one-second
+  cadence without burst replay.
+- Motion has one writer, fixed cadence, bounded velocity/acceleration, and graceful stop.
+- Ruff, compile checks, unit tests, the Reachy app checker, and no-hardware integration
+  tests pass locally.
+- Physical Wireless acceptance still covers audible stop latency, false interrupts,
+  first-audio latency, DoA response, motion feel, and session rollover.
 
-## 验收
+## Questions
 
-- 自动化：81 个 pytest、ruff、compileall、依赖检查与无硬件集成测试通过。
-- Gateway：真实 WSS 探针已验证 500 ms / 8000-sample 音频单元、queue/init、
-  `force_listen`、listen metrics 和干净关闭；当前 session init 约 6.3 秒，
-  input-to-listen 约 130 ms。
-- 真机：插话静音、旧音频不恢复、自声不误触发、首响延迟、动作连续性及至少两次
-  video session rollover 需要在 Wireless 实机上复测。
+None outstanding. The user supplied the target robot and model documentation; the local
+configuration supplies the gateway and confirms on-robot execution. All remaining tuning
+values are safe, documented environment settings.
