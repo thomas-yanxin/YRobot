@@ -1,204 +1,279 @@
-"""Environment-driven configuration (YROBOT_* variables, see .env.example)."""
+"""Environment-driven configuration for the YRobot realtime client."""
 
 from __future__ import annotations
 
+import math
 import os
+import ssl
 from dataclasses import dataclass
-from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+INPUT_SAMPLE_RATE = 16_000
+OUTPUT_SAMPLE_RATE = 24_000
+AUDIO_UNIT_SAMPLES = INPUT_SAMPLE_RATE
+DEFAULT_AUDIO_CHUNK_MS = 500
 
-def load_dotenv(path: str | Path = ".env") -> None:
-    """Load KEY=VALUE lines into os.environ without overriding existing vars."""
-    p = Path(path)
-    if not p.is_file():
-        return
-    for line in p.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.split("#", 1)[0].strip().strip("'\"")
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-def _s(name: str, default: str) -> str:
-    return os.environ.get(name, "").strip() or default
-
-
-def _f(name: str, default: float) -> float:
-    return float(_s(name, str(default)))
-
-
-def _i(name: str, default: int) -> int:
-    return int(_s(name, str(default)))
-
-
-def _b(name: str, default: bool) -> bool:
-    return _s(name, str(int(default))).lower() in ("1", "true", "yes", "on")
-
-
-# The duplex model is trained with this exact system sentence (it is the
-# server-side default and the one used by the official presets/frontend).
-# Replacing it with a free-form persona pushes the Qwen3 base out of its
-# duplex distribution — <think> blocks start leaking into speak slices and
-# answers degrade. Behaviour guidance goes into a SHORT separate instruction
-# appended on the next line (cf. the official offline example
-# "你是一个友好的助手，请简短回复。").
+DEFAULT_REALTIME_URL = "wss://10.0.16.184:8006/v1/realtime?mode=video"
+# MiniCPM-o's duplex examples and the deployed model use this exact prompt.
+# Keeping the model on its trained template is materially more reliable than
+# injecting a long persona or instruction block into session.init.
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
-DEFAULT_INSTRUCTION = "请像朋友聊天一样简短口语化地回复，跟随用户使用中文或英文。"
 
 
-@dataclass(frozen=True)
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
+def _float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
+    if not math.isfinite(parsed) or not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}, got {value!r}")
+    return parsed
+
+
+def _int_env(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    if not minimum <= parsed <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}, got {value!r}")
+    return parsed
+
+
+def normalize_realtime_url(value: str) -> str:
+    """Normalize a host or HTTP/WebSocket URL to the video Realtime Gateway."""
+
+    raw = value.strip()
+    if not raw:
+        raise ValueError("YROBOT_REALTIME_URL must not be empty")
+
+    # The official Gateway is HTTPS/WSS by default. urlsplit treats
+    # ``host:port`` as a custom scheme, so bare endpoints need an explicit
+    # secure transport before parsing. Plain deployments remain available by
+    # spelling http:// or ws:// explicitly.
+    if "://" not in raw:
+        raw = f"wss://{raw.lstrip('/')}"
+
+    parsed = urlsplit(raw)
+    scheme_map = {
+        "http": "ws",
+        "https": "wss",
+        "ws": "ws",
+        "wss": "wss",
+    }
+    scheme = scheme_map.get(parsed.scheme.lower())
+    if scheme is None or not parsed.netloc or parsed.hostname is None:
+        raise ValueError("YROBOT_REALTIME_URL must be a host or an http(s)/ws(s) URL")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("YROBOT_REALTIME_URL contains an invalid port") from exc
+
+    path = parsed.path.rstrip("/")
+    if path == "/backend" or path.endswith("/backend"):
+        raise ValueError(
+            "The legacy /backend endpoint is not supported; use /v1/realtime?mode=video"
+        )
+    if path not in {"", "/v1/realtime"}:
+        raise ValueError("YROBOT_REALTIME_URL path must be /v1/realtime")
+    if parsed.fragment:
+        raise ValueError("YROBOT_REALTIME_URL must not contain a fragment")
+
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if any(key != "mode" for key, _ in query):
+        raise ValueError("YROBOT_REALTIME_URL only supports the mode query parameter")
+
+    return urlunsplit(
+        (
+            scheme,
+            parsed.netloc,
+            "/v1/realtime",
+            urlencode({"mode": "video"}),
+            "",
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
-    """All runtime knobs. Defaults reflect measurements against the live gateway."""
-
-    # --- gateway ---
-    url: str = "wss://10.0.16.184:8006/v1/realtime"
-    mode: str = "audio"  # "audio" = 600 s sessions; still accepts video frames
-    tls_verify: bool = False
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT
-    instruction: str = DEFAULT_INSTRUCTION  # short behaviour line, NOT a persona essay
+    realtime_url: str
+    tls_verify: bool
+    send_video: bool
+    system_prompt: str
+    enable_tts: bool = True
     length_penalty: float = 1.1
-    force_listen_count: int = 1  # listen slices forced at session start
-    temperature: float = 0.0  # 0 = server default
-    top_p: float = 0.0  # 0 = server default
-
-    # --- uplink ---
-    chunk_ms: int = 500  # < 500 breaks server turn-taking; 1000 adds latency
-    send_video: bool = True
-    frame_active_s: float = 1.0  # frame cadence while conversation is active
-    frame_idle_s: float = 5.0  # sparse frames while idle (vision ~64 kv-tok each)
-
-    # --- downlink ---
-    model_out_sr: int = 24000
-    preroll_min_s: float = 0.25  # start-of-utterance delay absorbing TTS jitter
-    preroll_max_s: float = 0.8
-    max_backlog_s: float = 1.5  # device-side queue cap (keeps barge-in flush cheap)
-
-    # --- session budget (kv cache overflows at 8192; vision burns ~64 tok/frame) ---
-    kv_soft: int = 6500  # rotate at next quiet moment
-    kv_hard: int = 7800  # rotate immediately
-    session_max_s: float = 0.0  # 0 = auto from mode (audio 570 / video 280)
-    reconnect_initial_s: float = 2.0  # server rejects immediate reconnects
-    reconnect_max_s: float = 8.0
-
-    # --- voice gate (on the AEC'd mic stream) ---
-    gate_ratio: float = 4.0  # speech threshold = noise floor × ratio
-    gate_min_rms: float = 0.010
-    gate_barge_mult: float = 1.5  # stricter while the robot is speaking
-    onset_ms: float = 100.0
-    barge_onset_ms: float = 120.0
-    release_ms: float = 400.0
-    floor_tau_s: float = 3.0
-
-    # --- uplink AGC (quiet speakers are otherwise ignored by the model) ---
-    agc_target_rms: float = 0.12
-    agc_max_gain: float = 6.0
-
-    # --- turn gate / barge-in ---
-    quiet_s: float = 0.7  # user silence required before a listen counts as clean
-    unlatch_listens: int = 2  # clean consecutive listens required to unlatch
-    reforce_ack_s: float = 1.2  # listens this soon after our force are just acks
-    hold_max_s: float = 12.0  # discard-latch safety cap
-    reforce_s: float = 1.0  # min interval between re-forced listens
-
-    # --- motion ---
-    motion: bool = True
-    motion_hz: float = 20.0
-    track_weight_idle: float = 0.4
-    track_weight_listen: float = 0.6
-    track_weight_speak: float = 0.25
-    doa: bool = True
-    doa_min_turn_rad: float = 0.26  # ignore DOA errors below ~15°
-
-    log_level: str = "INFO"
+    force_listen_count: int = 1
+    audio_chunk_ms: int = DEFAULT_AUDIO_CHUNK_MS
+    frame_active_interval: float = 1.0
+    frame_idle_interval: float = 5.0
+    playback_lead_seconds: float = 0.120
+    kv_soft_limit: int = 6_500
+    kv_hard_limit: int = 7_800
+    reconnect_initial_delay: float = 1.0
+    reconnect_max_delay: float = 8.0
+    reconnect_reset_after: float = 30.0
+    handshake_timeout: float = 120.0
+    close_ack_timeout: float = 5.0
+    session_rollover: float = 280.0
+    max_message_size: int = 16 * 1024 * 1024
 
     @property
-    def full_url(self) -> str:
-        """URL with mode taken from YROBOT_MODE — any ?mode= in the URL is
-        replaced, so a stale `?mode=video` in a .env can't silently shrink
-        sessions to 300 s."""
-        base, _, query = self.url.partition("?")
-        params = [p for p in query.split("&") if p and not p.startswith("mode=")]
-        params.append(f"mode={self.mode}")
-        return f"{base}?{'&'.join(params)}"
+    def audio_unit_samples(self) -> int:
+        """Configured 16 kHz uplink unit size."""
 
-    @property
-    def effective_mode(self) -> str:
-        return self.mode
-
-    @property
-    def full_system_prompt(self) -> str:
-        if self.instruction:
-            return f"{self.system_prompt}\n{self.instruction}"
-        return self.system_prompt
-
-    @property
-    def session_budget_s(self) -> float:
-        """Stay under the gateway's hard cap (video 300 s / audio 600 s)."""
-        if self.session_max_s > 0:
-            return self.session_max_s
-        return 280.0 if self.effective_mode == "video" else 570.0
-
-    def session_config(self) -> dict:
-        cfg: dict = {
-            "length_penalty": self.length_penalty,
-            "force_listen_count": self.force_listen_count,
-        }
-        if self.temperature > 0:
-            cfg["temperature"] = self.temperature
-        if self.top_p > 0:
-            cfg["top_p"] = self.top_p
-        return cfg
+        return INPUT_SAMPLE_RATE * self.audio_chunk_ms // 1_000
 
     @classmethod
-    def from_env(cls) -> "Config":
-        load_dotenv()
-        d = cls()
-        return cls(
-            url=_s("YROBOT_REALTIME_URL", d.url),
-            mode=_s("YROBOT_MODE", d.mode),
-            tls_verify=_b("YROBOT_TLS_VERIFY", d.tls_verify),
-            system_prompt=_s("YROBOT_SYSTEM_PROMPT", d.system_prompt),
-            instruction=_s("YROBOT_INSTRUCTION", d.instruction),
-            length_penalty=_f("YROBOT_LENGTH_PENALTY", d.length_penalty),
-            force_listen_count=_i("YROBOT_FORCE_LISTEN_COUNT", d.force_listen_count),
-            temperature=_f("YROBOT_TEMPERATURE", d.temperature),
-            top_p=_f("YROBOT_TOP_P", d.top_p),
-            chunk_ms=_i("YROBOT_CHUNK_MS", d.chunk_ms),
-            send_video=_b("YROBOT_SEND_VIDEO", d.send_video),
-            frame_active_s=_f("YROBOT_FRAME_ACTIVE_S", d.frame_active_s),
-            frame_idle_s=_f("YROBOT_FRAME_IDLE_S", d.frame_idle_s),
-            model_out_sr=_i("YROBOT_MODEL_OUT_SR", d.model_out_sr),
-            preroll_min_s=_f("YROBOT_PREROLL_MIN_S", d.preroll_min_s),
-            preroll_max_s=_f("YROBOT_PREROLL_MAX_S", d.preroll_max_s),
-            max_backlog_s=_f("YROBOT_MAX_BACKLOG_S", d.max_backlog_s),
-            kv_soft=_i("YROBOT_KV_SOFT", d.kv_soft),
-            kv_hard=_i("YROBOT_KV_HARD", d.kv_hard),
-            session_max_s=_f("YROBOT_SESSION_MAX_S", d.session_max_s),
-            reconnect_initial_s=_f("YROBOT_RECONNECT_INITIAL", d.reconnect_initial_s),
-            reconnect_max_s=_f("YROBOT_RECONNECT_MAX", d.reconnect_max_s),
-            gate_ratio=_f("YROBOT_GATE_RATIO", d.gate_ratio),
-            gate_min_rms=_f("YROBOT_GATE_MIN_RMS", d.gate_min_rms),
-            gate_barge_mult=_f("YROBOT_GATE_BARGE_MULT", d.gate_barge_mult),
-            onset_ms=_f("YROBOT_ONSET_MS", d.onset_ms),
-            barge_onset_ms=_f("YROBOT_BARGE_ONSET_MS", d.barge_onset_ms),
-            release_ms=_f("YROBOT_RELEASE_MS", d.release_ms),
-            floor_tau_s=_f("YROBOT_FLOOR_TAU_S", d.floor_tau_s),
-            agc_target_rms=_f("YROBOT_AGC_TARGET_RMS", d.agc_target_rms),
-            agc_max_gain=_f("YROBOT_AGC_MAX_GAIN", d.agc_max_gain),
-            quiet_s=_f("YROBOT_QUIET_S", d.quiet_s),
-            unlatch_listens=_i("YROBOT_UNLATCH_LISTENS", d.unlatch_listens),
-            reforce_ack_s=_f("YROBOT_REFORCE_ACK_S", d.reforce_ack_s),
-            hold_max_s=_f("YROBOT_HOLD_MAX_S", d.hold_max_s),
-            reforce_s=_f("YROBOT_REFORCE_S", d.reforce_s),
-            motion=_b("YROBOT_MOTION", d.motion),
-            motion_hz=_f("YROBOT_MOTION_HZ", d.motion_hz),
-            track_weight_idle=_f("YROBOT_TRACK_IDLE", d.track_weight_idle),
-            track_weight_listen=_f("YROBOT_TRACK_LISTEN", d.track_weight_listen),
-            track_weight_speak=_f("YROBOT_TRACK_SPEAK", d.track_weight_speak),
-            doa=_b("YROBOT_DOA", d.doa),
-            doa_min_turn_rad=_f("YROBOT_DOA_MIN_TURN_RAD", d.doa_min_turn_rad),
-            log_level=_s("LOG_LEVEL", d.log_level),
+    def load(cls) -> Config:
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv()
+        except ImportError:
+            pass
+
+        system_prompt = os.getenv("YROBOT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
+        if system_prompt != DEFAULT_SYSTEM_PROMPT:
+            raise ValueError(
+                "YROBOT_SYSTEM_PROMPT must remain exactly "
+                f"{DEFAULT_SYSTEM_PROMPT!r} for the MiniCPM-o duplex template"
+            )
+        audio_chunk_ms = _int_env(
+            "YROBOT_CHUNK_MS",
+            DEFAULT_AUDIO_CHUNK_MS,
+            minimum=500,
+            maximum=1_000,
         )
+        if audio_chunk_ms % 20:
+            raise ValueError("YROBOT_CHUNK_MS must be a multiple of 20")
+        frame_active_interval = _float_env(
+            "YROBOT_FRAME_ACTIVE_S",
+            1.0,
+            minimum=0.5,
+            maximum=10.0,
+        )
+        frame_idle_interval = _float_env(
+            "YROBOT_FRAME_IDLE_S",
+            5.0,
+            minimum=1.0,
+            maximum=30.0,
+        )
+        if frame_idle_interval < frame_active_interval:
+            raise ValueError(
+                "YROBOT_FRAME_IDLE_S must be greater than or equal to "
+                "YROBOT_FRAME_ACTIVE_S"
+            )
+        kv_soft_limit = _int_env(
+            "YROBOT_KV_SOFT",
+            6_500,
+            minimum=1_000,
+            maximum=8_191,
+        )
+        kv_hard_limit = _int_env(
+            "YROBOT_KV_HARD",
+            7_800,
+            minimum=1_001,
+            maximum=8_192,
+        )
+        if kv_hard_limit <= kv_soft_limit:
+            raise ValueError("YROBOT_KV_HARD must be greater than YROBOT_KV_SOFT")
+        reconnect_initial = _float_env(
+            "YROBOT_RECONNECT_INITIAL",
+            1.0,
+            minimum=0.05,
+            maximum=60.0,
+        )
+        reconnect_max = _float_env(
+            "YROBOT_RECONNECT_MAX",
+            8.0,
+            minimum=0.05,
+            maximum=120.0,
+        )
+        if reconnect_max < reconnect_initial:
+            raise ValueError(
+                "YROBOT_RECONNECT_MAX must be greater than or equal to YROBOT_RECONNECT_INITIAL"
+            )
+
+        return cls(
+            realtime_url=normalize_realtime_url(
+                os.getenv("YROBOT_REALTIME_URL", DEFAULT_REALTIME_URL)
+            ),
+            # The configured on-premise Gateway currently uses the self-signed
+            # certificate generated by MiniCPM-o-Demo. Reissue a trusted
+            # certificate with a matching IP/DNS SAN, then set this to 1.
+            tls_verify=_bool_env("YROBOT_TLS_VERIFY", False),
+            send_video=_bool_env("YROBOT_SEND_VIDEO", True),
+            system_prompt=system_prompt,
+            enable_tts=_bool_env("YROBOT_ENABLE_TTS", True),
+            length_penalty=_float_env(
+                "YROBOT_LENGTH_PENALTY",
+                1.1,
+                minimum=0.1,
+                maximum=5.0,
+            ),
+            force_listen_count=_int_env(
+                "YROBOT_FORCE_LISTEN_COUNT",
+                1,
+                minimum=0,
+                maximum=10,
+            ),
+            audio_chunk_ms=audio_chunk_ms,
+            frame_active_interval=frame_active_interval,
+            frame_idle_interval=frame_idle_interval,
+            playback_lead_seconds=_float_env(
+                "YROBOT_PLAYBACK_LEAD_S",
+                0.120,
+                minimum=0.020,
+                maximum=0.150,
+            ),
+            kv_soft_limit=kv_soft_limit,
+            kv_hard_limit=kv_hard_limit,
+            reconnect_initial_delay=reconnect_initial,
+            reconnect_max_delay=reconnect_max,
+            session_rollover=_float_env(
+                "YROBOT_SESSION_ROLLOVER",
+                280.0,
+                minimum=30.0,
+                maximum=290.0,
+            ),
+        )
+
+    def ssl_context(self) -> ssl.SSLContext | None:
+        if self.realtime_url.startswith("ws://"):
+            return None
+        if self.tls_verify:
+            return ssl.create_default_context()
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
