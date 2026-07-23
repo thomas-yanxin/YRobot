@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -177,89 +178,275 @@ def test_sender_carries_force_listen_and_latest_jpeg() -> None:
     assert turns.snapshot().force_listen_sent is True
 
 
-def test_sender_never_compresses_two_one_second_units() -> None:
-    stop = threading.Event()
-    send_times: list[float] = []
-    turns = TurnCoordinator()
-    turns.new_session()
-    turns.accept_audio("old")
-    turns.interrupt()
-    client = make_client(turns)
+def test_sender_sends_each_fresh_unit_without_a_second_pacing_delay() -> None:
+    async def scenario() -> tuple[list[float], float, RealtimeClient]:
+        stop = threading.Event()
+        send_times: list[float] = []
+        client = make_client()
 
-    def after_send() -> None:
-        send_times.append(time.monotonic())
-        if len(send_times) == 1:
-            client.submit_audio(
-                np.zeros(16_000, dtype=np.float32),
-                captured_at=time.monotonic(),
-                sequence=2,
-            )
-        else:
-            stop.set()
+        def after_send() -> None:
+            send_times.append(time.monotonic())
+            if len(send_times) == 2:
+                stop.set()
 
-    websocket = FakeWebSocket(on_send=after_send)
-    client.submit_audio(
-        np.zeros(16_000, dtype=np.float32),
-        captured_at=time.monotonic(),
-        sequence=1,
-    )
-    lifecycle = _Lifecycle()
-    lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
-
-    asyncio.run(
-        client._sender(  # type: ignore[arg-type]
-            websocket,
-            lifecycle,
-            stop,
+        websocket = FakeWebSocket(on_send=after_send)
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        client.submit_audio(
+            np.zeros(16_000, dtype=np.float32),
+            captured_at=time.monotonic(),
+            sequence=1,
         )
-    )
+        sender = asyncio.create_task(
+            client._sender(  # type: ignore[arg-type]
+                websocket,
+                lifecycle,
+                stop,
+            )
+        )
+        while client.metrics.input_units < 1:
+            await asyncio.sleep(0)
+
+        # Simulate the next hardware-clocked one-second unit without making the
+        # test sleep for a full second.
+        client._last_wire_send_at = time.monotonic() - 1.0
+        client._last_sent_capture_at = time.monotonic() - 1.0
+        submitted_at = time.monotonic()
+        client.submit_audio(
+            np.full(16_000, 0.2, dtype=np.float32),
+            captured_at=submitted_at,
+            sequence=2,
+        )
+        await asyncio.wait_for(sender, timeout=0.5)
+        return send_times, submitted_at, client
+
+    send_times, submitted_at, client = asyncio.run(scenario())
 
     assert len(send_times) == 2
-    assert send_times[1] - send_times[0] >= 0.98
-    assert all(event["input"]["force_listen"] for event in websocket.sent)
-    assert client.metrics.capture_to_send.count == 2
-    assert client.metrics.send_interval.minimum_ms >= 980
+    assert send_times[1] - submitted_at < 0.3
+    assert client.metrics.unit_ready_to_send.count == 2
+    assert client.metrics.send_interval.minimum_ms >= 900
 
 
-def test_sender_keeps_absolute_cadence_across_normal_write_latency() -> None:
-    class DelayedWebSocket(FakeWebSocket):
+def test_sender_drops_audio_captured_behind_a_blocked_socket_write() -> None:
+    class BlockedWebSocket(FakeWebSocket):
+        def __init__(self, stop: threading.Event) -> None:
+            super().__init__()
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.stop = stop
+
         async def send(self, raw: str) -> None:
-            await asyncio.sleep(0.2)
-            await super().send(raw)
+            self.sent.append(json.loads(raw))
+            if len(self.sent) == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            else:
+                self.stop.set()
 
-    stop = threading.Event()
-    send_times: list[float] = []
-    client = make_client()
-
-    def after_send() -> None:
-        send_times.append(time.monotonic())
-        if len(send_times) == 1:
-            client.submit_audio(
-                np.zeros(16_000, dtype=np.float32),
-                captured_at=time.monotonic(),
-                sequence=2,
-            )
-        else:
-            stop.set()
-
-    websocket = DelayedWebSocket(on_send=after_send)
-    client.submit_audio(
-        np.zeros(16_000, dtype=np.float32),
-        captured_at=time.monotonic(),
-        sequence=1,
-    )
-    lifecycle = _Lifecycle()
-    lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
-
-    asyncio.run(
-        client._sender(  # type: ignore[arg-type]
-            websocket,
-            lifecycle,
-            stop,
+    async def scenario() -> tuple[BlockedWebSocket, RealtimeClient]:
+        stop = threading.Event()
+        client = make_client()
+        websocket = BlockedWebSocket(stop)
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        client.submit_audio(
+            np.full(16_000, 0.1, dtype=np.float32),
+            captured_at=time.monotonic(),
+            sequence=1,
         )
-    )
+        sender = asyncio.create_task(
+            client._sender(  # type: ignore[arg-type]
+                websocket,
+                lifecycle,
+                stop,
+            )
+        )
+        await websocket.first_started.wait()
+        client.submit_audio(
+            np.full(16_000, 0.2, dtype=np.float32),
+            captured_at=time.monotonic(),
+            sequence=2,
+        )
+        websocket.release_first.set()
+        while client.metrics.dropped_input_units < 1:
+            await asyncio.sleep(0)
+        client._last_wire_send_at = time.monotonic() - 1.0
+        client._last_sent_capture_at = time.monotonic() - 1.0
+        client.submit_audio(
+            np.full(16_000, 0.3, dtype=np.float32),
+            captured_at=time.monotonic(),
+            sequence=3,
+        )
+        await asyncio.wait_for(sender, timeout=0.5)
+        return websocket, client
 
-    assert 0.98 <= send_times[1] - send_times[0] < 1.1
+    websocket, client = asyncio.run(scenario())
+    sent_means = [
+        float(
+            np.frombuffer(
+                base64.b64decode(event["input"]["audio"]),
+                dtype="<f4",
+            ).mean()
+        )
+        for event in websocket.sent
+    ]
+
+    assert sent_means == pytest.approx([0.1, 0.3])
+    assert client.metrics.input_units == 2
+    assert client.metrics.dropped_input_units == 1
+
+
+def test_sender_drops_unit_captured_immediately_after_previous_send() -> None:
+    async def scenario() -> tuple[FakeWebSocket, RealtimeClient]:
+        stop = threading.Event()
+        client = make_client()
+        websocket = FakeWebSocket()
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        first_capture = time.monotonic() - 1.0
+        client.submit_audio(
+            np.full(16_000, 0.1, dtype=np.float32),
+            captured_at=first_capture,
+            sequence=1,
+        )
+        sender = asyncio.create_task(
+            client._sender(  # type: ignore[arg-type]
+                websocket,
+                lifecycle,
+                stop,
+            )
+        )
+        while client.metrics.input_units < 1:
+            await asyncio.sleep(0)
+
+        assert client._last_wire_send_at is not None
+        second_capture = time.monotonic()
+        since_wire_send = second_capture - client._last_wire_send_at
+        assert 0 <= since_wire_send < client._minimum_uplink_interval
+        assert second_capture - first_capture >= client._minimum_uplink_interval
+        client.submit_audio(
+            np.full(16_000, 0.2, dtype=np.float32),
+            captured_at=second_capture,
+            sequence=2,
+        )
+
+        async def wait_for_drop() -> None:
+            while client.metrics.dropped_input_units < 1:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_drop(), timeout=0.2)
+        stop.set()
+        await asyncio.wait_for(sender, timeout=0.3)
+        return websocket, client
+
+    websocket, client = asyncio.run(scenario())
+
+    assert len(websocket.sent) == 1
+    assert client.metrics.input_units == 1
+    assert client.metrics.dropped_input_units == 1
+
+
+def test_first_force_listen_unit_bypasses_backpressure_drop() -> None:
+    class BlockedWebSocket(FakeWebSocket):
+        def __init__(self, stop: threading.Event) -> None:
+            super().__init__()
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.stop = stop
+
+        async def send(self, raw: str) -> None:
+            self.sent.append(json.loads(raw))
+            if len(self.sent) == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            else:
+                self.stop.set()
+
+    async def scenario() -> tuple[BlockedWebSocket, TurnCoordinator, RealtimeClient]:
+        stop = threading.Event()
+        turns = TurnCoordinator()
+        turns.new_session()
+        turns.accept_audio("old")
+        client = make_client(turns)
+        websocket = BlockedWebSocket(stop)
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        client.submit_audio(
+            np.full(16_000, 0.1, dtype=np.float32),
+            captured_at=time.monotonic(),
+            sequence=1,
+        )
+        sender = asyncio.create_task(
+            client._sender(  # type: ignore[arg-type]
+                websocket,
+                lifecycle,
+                stop,
+            )
+        )
+        await websocket.first_started.wait()
+        assert turns.interrupt() is not None
+        client.submit_audio(
+            np.full(16_000, 0.2, dtype=np.float32),
+            captured_at=time.monotonic(),
+            sequence=2,
+        )
+        websocket.release_first.set()
+        await asyncio.wait_for(sender, timeout=0.5)
+        return websocket, turns, client
+
+    websocket, turns, client = asyncio.run(scenario())
+
+    assert len(websocket.sent) == 2
+    assert websocket.sent[1]["input"]["force_listen"] is True
+    assert turns.snapshot().force_listen_sent is True
+    assert client.metrics.dropped_input_units == 0
+
+
+def test_session_activation_discards_only_handshake_era_audio() -> None:
+    async def scenario() -> tuple[FakeWebSocket, RealtimeClient]:
+        client = make_client()
+        stop = threading.Event()
+        websocket = FakeWebSocket(on_send=stop.set)
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        activation = time.monotonic()
+        client._session_input_cutoff = activation
+        client._discard_input_captured_through(activation)
+
+        # This emulates a capture callback that obtained its timestamp before
+        # activation but submitted just after the one-time slot purge.
+        client.submit_audio(
+            np.full(16_000, -0.2, dtype=np.float32),
+            captured_at=activation - 0.1,
+            sequence=1,
+        )
+        sender = asyncio.create_task(
+            client._sender(  # type: ignore[arg-type]
+                websocket,
+                lifecycle,
+                stop,
+            )
+        )
+        while client.metrics.dropped_input_units < 1:
+            await asyncio.sleep(0)
+        client.submit_audio(
+            np.full(16_000, 0.4, dtype=np.float32),
+            captured_at=time.monotonic(),
+            sequence=2,
+        )
+        await asyncio.wait_for(sender, timeout=0.5)
+        return websocket, client
+
+    websocket, client = asyncio.run(scenario())
+
+    assert len(websocket.sent) == 1
+    sent = np.frombuffer(
+        base64.b64decode(websocket.sent[0]["input"]["audio"]),
+        dtype="<f4",
+    )
+    assert float(sent.mean()) == pytest.approx(0.4)
+    assert client.metrics.dropped_input_units == 1
 
 
 def test_input_send_timeout_closes_and_reconnects_without_acknowledging_force() -> None:
@@ -566,6 +753,101 @@ def test_interrupted_audio_is_dropped_until_listen_boundary() -> None:
     assert lifecycle.state.phase is Phase.CLOSED
 
 
+def test_response_first_packet_logs_once_per_kind_with_server_segments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pcm = np.zeros(240, dtype="<f4").tobytes()
+    encoded = base64.b64encode(pcm).decode("ascii")
+    server_now = time.time() - 0.05
+    websocket = FakeWebSocket(
+        [
+            {
+                "type": "response.output.delta",
+                "kind": "listen",
+                "session_id": "sess-1",
+                "metrics": {},
+                "server_send_ts": server_now,
+            },
+            {
+                "type": "response.output.delta",
+                "kind": "text",
+                "session_id": "sess-1",
+                "response_id": "resp-1",
+                "text": "first",
+                "metrics": {"prefill_ms": 12.5, "wall_clock_ms": 31},
+                "server_send_ts": server_now + 0.01,
+            },
+            {
+                "type": "response.output.delta",
+                "kind": "text",
+                "session_id": "sess-1",
+                "response_id": "resp-1",
+                "text": "second",
+                "metrics": {"prefill_ms": 999},
+                "server_send_ts": server_now + 0.02,
+            },
+            {
+                "type": "response.output.delta",
+                "kind": "audio",
+                "session_id": "sess-1",
+                "response_id": "resp-1",
+                "audio": encoded,
+                "metrics": {"vision_slices": 1, "kv_cache_length": 384},
+                "server_send_ts": server_now + 0.03,
+            },
+            {
+                "type": "response.output.delta",
+                "kind": "audio",
+                "session_id": "sess-1",
+                "response_id": "resp-1",
+                "audio": encoded,
+                "metrics": {"kv_cache_length": 999},
+                "server_send_ts": server_now + 0.04,
+            },
+            {
+                "type": "session.closed",
+                "session_id": "sess-1",
+                "reason": "test",
+            },
+        ]
+    )
+    turns = TurnCoordinator()
+    turns.new_session()
+    client = make_client(turns)
+    client._last_input_send_at = time.monotonic() - 0.1
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.STREAMING, "sess-1")
+    caplog.set_level(logging.INFO, logger="yrobot.realtime")
+
+    asyncio.run(
+        client._receiver(  # type: ignore[arg-type]
+            websocket,
+            lifecycle,
+            asyncio.Event(),
+        )
+    )
+
+    first_packet_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "yrobot.realtime" and record.getMessage().startswith("MiniCPM-o first ")
+    ]
+    assert len(first_packet_logs) == 2
+    assert first_packet_logs[0].startswith("MiniCPM-o first text packet:")
+    assert "latest_input_send_age_ms=" in first_packet_logs[0]
+    assert "server_send_ts=" in first_packet_logs[0]
+    assert "server_to_client_excess_ms=" in first_packet_logs[0]
+    assert "server_prefill_ms=12.5" in first_packet_logs[0]
+    assert "server_wall_clock_ms=31" in first_packet_logs[0]
+    assert "server_prefill_ms=999" not in " ".join(first_packet_logs)
+    assert first_packet_logs[1].startswith("MiniCPM-o first audio packet:")
+    assert "server_vision_slices=1" in first_packet_logs[1]
+    assert "server_kv_cache_length=384" in first_packet_logs[1]
+    assert "server_kv_cache_length=999" not in " ".join(first_packet_logs)
+    assert "e2e" not in " ".join(first_packet_logs).lower()
+    assert client.metrics.latest_input_to_first_audio.count == 1
+
+
 def test_real_websockets15_full_lifecycle() -> None:
     async def scenario() -> tuple[list[str], list[str]]:
         server_events: list[str] = []
@@ -628,6 +910,15 @@ def test_real_websockets15_full_lifecycle() -> None:
         async with serve(handler, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             turns = TurnCoordinator()
+            client_ref: list[RealtimeClient] = []
+
+            def on_session(ready: bool, _epoch: int) -> None:
+                if ready:
+                    client_ref[0].submit_audio(
+                        np.zeros(16_000, dtype=np.float32),
+                        captured_at=time.monotonic(),
+                    )
+
             client = RealtimeClient(
                 Settings(realtime_url=(f"ws://127.0.0.1:{port}/v1/realtime?mode=video")),
                 turns,
@@ -635,10 +926,11 @@ def test_real_websockets15_full_lifecycle() -> None:
                 on_audio=lambda _samples, _epoch, response: received_audio.append(str(response)),
                 on_listen=lambda _epoch: stop.set(),
                 on_text=lambda *_: None,
-                on_session=lambda *_: None,
+                on_session=on_session,
             )
+            client_ref.append(client)
             client.submit_audio(
-                np.zeros(16_000, dtype=np.float32),
+                np.full(16_000, -0.5, dtype=np.float32),
                 captured_at=time.monotonic(),
             )
             await asyncio.wait_for(client.run(stop), timeout=3.0)

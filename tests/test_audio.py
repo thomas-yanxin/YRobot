@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable
 
 import numpy as np
+import pytest
 
 from yrobot.audio import (
     AudioCaptureWorker,
@@ -106,7 +108,7 @@ def test_capture_normalization_splitter_and_exact_f32le_unit() -> None:
     np.testing.assert_array_equal(np.frombuffer(units[0].f32le, dtype="<f4"), channel_zero)
 
 
-def test_echo_is_suppressed_and_barge_in_requires_100_ms_near_end() -> None:
+def test_echo_is_suppressed_and_barge_in_requires_80_ms_near_end() -> None:
     rng = np.random.default_rng(9)
     played = rng.normal(0.0, 0.08, 16_000).astype(np.float32)
     echo_frame = played[4_000:4_320] * np.float32(0.2)
@@ -141,9 +143,9 @@ def test_echo_is_suppressed_and_barge_in_requires_100_ms_near_end() -> None:
         for index in range(6)
     ]
     assert human_decisions[1].near_end
-    assert not any(decision.barge_in for decision in human_decisions[:4])
-    assert human_decisions[4].barge_in
-    assert not human_decisions[5].barge_in
+    assert not any(decision.barge_in for decision in human_decisions[:3])
+    assert human_decisions[3].barge_in
+    assert not any(decision.barge_in for decision in human_decisions[4:])
     held = detector.process(
         np.zeros(320, dtype=np.float32),
         output_active=True,
@@ -222,6 +224,73 @@ def test_streaming_resampler_is_continuous_across_server_delta_boundaries() -> N
     )
 
     np.testing.assert_allclose(split, whole, atol=1e-6)
+
+
+def test_playback_logs_receive_to_first_push_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = [5.0]
+    media = FakeMedia()
+    engine = PlaybackEngine(
+        media,
+        lambda: 1,
+        EchoReference(),
+        input_sample_rate=16_000,
+        output_sample_rate=16_000,
+        clock=lambda: now[0],
+    )
+    caplog.set_level(logging.INFO, logger="yrobot.audio")
+    engine.start()
+
+    packet = PlaybackPacket(
+        1,
+        np.ones(320, dtype=np.float32),
+        "response-1",
+        received_at=4.975,
+    )
+    assert engine.enqueue(packet)
+    assert engine.enqueue(packet)
+    wait_for(lambda: len(media.pushed) == 2)
+    assert engine.stop(flush=False)
+
+    logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Reachy first audio push:")
+    ]
+    assert len(logs) == 1
+    assert "receive_to_push_ms=25.0" in logs[0]
+
+
+def test_preroll_is_applied_again_after_each_listen_boundary() -> None:
+    now = [1.0]
+    media = FakeMedia()
+    engine = PlaybackEngine(
+        media,
+        lambda: 1,
+        EchoReference(),
+        input_sample_rate=1_000,
+        output_sample_rate=1_000,
+        preroll_ms=100,
+        clock=lambda: now[0],
+    )
+    engine.start()
+
+    first = PlaybackPacket(1, np.ones(50, dtype=np.float32), "response-1")
+    assert engine.enqueue(first)
+    time.sleep(0.02)
+    assert media.pushed == []
+    now[0] = 1.1
+    wait_for(lambda: len(media.pushed) == 1)
+
+    engine.mark_response_boundary()
+    second = PlaybackPacket(1, np.ones(50, dtype=np.float32), "response-2")
+    assert engine.enqueue(second)
+    time.sleep(0.02)
+    assert len(media.pushed) == 1
+    now[0] = 1.201
+    wait_for(lambda: len(media.pushed) == 2)
+    assert engine.stop(flush=False)
 
 
 def test_playback_resampler_resets_at_response_and_listen_boundaries() -> None:
