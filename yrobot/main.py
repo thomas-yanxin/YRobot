@@ -121,7 +121,7 @@ class Pipeline:
 
     def _on_mic_chunk(self, chunk: np.ndarray, is_flush: bool) -> None:
         frame = self._maybe_frame()
-        force = self.turn.take_force_listen() or is_flush
+        force = self.turn.take_force_listen(time.monotonic()) or is_flush
         self.client.submit(chunk, frame, force)
 
     def _maybe_frame(self) -> Optional[bytes]:

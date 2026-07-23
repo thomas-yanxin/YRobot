@@ -122,6 +122,33 @@ class UplinkGain:
         return np.clip(chunk * self.gain, -1.0, 1.0) if self.gain > 1.001 else chunk
 
 
+class PrerollPolicy:
+    """Adaptive start-of-utterance playback delay absorbing TTS supply jitter.
+
+    An "utterance start" with a short dry gap means the reply was still in
+    flight when the player ran dry — an audible underrun — so the preroll
+    grows. Starts after a long silence are genuine new replies and decay the
+    preroll back toward its minimum.
+    """
+
+    UNDERRUN_GAP_S = 1.5
+
+    def __init__(self, cfg: Config):
+        self._min, self._max = cfg.preroll_min_s, cfg.preroll_max_s
+        # Start above the minimum: the first exchange should already be smooth;
+        # a clean link earns its way down.
+        self.value = min(max(0.4, self._min), self._max)
+
+    def on_utterance_start(self, dry_gap_s: float | None) -> float:
+        if dry_gap_s is not None and dry_gap_s < self.UNDERRUN_GAP_S:
+            self.value = min(self.value + 0.15, self._max)
+            logger.info("playback underrun (%.2fs dry) — preroll now %.2fs",
+                        dry_gap_s, self.value)
+        else:
+            self.value = max(self.value * 0.9, self._min)
+        return self.value
+
+
 class AudioIO:
     """Capture and playback threads around the ReachyMini media manager."""
 
@@ -171,7 +198,21 @@ class AudioIO:
         self._state.play_head = 0.0  # silence the speaking flag immediately
 
     def _playback_loop(self) -> None:
-        media = self._media
+        """Push model speech with a start-of-utterance preroll.
+
+        The server supplies TTS in ~1 s units whose pacing jitters around
+        real time; playing the first unit immediately means every late unit
+        underruns audibly. Delaying only the *start* of each utterance by an
+        adaptive preroll gives every following unit that much slack. Device
+        backlog is capped so a barge-in flush has little in-pipeline audio
+        to kill.
+        """
+        media, state = self._media, self._state
+        preroll = PrerollPolicy(self._cfg)
+        hold: list[np.ndarray] = []  # utterance head, held until its deadline
+        out: list[np.ndarray] = []  # ready to push, subject to the backlog cap
+        hold_deadline = 0.0
+
         while not self._stop.is_set():
             if self._clear.is_set():
                 try:
@@ -183,17 +224,36 @@ class AudioIO:
                         self._playq.get_nowait()
                     except queue.Empty:
                         break
+                hold.clear()
+                out.clear()
+                state.play_head = 0.0
                 self._clear.clear()
                 continue
+
             try:
-                pcm = self._playq.get(timeout=0.05)
+                pcm = self._playq.get(timeout=0.02)
             except queue.Empty:
-                continue
-            if self._clear.is_set():
-                continue
-            media.push_audio_sample(pcm)
+                pcm = None
             now = time.monotonic()
-            self._state.play_head = max(self._state.play_head, now) + len(pcm) / IN_SR
+
+            if pcm is not None:
+                if hold:
+                    hold.append(pcm)
+                elif out or now < state.play_head:  # utterance already flowing
+                    out.append(pcm)
+                else:  # device idle → new utterance
+                    dry = now - state.play_head if state.play_head else None
+                    hold.append(pcm)
+                    hold_deadline = now + preroll.on_utterance_start(dry)
+
+            if hold and now >= hold_deadline:
+                out.extend(hold)
+                hold.clear()
+
+            if out and state.play_head - now < self._cfg.max_backlog_s:
+                data = out.pop(0)
+                media.push_audio_sample(data)
+                state.play_head = max(state.play_head, time.monotonic()) + len(data) / IN_SR
 
     # -- uplink --------------------------------------------------------------
 

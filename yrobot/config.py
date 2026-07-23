@@ -67,6 +67,9 @@ class Config:
 
     # --- downlink ---
     model_out_sr: int = 24000
+    preroll_min_s: float = 0.25  # start-of-utterance delay absorbing TTS jitter
+    preroll_max_s: float = 0.8
+    max_backlog_s: float = 1.5  # device-side queue cap (keeps barge-in flush cheap)
 
     # --- session budget (kv cache overflows at 8192; vision burns ~64 tok/frame) ---
     kv_soft: int = 6500  # rotate at next quiet moment
@@ -89,7 +92,9 @@ class Config:
     agc_max_gain: float = 6.0
 
     # --- turn gate / barge-in ---
-    quiet_s: float = 0.7  # user silence required before a listen unlatches
+    quiet_s: float = 0.7  # user silence required before a listen counts as clean
+    unlatch_listens: int = 2  # clean consecutive listens required to unlatch
+    reforce_ack_s: float = 1.2  # listens this soon after our force are just acks
     hold_max_s: float = 12.0  # discard-latch safety cap
     reforce_s: float = 1.0  # min interval between re-forced listens
 
@@ -153,6 +158,9 @@ class Config:
             frame_active_s=_f("YROBOT_FRAME_ACTIVE_S", d.frame_active_s),
             frame_idle_s=_f("YROBOT_FRAME_IDLE_S", d.frame_idle_s),
             model_out_sr=_i("YROBOT_MODEL_OUT_SR", d.model_out_sr),
+            preroll_min_s=_f("YROBOT_PREROLL_MIN_S", d.preroll_min_s),
+            preroll_max_s=_f("YROBOT_PREROLL_MAX_S", d.preroll_max_s),
+            max_backlog_s=_f("YROBOT_MAX_BACKLOG_S", d.max_backlog_s),
             kv_soft=_i("YROBOT_KV_SOFT", d.kv_soft),
             kv_hard=_i("YROBOT_KV_HARD", d.kv_hard),
             session_max_s=_f("YROBOT_SESSION_MAX_S", d.session_max_s),
@@ -168,6 +176,8 @@ class Config:
             agc_target_rms=_f("YROBOT_AGC_TARGET_RMS", d.agc_target_rms),
             agc_max_gain=_f("YROBOT_AGC_MAX_GAIN", d.agc_max_gain),
             quiet_s=_f("YROBOT_QUIET_S", d.quiet_s),
+            unlatch_listens=_i("YROBOT_UNLATCH_LISTENS", d.unlatch_listens),
+            reforce_ack_s=_f("YROBOT_REFORCE_ACK_S", d.reforce_ack_s),
             hold_max_s=_f("YROBOT_HOLD_MAX_S", d.hold_max_s),
             reforce_s=_f("YROBOT_REFORCE_S", d.reforce_s),
             motion=_b("YROBOT_MOTION", d.motion),

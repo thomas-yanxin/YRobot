@@ -1,11 +1,22 @@
-"""VoiceGate timing, AGC behaviour, resampler ratio."""
+"""VoiceGate timing, AGC behaviour, resampler ratio, preroll adaptation."""
 
 import numpy as np
 
-from yrobot.audio import StreamResampler, UplinkGain, VoiceGate
+from yrobot.audio import PrerollPolicy, StreamResampler, UplinkGain, VoiceGate
 from yrobot.config import Config
 
 CFG = Config()
+
+
+def test_preroll_grows_on_underruns_and_decays_when_clean():
+    p = PrerollPolicy(CFG)  # min 0.25, max 0.8, starts at 0.4
+    assert p.on_utterance_start(None) < 0.4  # first-ever start decays
+    for _ in range(10):
+        p.on_utterance_start(0.3)  # supply resumed after a short dry gap
+    assert p.value == CFG.preroll_max_s
+    for _ in range(50):
+        p.on_utterance_start(10.0)  # clean starts after long silence
+    assert p.value == CFG.preroll_min_s
 
 
 def feed(gate, rms, ms, robot_speaking=False, step=20.0):

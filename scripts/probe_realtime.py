@@ -86,7 +86,8 @@ def main() -> None:
     def send(samples: np.ndarray, voice: bool) -> None:
         for i in range(0, len(samples), chunk):
             sink.turn.on_voice(voice, time.monotonic(), robot_speaking=sink.played_s > 0)
-            client.submit(samples[i:i + chunk], None, sink.turn.take_force_listen())
+            client.submit(samples[i:i + chunk], None,
+                          sink.turn.take_force_listen(time.monotonic()))
             time.sleep(cfg.chunk_ms / 1000)
 
     log.info("streaming %s (%.1fs)", args.wav, len(speech) / 16000)
