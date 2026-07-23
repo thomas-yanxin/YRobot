@@ -1,43 +1,36 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "yrobot"
 version = "1.0.0"
-description = "Full-duplex MiniCPM-o conversation for Reachy Mini Wireless"
+description = "Full-duplex voice+vision live chat for Reachy Mini on MiniCPM-o 4.5 realtime"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "numpy>=2.2.5,<2.3",
-    "pillow>=10,<13",
-    "python-dotenv>=1,<2",
-    "reachy-mini==1.9.0",
-    "scipy>=1.15,<2",
-    "webrtcvad-wheels>=2.0.14,<3",
+    "numpy>=1.26",
     "websockets>=12,<16",
+    "soxr>=0.4",
+    "reachy-mini>=1.9",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.9"]
-
-[project.entry-points."reachy_mini_apps"]
-yrobot = "yrobot.main:Yrobot"
+dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
-yrobot = "yrobot.main:cli"
+yrobot = "yrobot.main:main"
+
+[project.entry-points."reachy_mini_apps"]
+yrobot = "yrobot.main:YRobotApp"
 
 [tool.setuptools.packages.find]
 include = ["yrobot*"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"
-
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
-[tool.ruff.lint]
-select = ["B", "E", "F", "I", "UP"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

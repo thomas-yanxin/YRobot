@@ -1,235 +1,189 @@
-"""Reachy Mini application entry point and standalone Wireless CM4 runner."""
+"""YRobot app — wiring between mic, camera, realtime session, speaker and motion.
+
+Data paths (each arrow is one queue or callback, no polling in the hot path):
+    mic ──(500 ms chunks + voice gate)──► OmniClient ──► gateway
+    camera ──(JPEG, adaptive cadence)──┘
+    gateway ──deltas──► TurnGate ──play──► speaker (flushable) ──► daemon wobble
+Barge-in: voice onset while the robot speaks → flush player + ship the partial
+chunk with force_listen; TurnGate discards the stale turn until the model
+listens again (see yrobot.turn).
+"""
 
 from __future__ import annotations
 
-import argparse
-import asyncio
 import logging
-import os
+import signal
 import threading
-from collections.abc import Mapping
-from dataclasses import replace
-from typing import Any
+import time
+from typing import Optional
 
 import numpy as np
-from reachy_mini import ReachyMini, ReachyMiniApp
 
-from .audio import AudioEngine, PlayerClearError
-from .config import Config, normalize_realtime_url
-from .motion import MotionController, MotionState
-from .realtime import RealtimeClient
+from yrobot.audio import AudioIO, StreamResampler
+from yrobot.config import Config
+from yrobot.motion import Puppeteer
+from yrobot.omni import OmniClient
+from yrobot.state import Shared
+from yrobot.turn import TurnGate
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger("yrobot")
 
+try:
+    from reachy_mini.apps.app import ReachyMiniApp
+except ImportError:  # allow importing (e.g. tests) without the SDK
+    class ReachyMiniApp:  # type: ignore[no-redef]
+        def __init__(self, *a, **k):
+            self.stop_event = threading.Event()
 
-def configure_logging() -> None:
-    """Configure compact logs once for dashboard and CLI execution."""
-
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-
-class _ConversationPort:
-    """Keep transcript logging separate from real-time media ownership."""
-
-    def __init__(self, audio: AudioEngine) -> None:
-        self.audio = audio
-        self._text_chunks: list[str] = []
-
-    def next_audio_unit(self, timeout: float) -> tuple[np.ndarray, bool] | None:
-        return self.audio.next_audio_unit(timeout)
-
-    def latest_frame_jpeg(self) -> bytes | None:
-        return self.audio.latest_frame_jpeg()
-
-    def handle_audio_delta(
-        self,
-        samples: np.ndarray,
-        response_id: str,
-        metrics: Mapping[str, Any],
-    ) -> None:
-        self.audio.handle_audio_delta(samples, response_id, metrics)
-
-    def handle_listen(
-        self,
-        response_id: str,
-        metrics: Mapping[str, Any],
-    ) -> None:
-        self.audio.handle_listen(response_id, metrics)
-        if self._text_chunks:
-            log.info("MiniCPM-o: %s", "".join(self._text_chunks).strip())
-            self._text_chunks.clear()
-
-    def handle_text(self, text: str, response_id: str) -> None:
-        del response_id
-        self._text_chunks.append(text)
-
-    def handle_session_ready(self) -> None:
-        self.audio.handle_session_ready()
-
-    def invalidate_session(self, reason: str) -> None:
-        self._text_chunks.clear()
-        self.audio.invalidate_session(reason)
-
-    def ready_for_rollover(self) -> bool:
-        return self.audio.ready_for_rollover()
-
-
-class YRobotRuntime:
-    """Own one conversation and shut every subsystem down in dependency order."""
-
-    def __init__(
-        self,
-        mini: object,
-        config: Config,
-        stop_event: threading.Event,
-        *,
-        neutral_transitions: bool = False,
-    ) -> None:
-        self.stop_event = stop_event
-        self.motion = MotionController(mini, neutral_transitions=neutral_transitions)
-        self.audio = AudioEngine(
-            mini,
-            capture_video=config.send_video,
-            state_callback=self._handle_media_state,
-            error_callback=self._handle_media_error,
-        )
-        self.port = _ConversationPort(self.audio)
-        self.client = RealtimeClient(config)
-
-    def run(self) -> None:
-        """Run until the dashboard, Ctrl-C, or a fail-safe requests stop."""
-
-        if self.stop_event.is_set():
-            return
-
-        audio_started = False
-        try:
-            # Starting media first activates the XVF far-end reference. The
-            # AudioEngine then applies verified AEC tuning before DoA USB reads
-            # begin in the motion subsystem.
-            self.audio.start(session_ready=False)
-            audio_started = True
-            self.motion.start()
-            asyncio.run(self.client.run(self.port, self.stop_event))
-        finally:
-            # RealtimeClient invalidates its session before returning. Stop the
-            # speaker/capture path next, then the only motor owner and wobbling.
-            if audio_started:
-                self.audio.stop()
-            self.motion.stop()
-            log.info("YRobot media metrics: %s", self.audio.metrics)
-
-    def _handle_media_state(self, state: str) -> None:
-        try:
-            self.motion.set_state(MotionState(state))
-        except ValueError:
-            log.warning("Ignoring unknown media state: %s", state)
-
-    def _handle_media_error(self, error: BaseException) -> None:
-        if isinstance(error, PlayerClearError):
-            # Continuing would violate the guarantee that interrupted speech
-            # can never resume from a device-side queue.
-            log.critical("Cannot guarantee speaker silence; stopping YRobot: %s", error)
+        def stop(self):
             self.stop_event.set()
 
 
-def run_conversation(
-    mini: object,
-    config: Config,
-    stop_event: threading.Event,
-    *,
-    neutral_transitions: bool = False,
-) -> None:
-    """Run a complete YRobot lifecycle on an already connected robot."""
+class YRobotApp(ReachyMiniApp):
+    """Reachy Mini app entry point (`reachy_mini_apps` group)."""
 
-    YRobotRuntime(
-        mini,
-        config,
-        stop_event,
-        neutral_transitions=neutral_transitions,
-    ).run()
+    def run(self, reachy_mini, stop_event: threading.Event) -> None:
+        cfg = Config.from_env()
+        logging.basicConfig(
+            level=cfg.log_level,
+            format="%(asctime)s %(levelname).1s %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        Pipeline(cfg, reachy_mini).run_until(stop_event)
 
 
-class Yrobot(ReachyMiniApp):
-    """Full-duplex MiniCPM-o 4.5 conversation for Reachy Mini Wireless."""
+class Pipeline:
+    def __init__(self, cfg: Config, mini):
+        self.cfg = cfg
+        self.mini = mini
+        self.state = Shared()
+        self.turn = TurnGate(cfg)
+        self.resampler = StreamResampler(cfg.model_out_sr, 16000)
+        self.audio = AudioIO(cfg, mini.media, self.state,
+                             on_chunk=self._on_mic_chunk,
+                             on_voice_edge=self._on_voice_edge)
+        self.client = OmniClient(cfg, sink=self)
+        self.motion: Optional[Puppeteer] = Puppeteer(mini, cfg, self.state) if cfg.motion else None
+        self._last_frame_t = 0.0
+        self._text: list[str] = []
+        self._await_reply_since = 0.0  # end-of-user-speech timestamp for latency logs
 
-    dont_start_webserver = True
-    request_media_backend = "local"
+    # -- lifecycle -------------------------------------------------------------
 
-    def __init__(self, running_on_wireless: bool = False) -> None:
-        super().__init__(running_on_wireless)
-        self.config = Config.load()
+    def run_until(self, stop_event: threading.Event) -> None:
+        mini, media = self.mini, self.mini.media
+        media.start_recording()
+        media.start_playing()
+        try:
+            mini.enable_wobbling()
+        except Exception:
+            logger.warning("head wobbling unavailable", exc_info=True)
+        try:
+            mini.wake_up()
+        except Exception:
+            logger.warning("wake_up failed", exc_info=True)
 
-    def run(self, reachy_mini: ReachyMini, stop_event: threading.Event) -> None:
-        configure_logging()
-        run_conversation(reachy_mini, self.config, stop_event)
+        self.audio.start()
+        self.client.start()
+        if self.motion:
+            self.motion.start()
+        logger.info("YRobot up — talk to me (chunk=%dms mode=%s video=%s)",
+                    self.cfg.chunk_ms, self.cfg.effective_mode, self.cfg.send_video)
+        try:
+            stop_event.wait()
+        finally:
+            logger.info("shutting down")
+            self.client.stop()
+            if self.motion:
+                self.motion.stop()
+            self.audio.stop()
+            for fn in (mini.disable_wobbling, mini.stop_head_tracking, mini.goto_sleep):
+                try:
+                    fn()
+                except Exception:
+                    pass
+            media.stop_playing()
+            media.stop_recording()
+
+    # -- uplink ------------------------------------------------------------------
+
+    def _on_voice_edge(self, active: bool) -> bool:
+        """Mic thread; returns True to flush the partial chunk immediately."""
+        now = time.monotonic()
+        interrupt = self.turn.on_voice(active, now, self.state.robot_speaking())
+        if interrupt:
+            logger.info("barge-in: flushing playback, forcing listen")
+            self.audio.clear_playback()
+            self.resampler.reset()
+        if not active:
+            self._await_reply_since = now
+        return interrupt
+
+    def _on_mic_chunk(self, chunk: np.ndarray, is_flush: bool) -> None:
+        frame = self._maybe_frame()
+        force = self.turn.take_force_listen() or is_flush
+        self.client.submit(chunk, frame, force)
+
+    def _maybe_frame(self) -> Optional[bytes]:
+        if not self.cfg.send_video:
+            return None
+        now = time.monotonic()
+        active = (self.state.voice_active or self.state.robot_speaking()
+                  or now - self.state.last_voice_end < 3.0)
+        interval = self.cfg.frame_active_s if active else self.cfg.frame_idle_s
+        if now - self._last_frame_t < interval:
+            return None
+        try:
+            jpeg = self.mini.media.get_frame_jpeg()
+        except Exception:
+            return None
+        if jpeg:
+            self._last_frame_t = now
+        return jpeg
+
+    # -- downlink (OmniClient sink) ------------------------------------------------
+
+    def on_ready(self, ready: bool) -> None:
+        self.state.ready = ready
+        if not ready:
+            # Let any queued reply audio finish naturally — reconnecting takes
+            # ~15 s anyway. Only a user barge-in flushes the player.
+            self.turn.reset()
+            self.resampler.reset()
+
+    def on_listen(self) -> None:
+        self.turn.on_listen(time.monotonic())
+        if self._text:
+            logger.info("🤖 %s", "".join(self._text))
+            self._text.clear()
+
+    def on_model_audio(self, pcm24k: np.ndarray) -> None:
+        now = time.monotonic()
+        if not self.turn.on_model_audio(now):
+            return
+        if self._await_reply_since:
+            logger.info("first reply audio +%.2fs after user stopped",
+                        now - self._await_reply_since)
+            self._await_reply_since = 0.0
+        self.audio.play(self.resampler.process(pcm24k))
+
+    def on_text(self, text: str) -> None:
+        if not self.turn.latched():
+            self._text.append(text)
+
+    def quiet(self) -> bool:
+        s = self.state
+        return (not s.voice_active and not s.robot_speaking()
+                and time.monotonic() - s.last_voice_end > 2.0)
 
 
-def _force_listen_count(value: str) -> int:
-    parsed = int(value)
-    if not 0 <= parsed <= 10:
-        raise argparse.ArgumentTypeError("must be between 0 and 10")
-    return parsed
-
-
-def cli(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=Yrobot.__doc__)
-    parser.add_argument("--url", help="MiniCPM-o Realtime Gateway URL")
-    parser.add_argument("--no-video", action="store_true", help="send microphone audio only")
-    parser.add_argument(
-        "--tls-no-verify",
-        action="store_true",
-        help="disable certificate verification for a wss:// development proxy",
-    )
-    parser.add_argument(
-        "--force-listen-count",
-        type=_force_listen_count,
-        help="startup listen units (recommended: 1)",
-    )
-    args = parser.parse_args(argv)
-
-    configure_logging()
-    config = Config.load()
-    if args.url:
-        config = replace(config, realtime_url=normalize_realtime_url(args.url))
-    if args.no_video:
-        config = replace(config, send_video=False)
-    if args.tls_no_verify:
-        config = replace(config, tls_verify=False)
-    if args.force_listen_count is not None:
-        config = replace(config, force_listen_count=args.force_listen_count)
-
-    stop_event = threading.Event()
-    try:
-        with ReachyMini(
-            connection_mode="localhost_only",
-            automatic_body_yaw=True,
-            media_backend="local",
-        ) as mini:
-            run_conversation(
-                mini,
-                config,
-                stop_event,
-                neutral_transitions=True,
-            )
-    except KeyboardInterrupt:
-        log.info("Stopping YRobot")
-        stop_event.set()
-
-
-def app_main() -> None:
-    """Entrypoint used by the Reachy dashboard app manager."""
-
-    app = Yrobot()
-    try:
-        app.wrapped_run()
-    except KeyboardInterrupt:
-        app.stop()
+def main() -> None:
+    """Standalone entry point: run on the robot without the app manager."""
+    app = YRobotApp()
+    signal.signal(signal.SIGINT, lambda *_: app.stop())
+    signal.signal(signal.SIGTERM, lambda *_: app.stop())
+    app.wrapped_run()
 
 
 if __name__ == "__main__":
-    app_main()
+    main()
