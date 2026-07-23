@@ -77,9 +77,9 @@ class RealtimeMetrics:
     audio_deltas: int
     text_deltas: int
     listen_deltas: int
-    capture_to_send: TimingSummary
+    unit_ready_to_send: TimingSummary
     send_interval: TimingSummary
-    input_to_first_audio: TimingSummary
+    latest_input_to_first_audio: TimingSummary
 
 
 class _Counters:
@@ -93,9 +93,9 @@ class _Counters:
         self.text_deltas = 0
         self.listen_deltas = 0
         self.timings: dict[str, deque[float]] = {
-            "capture_to_send": deque(maxlen=256),
+            "unit_ready_to_send": deque(maxlen=256),
             "send_interval": deque(maxlen=256),
-            "input_to_first_audio": deque(maxlen=256),
+            "latest_input_to_first_audio": deque(maxlen=256),
         }
 
     def add(self, name: str, amount: int = 1) -> None:
@@ -118,9 +118,11 @@ class _Counters:
                 audio_deltas=self.audio_deltas,
                 text_deltas=self.text_deltas,
                 listen_deltas=self.listen_deltas,
-                capture_to_send=_timing_summary(self.timings["capture_to_send"]),
+                unit_ready_to_send=_timing_summary(self.timings["unit_ready_to_send"]),
                 send_interval=_timing_summary(self.timings["send_interval"]),
-                input_to_first_audio=_timing_summary(self.timings["input_to_first_audio"]),
+                latest_input_to_first_audio=_timing_summary(
+                    self.timings["latest_input_to_first_audio"]
+                ),
             )
 
 
@@ -211,9 +213,13 @@ class RealtimeClient:
         self._sequence_lock = threading.Lock()
         self._metrics = _Counters()
         self._last_wire_send_at: float | None = None
+        self._last_sent_capture_at: float | None = None
         self._last_input_send_at: float | None = None
-        self._last_audio_response_id: str | None = None
-        self._seen_audio_since_listen = False
+        self._minimum_uplink_interval = settings.input_unit_ms / 1_000 * 0.8
+        self._session_input_cutoff: float | None = None
+        self._response_segment = 0
+        self._logged_first_packets: set[tuple[str, str]] = set()
+        self._server_client_offset_floor: float | None = None
         self._input_send_timeout = 2.0
 
     @property
@@ -337,10 +343,18 @@ class RealtimeClient:
                     session_deadline,
                 )
 
+                # Audio captured while waiting for a GPU/session is no longer
+                # live context. Drop it at the activation boundary instead of
+                # replaying it as the first unit of the new session.
+                activation = time.monotonic()
+                self._session_input_cutoff = activation
+                self._discard_input_captured_through(activation)
                 self._last_wire_send_at = None
+                self._last_sent_capture_at = None
                 self._last_input_send_at = None
-                self._last_audio_response_id = None
-                self._seen_audio_since_listen = False
+                self._response_segment = 0
+                self._logged_first_packets.clear()
+                self._server_client_offset_floor = None
                 epoch = self.coordinator.new_session()
                 self.on_session(True, epoch)
                 activated = True
@@ -594,20 +608,39 @@ class RealtimeClient:
         self._bind_input_loop()
         if session_stop is None:
             session_stop = asyncio.Event()
-        next_send_at = 0.0
-        send_period = self.settings.input_unit_ms / 1_000
         while not stop_event.is_set() and not session_stop.is_set():
-            await self._wait_until(stop_event, next_send_at, session_stop)
-            if stop_event.is_set() or session_stop.is_set():
-                return
             unit = await self._next_input(stop_event, session_stop)
             if unit is None:
                 continue
+            snapshot = self.coordinator.snapshot()
             age = time.monotonic() - unit.captured_at
             if age > 1.5:
                 self._metrics.add("dropped_input_units")
                 continue
-            snapshot = self.coordinator.snapshot()
+            if (
+                self._session_input_cutoff is not None
+                and unit.captured_at <= self._session_input_cutoff
+            ):
+                self._metrics.add("dropped_input_units")
+                continue
+            self._session_input_cutoff = None
+            urgent_force = snapshot.force_listen and not snapshot.force_listen_sent
+            # A recovering appsink/socket may release complete one-second units
+            # in a burst. Drop catch-up audio instead of accelerating the model
+            # timeline, except for the first packet that must carry barge-in.
+            if not urgent_force and (
+                (
+                    self._last_wire_send_at is not None
+                    and unit.captured_at - self._last_wire_send_at < self._minimum_uplink_interval
+                )
+                or (
+                    self._last_sent_capture_at is not None
+                    and unit.captured_at - self._last_sent_capture_at
+                    < self._minimum_uplink_interval
+                )
+            ):
+                self._metrics.add("dropped_input_units")
+                continue
             frame = self.latest_frame()
             if stop_event.is_set() or session_stop.is_set():
                 return
@@ -617,7 +650,6 @@ class RealtimeClient:
                 force_listen=snapshot.force_listen,
                 max_slice_nums=1,
             )
-            send_started_at = asyncio.get_running_loop().time()
             after_send = (
                 partial(self.coordinator.force_listen_sent, snapshot.epoch)
                 if snapshot.force_listen
@@ -631,7 +663,7 @@ class RealtimeClient:
             )
             sent_at = time.monotonic()
             self._metrics.observe(
-                "capture_to_send",
+                "unit_ready_to_send",
                 (sent_at - unit.captured_at) * 1_000,
             )
             if self._last_wire_send_at is not None:
@@ -640,12 +672,9 @@ class RealtimeClient:
                     (sent_at - self._last_wire_send_at) * 1_000,
                 )
             self._last_wire_send_at = sent_at
+            self._last_sent_capture_at = unit.captured_at
             self._last_input_send_at = sent_at
             self._metrics.add("input_units")
-            completed_at = asyncio.get_running_loop().time()
-            next_send_at = send_started_at + send_period
-            if next_send_at <= completed_at:
-                next_send_at = completed_at + send_period
 
     async def _send_input(
         self,
@@ -732,6 +761,9 @@ class RealtimeClient:
     ) -> None:
         while True:
             raw = await websocket.recv()
+            received_monotonic = time.monotonic()
+            received_wall = time.time()
+            last_input_send_at = self._last_input_send_at
             event = await lifecycle.receive(raw)
             if isinstance(event, SessionClosed):
                 closed.set()
@@ -743,12 +775,15 @@ class RealtimeClient:
             if lifecycle.state.phase is Phase.CLOSE:
                 continue
 
+            downlink_excess_ms = self._server_to_client_excess_ms(
+                event.server_send_ts,
+                received_wall,
+            )
             if event.kind == "listen":
                 epoch = self.coordinator.model_listening()
                 if epoch is None:
                     continue
-                self._last_audio_response_id = None
-                self._seen_audio_since_listen = False
+                self._response_segment += 1
                 self._metrics.add("listen_deltas")
                 self.on_listen(epoch)
                 continue
@@ -756,6 +791,13 @@ class RealtimeClient:
                 self._metrics.add("text_deltas")
                 snapshot = self.coordinator.snapshot()
                 if not snapshot.drop_output and event.text is not None:
+                    self._log_first_response_packet(
+                        event,
+                        received_monotonic=received_monotonic,
+                        received_wall=received_wall,
+                        last_input_send_at=last_input_send_at,
+                        server_to_client_excess_ms=downlink_excess_ms,
+                    )
                     self.on_text(event.text, snapshot.epoch, event.response_id)
                 continue
 
@@ -763,23 +805,103 @@ class RealtimeClient:
             epoch = self.coordinator.accept_audio(event.response_id)
             if epoch is None:
                 continue
+            self._log_first_response_packet(
+                event,
+                received_monotonic=received_monotonic,
+                received_wall=received_wall,
+                last_input_send_at=last_input_send_at,
+                server_to_client_excess_ms=downlink_excess_ms,
+            )
             samples = np.frombuffer(event.audio.pcm_f32le, dtype="<f4").copy()
             if not np.all(np.isfinite(samples)):
                 raise RealtimeError("MiniCPM-o output contains non-finite samples")
-            is_first = (
-                event.response_id != self._last_audio_response_id
-                if event.response_id is not None
-                else not self._seen_audio_since_listen
-            )
-            if is_first and self._last_input_send_at is not None:
-                self._metrics.observe(
-                    "input_to_first_audio",
-                    (time.monotonic() - self._last_input_send_at) * 1_000,
-                )
-            self._last_audio_response_id = event.response_id
-            self._seen_audio_since_listen = True
             self._metrics.add("audio_deltas")
             self.on_audio(samples, epoch, event.response_id)
+
+    def _log_first_response_packet(
+        self,
+        event: ResponseDelta,
+        *,
+        received_monotonic: float,
+        received_wall: float,
+        last_input_send_at: float | None,
+        server_to_client_excess_ms: float | None,
+    ) -> None:
+        response_key = (
+            f"id:{event.response_id}"
+            if event.response_id is not None
+            else f"anonymous-segment:{self._response_segment}"
+        )
+        marker = (response_key, event.kind)
+        if marker in self._logged_first_packets:
+            return
+        self._logged_first_packets.add(marker)
+
+        fields = [
+            f"response_id={event.response_id or '-'}",
+            f"client_receive_ts={received_wall:.6f}",
+        ]
+        if last_input_send_at is not None:
+            latest_input_age_ms = (received_monotonic - last_input_send_at) * 1_000
+            fields.append(f"latest_input_send_age_ms={latest_input_age_ms:.1f}")
+            if event.kind == "audio":
+                self._metrics.observe(
+                    "latest_input_to_first_audio",
+                    latest_input_age_ms,
+                )
+        if event.server_send_ts is not None:
+            fields.append(f"server_send_ts={event.server_send_ts:.6f}")
+        if server_to_client_excess_ms is not None:
+            fields.append(f"server_to_client_excess_ms={server_to_client_excess_ms:.1f}")
+        for name in (
+            "prefill_ms",
+            "generate_ms",
+            "wall_clock_ms",
+            "cost_llm_ms",
+            "cost_tts_prep_ms",
+            "cost_tts_ms",
+            "cost_token2wav_ms",
+            "vision_slices",
+            "vision_tokens",
+            "kv_cache_length",
+        ):
+            value = _finite_metric(event.metrics.get(name))
+            if value is not None:
+                fields.append(f"server_{name}={value:g}")
+        log.info(
+            "MiniCPM-o first %s packet: %s",
+            event.kind,
+            " ".join(fields),
+        )
+
+    def _server_to_client_excess_ms(
+        self,
+        server_send_ts: float | None,
+        client_receive_ts: float,
+    ) -> float | None:
+        if server_send_ts is None:
+            return None
+        current_offset = client_receive_ts - server_send_ts
+        if (
+            self._server_client_offset_floor is None
+            or current_offset < self._server_client_offset_floor
+        ):
+            self._server_client_offset_floor = current_offset
+        # Relative excess over the best observed path. It is not one-way
+        # latency because client and server wall clocks need not be synchronized.
+        return max(0.0, (current_offset - self._server_client_offset_floor) * 1_000)
+
+    def _discard_input_captured_through(self, cutoff: float) -> None:
+        dropped = False
+        with self._input_lock:
+            unit = self._latest_input
+            if unit is not None and unit.captured_at <= cutoff:
+                self._latest_input = None
+                dropped = True
+                if self._input_event is not None:
+                    self._input_event.clear()
+        if dropped:
+            self._metrics.add("dropped_input_units")
 
     async def _stop_waiter(self, stop_event: threading.Event) -> None:
         while not stop_event.is_set():
@@ -793,20 +915,6 @@ class RealtimeClient:
         deadline = asyncio.get_running_loop().time() + seconds
         while not stop_event.is_set() and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.05)
-
-    async def _wait_until(
-        self,
-        stop_event: threading.Event,
-        deadline: float,
-        session_stop: asyncio.Event | None = None,
-    ) -> None:
-        loop = asyncio.get_running_loop()
-        while (
-            not stop_event.is_set()
-            and (session_stop is None or not session_stop.is_set())
-            and loop.time() < deadline
-        ):
-            await asyncio.sleep(min(0.05, deadline - loop.time()))
 
     def _bind_input_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -837,3 +945,10 @@ class RealtimeClient:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
         return context
+
+
+def _finite_metric(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if np.isfinite(number) else None

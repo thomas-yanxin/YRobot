@@ -8,7 +8,8 @@ import numpy as np
 
 from yrobot.config import Settings
 from yrobot.main import Yrobot, cli
-from yrobot.runtime import YRobotRuntime
+from yrobot.perception import LatestFrame
+from yrobot.runtime import YRobotRuntime, _VisionUplink
 
 
 class FakeAudioBackend:
@@ -57,6 +58,7 @@ class FakeMini:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.media = FakeMedia(events)
+        self.client = type("Client", (), {"host": "127.0.0.1", "port": 8000})()
 
     def enable_motors(self) -> None:
         self.events.append("motors.enable")
@@ -93,7 +95,20 @@ def test_runtime_owns_media_once_and_stops_in_dependency_order(
 
         def submit_audio(self, *_args: Any, **_kwargs: Any) -> None: ...
 
+    class DoA:
+        def __init__(self, source: str, *_args: Any, **_kwargs: Any) -> None:
+            assert source == "http://127.0.0.1:8000/api/state/doa"
+
+        def start(self) -> None:
+            events.append("doa.start")
+
+        def stop(self, timeout: float = 2.0) -> bool:
+            del timeout
+            events.append("doa.stop")
+            return True
+
     monkeypatch.setattr("yrobot.runtime.RealtimeClient", Client)
+    monkeypatch.setattr("yrobot.runtime.DoAWorker", DoA)
     runtime = YRobotRuntime(
         FakeMini(events),
         Settings(realtime_url="ws://brain.local/v1/realtime?mode=video"),
@@ -116,6 +131,54 @@ def test_reachy_app_requests_the_wireless_local_media_backend() -> None:
     assert Yrobot.request_media_backend == "local"
     assert Yrobot.dont_start_webserver is True
     assert Yrobot.custom_app_url is None
+
+
+def test_vision_uplink_sends_only_new_frames_at_model_cadence() -> None:
+    now = [1.0]
+    latest = LatestFrame()
+    uplink = _VisionUplink(latest, 2.0, clock=lambda: now[0])
+
+    latest.publish(b"first", captured_at=now[0])
+    assert uplink.next_jpeg() == b"first"
+    assert uplink.next_jpeg() is None
+
+    now[0] = 2.0
+    latest.publish(b"second", captured_at=now[0])
+    assert uplink.next_jpeg() is None
+
+    now[0] = 2.999
+    assert uplink.next_jpeg() == b"second"
+    assert uplink.next_jpeg() is None
+
+    uplink.reset()
+    assert uplink.next_jpeg() == b"second"
+
+
+def test_runtime_pre_stopped_run_closes_doa_without_starting_hardware(
+    monkeypatch: Any,
+) -> None:
+    events: list[str] = []
+
+    class DoA:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None: ...
+
+        def stop(self, timeout: float = 2.0) -> bool:
+            del timeout
+            events.append("doa.stop")
+            return True
+
+    monkeypatch.setattr("yrobot.runtime.DoAWorker", DoA)
+    stop = threading.Event()
+    stop.set()
+    runtime = YRobotRuntime(
+        FakeMini(events),
+        Settings(realtime_url="ws://brain.local/v1/realtime?mode=video"),
+        stop,
+    )
+
+    runtime.run()
+
+    assert events == ["doa.stop"]
 
 
 def test_cli_connects_locally_with_automatic_body_yaw(monkeypatch: Any) -> None:

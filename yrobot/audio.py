@@ -40,6 +40,7 @@ class PlaybackPacket:
     samples: FloatAudio
     response_id: str | None = None
     stream_generation: int = 0
+    received_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,7 +346,7 @@ class NearEndDetector:
         vad_mode: int = 2,
         min_rms: float = 0.006,
         noise_ratio: float = 2.2,
-        barge_attack_ms: int = 100,
+        barge_attack_ms: int = 80,
         barge_debounce_ms: int = 350,
         near_end_hold_ms: int = 300,
         echo_correlation: float = 0.72,
@@ -455,8 +456,8 @@ class PlaybackEngine:
         *,
         input_sample_rate: int = 24_000,
         output_sample_rate: int = 16_000,
-        max_queue: int = 3,
-        preroll_ms: int = 60,
+        max_queue: int = 2,
+        preroll_ms: int = 0,
         clock: Callable[[], float] = time.monotonic,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -474,6 +475,7 @@ class PlaybackEngine:
             output_sample_rate,
         )
         self._resampler_key: tuple[int, int, str | None] | None = None
+        self._logged_first_pushes: set[tuple[int, int, str | None]] = set()
         self._stream_generation = 0
         self._max_queue = max_queue
         self._preroll_samples = input_sample_rate * preroll_ms // 1_000
@@ -485,8 +487,8 @@ class PlaybackEngine:
         self._output_lock = threading.Lock()
         self._activity_lock = threading.Lock()
         self._queue: deque[PlaybackPacket] = deque()
-        self._first_seen: dict[int, float] = {}
-        self._primed_epochs: set[int] = set()
+        self._first_seen: dict[tuple[int, int], float] = {}
+        self._primed_streams: set[tuple[int, int]] = set()
         self._fence_epoch = 0
         self._stopping = False
         self._started = False
@@ -527,6 +529,7 @@ class PlaybackEngine:
                 samples=normalized_samples,
                 response_id=packet.response_id,
                 stream_generation=self._stream_generation,
+                received_at=packet.received_at,
             )
             if self._stopping or not self._is_current(normalized):
                 self._stale += 1
@@ -535,7 +538,9 @@ class PlaybackEngine:
                 self._queue.popleft()
                 self._dropped += 1
             self._queue.append(normalized)
-            self._first_seen.setdefault(packet.epoch, self._clock())
+            stream_key = (normalized.epoch, normalized.stream_generation)
+            if self._preroll_samples:
+                self._first_seen.setdefault(stream_key, self._clock())
             self._enqueued += 1
             self._condition.notify()
         return True
@@ -554,7 +559,8 @@ class PlaybackEngine:
             self._dropped += len(self._queue)
             self._queue.clear()
             self._first_seen.clear()
-            self._primed_epochs.clear()
+            self._primed_streams.clear()
+            self._logged_first_pushes.clear()
             self._condition.notify_all()
         with self._output_lock:
             with self._activity_lock:
@@ -680,6 +686,22 @@ class PlaybackEngine:
                     self._echo_guard_until = self._playing_until + self._echo_tail_seconds
                 with self._condition:
                     self._pushed += 1
+                    push_key = (
+                        packet.epoch,
+                        packet.stream_generation,
+                        packet.response_id,
+                    )
+                    log_first_push = push_key not in self._logged_first_pushes
+                    if log_first_push:
+                        self._logged_first_pushes.add(push_key)
+                if log_first_push and packet.received_at is not None:
+                    self._logger.info(
+                        "Reachy first audio push: response_id=%s "
+                        "receive_to_push_ms=%.1f chunk_ms=%.1f",
+                        packet.response_id or "-",
+                        max(0.0, (self._clock() - packet.received_at) * 1_000),
+                        output.size / self._output_rate * 1_000,
+                    )
 
     def _take_packet(self) -> PlaybackPacket | None:
         with self._condition:
@@ -693,18 +715,22 @@ class PlaybackEngine:
                     self._condition.wait()
                     continue
                 packet = self._queue[0]
-                if self._preroll_samples and packet.epoch not in self._primed_epochs:
+                stream_key = (packet.epoch, packet.stream_generation)
+                if self._preroll_samples and stream_key not in self._primed_streams:
                     available = sum(
                         queued.samples.size
                         for queued in self._queue
-                        if queued.epoch == packet.epoch
+                        if (
+                            queued.epoch == packet.epoch
+                            and queued.stream_generation == packet.stream_generation
+                        )
                     )
-                    elapsed = self._clock() - self._first_seen[packet.epoch]
+                    elapsed = self._clock() - self._first_seen[stream_key]
                     remaining = self._preroll_seconds - elapsed
                     if available < self._preroll_samples and remaining > 0:
                         self._condition.wait(min(remaining, 0.01))
                         continue
-                    self._primed_epochs.add(packet.epoch)
+                    self._primed_streams.add(stream_key)
                 return self._queue.popleft()
 
     def _is_current(self, packet: PlaybackPacket) -> bool:

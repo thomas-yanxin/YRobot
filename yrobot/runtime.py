@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -26,6 +27,45 @@ from .realtime import RealtimeClient
 from .state import InteractionPhase, TurnCoordinator
 
 log = logging.getLogger(__name__)
+
+
+class _VisionUplink:
+    """Return only fresh camera frames at the configured model cadence."""
+
+    def __init__(
+        self,
+        latest: LatestFrame,
+        interval_seconds: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._latest = latest
+        self._interval = interval_seconds
+        self._tolerance = min(0.05, interval_seconds * 0.05)
+        self._clock = clock
+        self._last_sequence = -1
+        self._next_at = -float("inf")
+
+    def reset(self) -> None:
+        self._last_sequence = -1
+        self._next_at = -float("inf")
+
+    def next_jpeg(self) -> bytes | None:
+        now = self._clock()
+        snapshot = self._latest.snapshot(max_age_seconds=2.0, now=now)
+        if (
+            snapshot is None
+            or snapshot.sequence == self._last_sequence
+            or now + self._tolerance < self._next_at
+        ):
+            return None
+        self._last_sequence = snapshot.sequence
+        if self._next_at == -float("inf"):
+            self._next_at = now + self._interval
+        else:
+            while self._next_at <= now + self._tolerance:
+                self._next_at += self._interval
+        return snapshot.jpeg
 
 
 class _NearEndState:
@@ -84,6 +124,10 @@ class YRobotRuntime:
         self.stop_event = stop_event
         self.coordinator = TurnCoordinator()
         self.latest_frame = LatestFrame()
+        self.vision_uplink = _VisionUplink(
+            self.latest_frame,
+            settings.vision_send_interval_seconds,
+        )
         self.doa_tracker = DoATracker(hold_seconds=settings.doa_hold_seconds)
         self.near_end = _NearEndState()
         self.transcript = _Transcript()
@@ -126,7 +170,7 @@ class YRobotRuntime:
             fps=settings.camera_fps,
         )
         self.doa = DoAWorker(
-            media,
+            self._daemon_doa_url(),
             self.doa_tracker,
             self.near_end.current,
             head_pose=mini.get_current_head_pose,
@@ -136,7 +180,7 @@ class YRobotRuntime:
         self.client = RealtimeClient(
             settings,
             self.coordinator,
-            latest_frame=self._latest_jpeg,
+            latest_frame=self.vision_uplink.next_jpeg,
             on_audio=self._on_audio,
             on_listen=self._on_listen,
             on_text=self._on_text,
@@ -158,6 +202,7 @@ class YRobotRuntime:
 
     def run(self) -> None:
         if self.stop_event.is_set():
+            self.doa.stop()
             return
 
         media = self.mini.media
@@ -187,10 +232,13 @@ class YRobotRuntime:
             self.capture.start()
 
             log.info(
-                "YRobot ready: %s, input=%d ms, camera=%.1f fps, motion=%.0f Hz",
+                "YRobot ready: %s, input=%d ms, camera=%.1f fps, vision=%.2f fps, "
+                "DoA=adaptive up to %.0f Hz, motion=%.0f Hz",
                 self.settings.realtime_url,
                 self.settings.input_unit_ms,
                 self.settings.camera_fps,
+                1.0 / self.settings.vision_send_interval_seconds,
+                self.settings.doa_hz,
                 self.settings.motion_hz,
             )
             asyncio.run(self.client.run(self.stop_event))
@@ -249,7 +297,14 @@ class YRobotRuntime:
         epoch: int,
         response_id: str | None,
     ) -> None:
-        self.playback.enqueue(PlaybackPacket(epoch, samples, response_id))
+        self.playback.enqueue(
+            PlaybackPacket(
+                epoch,
+                samples,
+                response_id,
+                received_at=time.monotonic(),
+            )
+        )
 
     def _on_text(
         self,
@@ -269,6 +324,8 @@ class YRobotRuntime:
 
     def _on_session(self, ready: bool, epoch: int) -> None:
         self.transcript.clear()
+        if ready:
+            self.vision_uplink.reset()
         if not self.playback.interrupt(epoch):
             log.critical("cannot guarantee stale audio is silent; stopping YRobot")
             self.stop_event.set()
@@ -286,15 +343,21 @@ class YRobotRuntime:
             self.stop_event.set()
             return
         log.info(
-            "Barge-in: local silence in %.1f ms (rms=%.4f echo=%.2f)",
-            (time.perf_counter() - started) * 1_000,
+            "Barge-in: VAD attack=%d ms, player flush=%.1f ms, total≈%.1f ms (rms=%.4f echo=%.2f)",
+            self.settings.barge_attack_ms,
+            (flush_ms := (time.perf_counter() - started) * 1_000),
+            self.settings.barge_attack_ms + flush_ms,
             decision.rms,
             decision.echo_similarity,
         )
 
-    def _latest_jpeg(self) -> bytes | None:
-        snapshot = self.latest_frame.snapshot(max_age_seconds=2.0)
-        return None if snapshot is None else snapshot.jpeg
+    def _daemon_doa_url(self) -> str:
+        client = getattr(self.mini, "client", None)
+        host = getattr(client, "host", None)
+        port = getattr(client, "port", None)
+        if not isinstance(host, str) or not host or not isinstance(port, int):
+            raise RuntimeError("Reachy Mini daemon address is unavailable")
+        return f"http://{host}:{port}/api/state/doa"
 
     def _model_output_active(self) -> bool:
         return (

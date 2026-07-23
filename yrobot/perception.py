@@ -15,21 +15,78 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import numpy.typing as npt
+import requests
 from PIL import Image
 
 LOGGER = logging.getLogger(__name__)
 
 
 class PerceptionMedia(Protocol):
-    """Subset of Reachy Mini's local ``MediaManager`` used here."""
+    """Subset of Reachy Mini's local ``MediaManager`` used for the camera."""
 
     def get_frame(self) -> npt.NDArray[np.uint8] | None: ...
 
-    def get_DoA(self) -> tuple[float, bool] | None: ...  # noqa: N802
+
+class DoASource(Protocol):
+    """Bounded, closeable source of daemon-owned DoA samples."""
+
+    def read(self) -> tuple[float, bool] | None: ...
+
+    def close(self) -> None: ...
+
+
+class DaemonDoASource:
+    """Read DoA through the Reachy Mini daemon's persistent HTTP session."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 0.25,
+        session: Any | None = None,
+    ) -> None:
+        if not url.startswith(("http://", "https://")):
+            raise ValueError("DoA URL must use http:// or https://")
+        if timeout_seconds <= 0:
+            raise ValueError("DoA request timeout must be positive")
+        self._url = url
+        self._timeout_seconds = timeout_seconds
+        if session is None:
+            session = requests.Session()
+            session.trust_env = False
+        self._session = session
+        self._closed = False
+
+    def read(self) -> tuple[float, bool] | None:
+        if self._closed:
+            raise RuntimeError("DoA source is closed")
+        response = self._session.get(self._url, timeout=self._timeout_seconds)
+        response.raise_for_status()
+        payload = response.json()
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            raise ValueError("DoA response must be an object or null")
+        try:
+            angle = float(payload["angle"])
+            speech_detected = payload["speech_detected"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("invalid DoA response") from error
+        if not math.isfinite(angle):
+            raise ValueError("DoA angle must be finite")
+        if not isinstance(speech_detected, bool):
+            raise ValueError("DoA speech_detected must be a boolean")
+        return angle, speech_detected
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._session.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,28 +386,62 @@ class DoATracker:
 
 
 class DoAWorker:
-    """Poll the XVF3800 at 10–20 Hz; publish state, never motor commands."""
+    """Adaptively poll daemon-owned DoA; publish state, never motor commands."""
 
     def __init__(
         self,
-        media: PerceptionMedia,
+        source: DoASource | str,
         tracker: DoATracker,
         near_end_speech: Callable[[], bool],
         *,
         head_pose: Callable[[], npt.ArrayLike],
         playback_active: Callable[[], bool],
         hz: float = 10.0,
+        idle_hz: float = 2.0,
+        request_timeout_seconds: float = 0.25,
+        retry_initial_seconds: float = 0.25,
+        retry_max_seconds: float = 2.0,
+        warning_interval_seconds: float = 5.0,
+        slow_request_seconds: float = 0.03,
+        slow_request_limit: int = 3,
     ) -> None:
-        if not 10.0 <= hz <= 20.0:
+        if not math.isfinite(hz) or not 10.0 <= hz <= 20.0:
             raise ValueError("DoA polling rate must be within 10..20 Hz")
-        self._media = media
+        if not math.isfinite(idle_hz) or not 0 < idle_hz <= hz:
+            raise ValueError("DoA idle polling rate must be within 0..active Hz")
+        if (
+            not math.isfinite(retry_initial_seconds)
+            or not math.isfinite(retry_max_seconds)
+            or retry_initial_seconds <= 0
+            or retry_max_seconds < retry_initial_seconds
+        ):
+            raise ValueError("DoA retry timings are invalid")
+        if not math.isfinite(warning_interval_seconds) or warning_interval_seconds <= 0:
+            raise ValueError("DoA warning interval must be positive")
+        if not math.isfinite(slow_request_seconds) or slow_request_seconds <= 0:
+            raise ValueError("DoA slow-request threshold must be positive")
+        if slow_request_limit <= 0:
+            raise ValueError("DoA slow-request limit must be positive")
+        self._source = (
+            DaemonDoASource(source, timeout_seconds=request_timeout_seconds)
+            if isinstance(source, str)
+            else source
+        )
         self._tracker = tracker
         self._near_end_speech = near_end_speech
         self._head_pose = head_pose
         self._playback_active = playback_active
-        self._period = 1.0 / hz
+        self._active_period = 1.0 / hz
+        self._idle_period = 1.0 / idle_hz
+        self._retry_initial = retry_initial_seconds
+        self._retry_max = retry_max_seconds
+        self._warning_interval = warning_interval_seconds
+        self._slow_request_seconds = slow_request_seconds
+        self._slow_request_limit = slow_request_limit
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._close_lock = threading.Lock()
+        self._closed = False
 
     @property
     def is_alive(self) -> bool:
@@ -359,6 +450,8 @@ class DoAWorker:
     def start(self) -> None:
         if self.is_alive:
             return
+        if self._closed:
+            raise RuntimeError("DoA worker cannot be restarted after it is closed")
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
@@ -372,40 +465,147 @@ class DoAWorker:
         thread = self._thread
         if thread is not None:
             thread.join(timeout)
-        return not self.is_alive
+        stopped = not self.is_alive
+        if stopped:
+            self._close_source()
+        return stopped
+
+    def _close_source(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self._source.close()
+        except Exception:
+            LOGGER.warning("failed to close DoA source", exc_info=True)
 
     def _run(self) -> None:
-        deadline = time.monotonic()
         last_warning = -math.inf
-        while not self._stop.is_set():
-            now = time.monotonic()
-            if now < deadline:
-                self._stop.wait(deadline - now)
-                continue
-            try:
-                result = self._media.get_DoA()
-                if result is not None:
-                    angle, hardware_speech = result
+        last_processing_warning = -math.inf
+        last_poll = -math.inf
+        failures = 0
+        slow_requests = 0
+        try:
+            while not self._stop.is_set():
+                now = time.monotonic()
+                try:
                     near_end_speech = bool(self._near_end_speech())
-                    # The XVF speech bit can still react to residual loudspeaker
-                    # energy. During playback, only the echo-guarded near-end VAD
-                    # is trusted.
-                    hardware_gate = bool(hardware_speech) and not bool(self._playback_active())
-                    if hardware_gate or near_end_speech:
-                        self._tracker.update(
-                            float(angle),
-                            hardware_speech=hardware_gate,
-                            near_end_speech=near_end_speech,
-                            head_pose=self._head_pose(),
-                            now=now,
-                        )
-            except Exception:
-                if now - last_warning >= 5.0:
-                    LOGGER.warning("DoA polling failed", exc_info=True)
-                    last_warning = now
+                    playback_active = bool(self._playback_active())
+                except Exception:
+                    if now - last_processing_warning >= self._warning_interval:
+                        LOGGER.warning("DoA gate processing failed", exc_info=True)
+                        last_processing_warning = now
+                    self._stop.wait(self._active_period)
+                    continue
 
-            deadline += self._period
-            current = time.monotonic()
-            if deadline <= current:
-                skipped = math.floor((current - deadline) / self._period) + 1
-                deadline += skipped * self._period
+                # Hardware speech detection can react to the robot's own speaker.
+                # Echo-guarded near-end VAD wakes polling within one active period.
+                if playback_active and not near_end_speech:
+                    self._stop.wait(self._active_period)
+                    continue
+
+                period = self._active_period if near_end_speech else self._idle_period
+                until_poll = period - (now - last_poll)
+                if until_poll > 0:
+                    self._stop.wait(min(self._active_period, until_poll))
+                    continue
+
+                request_started = time.monotonic()
+                try:
+                    result = self._source.read()
+                    if result is None:
+                        raise RuntimeError("daemon returned null (audio/DoA unavailable)")
+                except requests.exceptions.ReadTimeout:
+                    LOGGER.error(
+                        "DoA disabled for this run after a daemon read timeout; "
+                        "restart the Reachy daemon or device before retrying"
+                    )
+                    LOGGER.debug("DoA daemon read timeout", exc_info=True)
+                    break
+                except Exception as error:
+                    slow_requests = 0
+                    failures += 1
+                    retry = min(
+                        self._retry_initial * (2 ** min(failures - 1, 30)),
+                        self._retry_max,
+                    )
+                    if now - last_warning >= self._warning_interval:
+                        LOGGER.warning(
+                            "DoA daemon polling failed (%s); retrying in %.2f s",
+                            error,
+                            retry,
+                        )
+                        last_warning = now
+                    LOGGER.debug("DoA daemon polling failure", exc_info=True)
+                    if self._stop.wait(retry):
+                        break
+                    continue
+
+                request_finished = time.monotonic()
+                request_seconds = request_finished - request_started
+                # Healthy reads are paced start-to-start. If a synchronous
+                # daemon read overruns the period, add one cooldown instead of
+                # immediately hammering the already slow control endpoint.
+                last_poll = request_finished if request_seconds >= period else request_started
+                if request_seconds > self._slow_request_seconds:
+                    slow_requests += 1
+                    if slow_requests == 1:
+                        LOGGER.warning(
+                            "DoA daemon read is slow (%.1f ms); disabling after "
+                            "%d consecutive slow reads",
+                            request_seconds * 1_000,
+                            self._slow_request_limit,
+                        )
+                    if slow_requests >= self._slow_request_limit:
+                        LOGGER.error(
+                            "DoA disabled for this run after %d consecutive "
+                            "daemon reads exceeded %.1f ms",
+                            slow_requests,
+                            self._slow_request_seconds * 1_000,
+                        )
+                        break
+                else:
+                    slow_requests = 0
+
+                if failures:
+                    LOGGER.info("DoA polling recovered after %d failure(s)", failures)
+                    failures = 0
+                try:
+                    current_near_end = bool(self._near_end_speech())
+                    current_playback = bool(self._playback_active())
+                    self._publish(
+                        result,
+                        request_finished,
+                        near_end_speech=current_near_end,
+                        # If playback crossed either edge during this request,
+                        # conservatively reject the hardware speech bit.
+                        playback_active=playback_active or current_playback,
+                    )
+                except Exception:
+                    if request_finished - last_processing_warning >= self._warning_interval:
+                        LOGGER.warning("DoA sample processing failed", exc_info=True)
+                        last_processing_warning = request_finished
+        finally:
+            self._close_source()
+
+    def _publish(
+        self,
+        result: tuple[float, bool],
+        now: float,
+        *,
+        near_end_speech: bool,
+        playback_active: bool,
+    ) -> None:
+        angle, hardware_speech = result
+        # The XVF speech bit can still react to residual loudspeaker energy.
+        # During playback, only the echo-guarded near-end VAD is trusted.
+        hardware_gate = bool(hardware_speech) and not playback_active
+        if hardware_gate or near_end_speech:
+            self._tracker.update(
+                float(angle),
+                hardware_speech=hardware_gate,
+                near_end_speech=near_end_speech,
+                head_pose=self._head_pose(),
+                now=now,
+            )
