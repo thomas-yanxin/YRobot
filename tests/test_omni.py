@@ -6,7 +6,7 @@ import json
 import numpy as np
 
 from yrobot.config import Config
-from yrobot.omni import encode_append, should_rotate
+from yrobot.omni import ThinkFilter, encode_append, should_rotate
 
 
 def test_encode_append_audio_only():
@@ -41,7 +41,33 @@ def test_url_and_budget():
     cfg = Config(url="wss://h:8006/v1/realtime", mode="audio")
     assert cfg.full_url.endswith("?mode=audio")
     assert cfg.session_budget_s == 570.0
-    explicit = Config(url="wss://h:8006/v1/realtime?mode=video")
-    assert explicit.full_url == "wss://h:8006/v1/realtime?mode=video"
-    assert explicit.effective_mode == "video"
-    assert explicit.session_budget_s == 280.0
+    # a stale ?mode=video in the URL is overridden by cfg.mode
+    stale = Config(url="wss://h:8006/v1/realtime?mode=video")
+    assert stale.full_url == "wss://h:8006/v1/realtime?mode=audio"
+    assert stale.session_budget_s == 570.0
+    video = Config(url="wss://h:8006/v1/realtime", mode="video")
+    assert video.full_url.endswith("?mode=video")
+    assert video.session_budget_s == 280.0
+
+
+def test_system_prompt_composition():
+    cfg = Config()
+    assert cfg.system_prompt == "You are a helpful assistant."
+    lines = cfg.full_system_prompt.split("\n")
+    assert lines[0] == "You are a helpful assistant."
+    assert len(lines) == 2 and lines[1] and lines[1] != lines[0]
+    bare = Config(instruction="")
+    assert bare.full_system_prompt == "You are a helpful assistant."
+
+
+def test_think_filter_strips_blocks_and_split_tags():
+    f = ThinkFilter()
+    assert f.feed("你好<think>秘密推理</think>世界") == "你好世界"
+    f = ThinkFilter()
+    assert f.feed("我在学<thi") == "我在学"
+    assert f.feed("nk>abc</think>好的") == "好的"
+    f = ThinkFilter()  # stray closing tag (opening lost in an earlier session)
+    assert f.feed("有个人</think>坐着看手机") == "有个人坐着看手机"
+    f = ThinkFilter()
+    assert f.feed("平常文字") == "平常文字"
+    assert f.feed("不受影响") == "不受影响"

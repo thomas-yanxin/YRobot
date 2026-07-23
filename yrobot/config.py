@@ -38,11 +38,15 @@ def _b(name: str, default: bool) -> bool:
     return _s(name, str(int(default))).lower() in ("1", "true", "yes", "on")
 
 
-DEFAULT_SYSTEM_PROMPT = (
-    "你是 Reachy Mini，一个放在桌上的可爱小机器人，通过摄像头看着眼前的世界。"
-    "像朋友一样口语化聊天：回答简短自然，通常一两句话，除非用户明确要求展开。"
-    "用户说中文就用中文回答，说英文就用英文回答。"
-)
+# The duplex model is trained with this exact system sentence (it is the
+# server-side default and the one used by the official presets/frontend).
+# Replacing it with a free-form persona pushes the Qwen3 base out of its
+# duplex distribution — <think> blocks start leaking into speak slices and
+# answers degrade. Behaviour guidance goes into a SHORT separate instruction
+# appended on the next line (cf. the official offline example
+# "你是一个友好的助手，请简短回复。").
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+DEFAULT_INSTRUCTION = "请像朋友聊天一样简短口语化地回复，跟随用户使用中文或英文。"
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,7 @@ class Config:
     mode: str = "audio"  # "audio" = 600 s sessions; still accepts video frames
     tls_verify: bool = False
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    instruction: str = DEFAULT_INSTRUCTION  # short behaviour line, NOT a persona essay
     length_penalty: float = 1.1
     force_listen_count: int = 1  # listen slices forced at session start
     temperature: float = 0.0  # 0 = server default
@@ -111,16 +116,23 @@ class Config:
 
     @property
     def full_url(self) -> str:
-        if "mode=" in self.url:
-            return self.url
-        sep = "&" if "?" in self.url else "?"
-        return f"{self.url}{sep}mode={self.mode}"
+        """URL with mode taken from YROBOT_MODE — any ?mode= in the URL is
+        replaced, so a stale `?mode=video` in a .env can't silently shrink
+        sessions to 300 s."""
+        base, _, query = self.url.partition("?")
+        params = [p for p in query.split("&") if p and not p.startswith("mode=")]
+        params.append(f"mode={self.mode}")
+        return f"{base}?{'&'.join(params)}"
 
     @property
     def effective_mode(self) -> str:
-        if "mode=" in self.url:
-            return self.url.rsplit("mode=", 1)[1].split("&", 1)[0]
         return self.mode
+
+    @property
+    def full_system_prompt(self) -> str:
+        if self.instruction:
+            return f"{self.system_prompt}\n{self.instruction}"
+        return self.system_prompt
 
     @property
     def session_budget_s(self) -> float:
@@ -149,6 +161,7 @@ class Config:
             mode=_s("YROBOT_MODE", d.mode),
             tls_verify=_b("YROBOT_TLS_VERIFY", d.tls_verify),
             system_prompt=_s("YROBOT_SYSTEM_PROMPT", d.system_prompt),
+            instruction=_s("YROBOT_INSTRUCTION", d.instruction),
             length_penalty=_f("YROBOT_LENGTH_PENALTY", d.length_penalty),
             force_listen_count=_i("YROBOT_FORCE_LISTEN_COUNT", d.force_listen_count),
             temperature=_f("YROBOT_TEMPERATURE", d.temperature),

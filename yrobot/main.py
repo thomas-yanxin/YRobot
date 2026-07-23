@@ -22,7 +22,7 @@ import numpy as np
 from yrobot.audio import AudioIO, StreamResampler
 from yrobot.config import Config
 from yrobot.motion import Puppeteer
-from yrobot.omni import OmniClient
+from yrobot.omni import OmniClient, ThinkFilter
 from yrobot.state import Shared
 from yrobot.turn import TurnGate
 
@@ -66,6 +66,7 @@ class Pipeline:
         self.motion: Optional[Puppeteer] = Puppeteer(mini, cfg, self.state) if cfg.motion else None
         self._last_frame_t = 0.0
         self._text: list[str] = []
+        self._think = ThinkFilter()
         self._await_reply_since = 0.0  # end-of-user-speech timestamp for latency logs
 
     # -- lifecycle -------------------------------------------------------------
@@ -128,8 +129,9 @@ class Pipeline:
         if not self.cfg.send_video:
             return None
         now = time.monotonic()
-        active = (self.state.voice_active or self.state.robot_speaking()
-                  or now - self.state.last_voice_end < 3.0)
+        # Vision costs ~64 kv-tokens per frame: full rate only around USER
+        # speech — the robot doesn't need to watch itself talk.
+        active = self.state.voice_active or now - self.state.last_voice_end < 3.0
         interval = self.cfg.frame_active_s if active else self.cfg.frame_idle_s
         if now - self._last_frame_t < interval:
             return None
@@ -168,7 +170,8 @@ class Pipeline:
         self.audio.play(self.resampler.process(pcm24k))
 
     def on_text(self, text: str) -> None:
-        if not self.turn.latched():
+        text = self._think.feed(text)
+        if text and not self.turn.latched():
             self._text.append(text)
 
     def quiet(self) -> bool:

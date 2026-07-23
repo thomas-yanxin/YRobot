@@ -50,6 +50,44 @@ def encode_append(audio: np.ndarray, frame_jpeg: Optional[bytes], force_listen: 
     return json.dumps({"type": "input.append", "input": inp})
 
 
+class ThinkFilter:
+    """Drop Qwen3 <think>…</think> blocks that leak into duplex text deltas.
+
+    Tags can split across deltas, so a trailing partial tag is held back
+    until the next delta decides it.
+    """
+
+    _TAGS = ("<think>", "</think>")
+
+    def __init__(self) -> None:
+        self._in_think = False
+        self._tail = ""
+
+    def feed(self, text: str) -> str:
+        text = self._tail + text
+        self._tail = ""
+        out: list[str] = []
+        while text:
+            hits = [(p, t) for t in self._TAGS if (p := text.find(t)) >= 0]
+            if hits:
+                pos, tag = min(hits)
+                if not self._in_think:
+                    out.append(text[:pos])
+                self._in_think = tag == "<think>"
+                text = text[pos + len(tag):]
+                continue
+            # hold back a trailing prefix of either tag for the next delta
+            for i in range(min(len(text), 7), 0, -1):
+                if any(t.startswith(text[-i:]) for t in self._TAGS):
+                    self._tail = text[-i:]
+                    text = text[:-i]
+                    break
+            if not self._in_think:
+                out.append(text)
+            break
+        return "".join(out)
+
+
 def should_rotate(cfg: Config, kv: int, age_s: float, quiet: bool) -> Optional[str]:
     if kv >= cfg.kv_hard:
         return f"kv={kv}"
@@ -151,7 +189,7 @@ class OmniClient:
                     elif mtype in ("session.queue_done", "queue_done"):
                         await ws.send(json.dumps({
                             "type": "session.init",
-                            "payload": {"system_prompt": cfg.system_prompt,
+                            "payload": {"system_prompt": cfg.full_system_prompt,
                                         "config": cfg.session_config()},
                         }))
                     elif mtype == "session.created":
