@@ -1,3 +1,3 @@
-"""YRobot: a small full-duplex Omni client for Reachy Mini."""
+"""Low-latency MiniCPM-o 4.5 conversation for Reachy Mini Wireless."""
 
-__version__ = "0.3.0"
+__version__ = "1.0.0"

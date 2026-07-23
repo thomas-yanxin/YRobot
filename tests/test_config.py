@@ -2,62 +2,166 @@ import ssl
 
 import pytest
 
-from yrobot.config import Config, normalize_backend_url
-
-
-def test_backend_url_adds_path() -> None:
-    assert normalize_backend_url("wss://robot-brain:28099") == ("wss://robot-brain:28099/backend")
+from yrobot.config import DEFAULT_SYSTEM_PROMPT, Config, normalize_realtime_url
 
 
 @pytest.mark.parametrize(
-    "url",
+    ("value", "expected"),
     [
-        "https://robot-brain:28099/backend",
-        "wss://robot-brain:8006/v1/realtime?mode=video",
-        "not-a-url",
+        (
+            "10.0.16.184:8006",
+            "wss://10.0.16.184:8006/v1/realtime?mode=video",
+        ),
+        (
+            "10.0.16.184:8006/v1/realtime?mode=video",
+            "wss://10.0.16.184:8006/v1/realtime?mode=video",
+        ),
+        (
+            "http://brain.local:8006",
+            "ws://brain.local:8006/v1/realtime?mode=video",
+        ),
+        (
+            "https://brain.local/v1/realtime?mode=audio",
+            "wss://brain.local/v1/realtime?mode=video",
+        ),
+        (
+            "ws://brain.local:8006/v1/realtime/",
+            "ws://brain.local:8006/v1/realtime?mode=video",
+        ),
+        (
+            "wss://brain.local",
+            "wss://brain.local/v1/realtime?mode=video",
+        ),
     ],
 )
-def test_backend_url_rejects_non_backend_urls(url: str) -> None:
+def test_normalize_realtime_url(value: str, expected: str) -> None:
+    assert normalize_realtime_url(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ws://brain.local:28099/backend",
+        "https://brain.local/some/backend",
+        "ftp://brain.local",
+        "ws://brain.local/not-realtime",
+        "ws://brain.local/v1/realtime?token=secret",
+        "ws://brain.local/v1/realtime#fragment",
+        "ws://brain.local:not-a-port",
+        "",
+    ],
+)
+def test_normalize_realtime_url_rejects_legacy_or_invalid_values(value: str) -> None:
     with pytest.raises(ValueError):
-        normalize_backend_url(url)
+        normalize_realtime_url(value)
 
 
-def test_config_loads_small_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNI_WS_URL", "ws://127.0.0.1:28099")
-    monkeypatch.setenv("OMNI_TLS_VERIFY", "1")
-    monkeypatch.setenv("OMNI_SEND_VIDEO", "0")
-    monkeypatch.setenv("OMNI_LENGTH_PENALTY", "1.2")
-    monkeypatch.setenv("OMNI_SYSTEM_PROMPT", "short prompt")
+def test_config_loads_yrobot_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YROBOT_REALTIME_URL", "https://brain.local:8006")
+    monkeypatch.setenv("YROBOT_TLS_VERIFY", "0")
+    monkeypatch.setenv("YROBOT_SEND_VIDEO", "false")
+    monkeypatch.setenv("YROBOT_ENABLE_TTS", "false")
+    monkeypatch.setenv("YROBOT_LENGTH_PENALTY", "1.25")
+    monkeypatch.setenv("YROBOT_FORCE_LISTEN_COUNT", "1")
+    monkeypatch.setenv("YROBOT_RECONNECT_INITIAL", "0.25")
+    monkeypatch.setenv("YROBOT_RECONNECT_MAX", "4")
+    monkeypatch.setenv("YROBOT_SESSION_ROLLOVER", "280")
 
     config = Config.load()
 
-    assert config.omni_url == "ws://127.0.0.1:28099/backend"
-    assert config.tls_verify is True
+    assert config.realtime_url == "wss://brain.local:8006/v1/realtime?mode=video"
+    assert config.tls_verify is False
     assert config.send_video is False
-    assert config.length_penalty == 1.2
-    assert config.system_prompt == "short prompt"
-    assert config.ssl_context() is None
+    assert config.enable_tts is False
+    assert config.system_prompt == DEFAULT_SYSTEM_PROMPT
+    assert config.length_penalty == 1.25
+    assert config.force_listen_count == 1
+    assert config.reconnect_initial_delay == 0.25
+    assert config.reconnect_max_delay == 4.0
+    assert config.session_rollover == 280.0
 
 
-@pytest.mark.parametrize("value", ["nan", "0", "5.1", "not-a-number"])
-def test_length_penalty_rejects_invalid_values(
+def test_config_defaults_use_minicpm_realtime_gateway(
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = [
+        "YROBOT_REALTIME_URL",
+        "YROBOT_TLS_VERIFY",
+        "YROBOT_SEND_VIDEO",
+        "YROBOT_ENABLE_TTS",
+        "YROBOT_SYSTEM_PROMPT",
+        "YROBOT_LENGTH_PENALTY",
+        "YROBOT_FORCE_LISTEN_COUNT",
+        "YROBOT_RECONNECT_INITIAL",
+        "YROBOT_RECONNECT_MAX",
+        "YROBOT_SESSION_ROLLOVER",
+    ]
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    # Legacy variables are deliberately ignored by the clean 2.0 boundary.
+    monkeypatch.setenv("OMNI_WS_URL", "ws://legacy.invalid/backend")
+    monkeypatch.setenv("OMNI_FORCE_LISTEN_COUNT", "9")
+
+    config = Config.load()
+
+    assert config.realtime_url == ("wss://10.0.16.184:8006/v1/realtime?mode=video")
+    assert config.tls_verify is False
+    assert config.send_video is True
+    assert config.enable_tts is True
+    assert config.system_prompt == DEFAULT_SYSTEM_PROMPT
+    assert config.length_penalty == 1.1
+    assert config.force_listen_count == 1
+    assert config.session_rollover == 285.0
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("YROBOT_TLS_VERIFY", "maybe"),
+        ("YROBOT_LENGTH_PENALTY", "nan"),
+        ("YROBOT_LENGTH_PENALTY", "5.1"),
+        ("YROBOT_FORCE_LISTEN_COUNT", "-1"),
+        ("YROBOT_FORCE_LISTEN_COUNT", "not-an-integer"),
+        ("YROBOT_SESSION_ROLLOVER", "299"),
+        ("YROBOT_SYSTEM_PROMPT", "unsupported persona"),
+    ],
+)
+def test_config_rejects_invalid_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
     value: str,
 ) -> None:
-    monkeypatch.setenv("OMNI_LENGTH_PENALTY", value)
-
-    with pytest.raises(ValueError, match="OMNI_LENGTH_PENALTY"):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
         Config.load()
 
 
-def test_unverified_tls_context() -> None:
-    config = Config(
-        omni_url="wss://127.0.0.1:28099/backend",
+def test_config_rejects_inverted_reconnect_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("YROBOT_RECONNECT_INITIAL", "4")
+    monkeypatch.setenv("YROBOT_RECONNECT_MAX", "1")
+    with pytest.raises(ValueError, match="YROBOT_RECONNECT_MAX"):
+        Config.load()
+
+
+def test_ssl_context_follows_normalized_transport() -> None:
+    plain = Config(
+        realtime_url="ws://brain.local/v1/realtime?mode=video",
+        tls_verify=True,
+        send_video=True,
+        system_prompt="test",
+    )
+    assert plain.ssl_context() is None
+
+    secure = Config(
+        realtime_url="wss://brain.local/v1/realtime?mode=video",
         tls_verify=False,
         send_video=True,
         system_prompt="test",
     )
-    context = config.ssl_context()
+    context = secure.ssl_context()
     assert context is not None
     assert context.verify_mode == ssl.CERT_NONE
     assert context.check_hostname is False
