@@ -1,115 +1,148 @@
-"""Exercise the live gateway with YRobot's own client — no robot needed.
-
-Streams a 16 kHz mono WAV as paced mic chunks, prints reply latency and text,
-and (with --barge-wav) simulates a barge-in mid-reply to check the turn gate.
-
-    python scripts/probe_realtime.py --wav hello.wav [--barge-wav interrupt.wav]
-"""
+#!/usr/bin/env python3
+"""Probe the documented MiniCPM-o video Realtime lifecycle."""
 
 from __future__ import annotations
 
 import argparse
-import logging
+import ssl
 import time
-import wave
+from pathlib import Path
 
 import numpy as np
+from websockets.sync.client import connect
 
-from yrobot.config import Config
-from yrobot.omni import OmniClient
-from yrobot.turn import TurnGate
+from yrobot.config import OFFICIAL_REALTIME_URL
+from yrobot.protocol import (
+    ProtocolState,
+    QueueDone,
+    QueueStatus,
+    ResponseDelta,
+    ServerError,
+    SessionClosed,
+    SessionCreated,
+    input_append,
+    parse_server_event,
+    serialize_client_event,
+    session_close,
+    session_init,
+    transition_client,
+    transition_server,
+    validate_video_url,
+)
 
-log = logging.getLogger("probe")
 
+def probe(
+    url: str,
+    *,
+    seconds: int,
+    image: Path | None,
+    tls_verify: bool,
+) -> None:
+    validate_video_url(url)
+    frame = image.read_bytes() if image else None
+    if frame is not None and not (frame.startswith(b"\xff\xd8") and frame.endswith(b"\xff\xd9")):
+        raise ValueError(f"not a JPEG: {image}")
 
-def load_wav(path: str) -> np.ndarray:
-    with wave.open(path, "rb") as w:
-        assert w.getframerate() == 16000 and w.getnchannels() == 1, "need 16 kHz mono"
-        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-    return (pcm.astype(np.float32) / 32768.0).copy()
+    context = None
+    if url.startswith("wss://"):
+        context = ssl.create_default_context()
+        if not tls_verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
 
+    state = ProtocolState()
+    started = time.monotonic()
+    with connect(
+        url,
+        ssl=context,
+        open_timeout=10,
+        close_timeout=3,
+        max_size=16 * 1024 * 1024,
+        compression=None,
+    ) as websocket:
+        while True:
+            event = parse_server_event(websocket.recv(timeout=120))
+            state = transition_server(state, event)
+            if isinstance(event, QueueStatus):
+                print(f"queue position={event.position}")
+            elif isinstance(event, QueueDone):
+                break
+            elif isinstance(event, ServerError):
+                raise RuntimeError(event.error)
 
-class ProbeSink:
-    def __init__(self, cfg: Config):
-        self.turn = TurnGate(cfg)
-        self.ready = False
-        self.speech_end_t = 0.0
-        self.first_audio_dt: float | None = None
-        self.played_s = 0.0
-        self.dropped = 0
-        self.text: list[str] = []
+        init = session_init("Reply briefly and naturally.", length_penalty=1.1)
+        websocket.send(serialize_client_event(init))
+        state = transition_client(state, init)
+        created: SessionCreated | None = None
+        while created is None:
+            event = parse_server_event(websocket.recv(timeout=120))
+            state = transition_server(state, event)
+            if isinstance(event, SessionCreated):
+                created = event
+            elif isinstance(event, ServerError):
+                raise RuntimeError(event.error)
 
-    def on_ready(self, ready: bool) -> None:
-        self.ready = ready
-        log.info("session %s", "ready" if ready else "down")
+        silence = np.zeros(16_000, dtype="<f4").tobytes()
+        next_send = time.monotonic()
+        for index in range(seconds):
+            if next_send > time.monotonic():
+                time.sleep(next_send - time.monotonic())
+            event = input_append(
+                silence,
+                video_frames=(frame,) if frame else (),
+                force_listen=index == 0,
+                max_slice_nums=1,
+            )
+            send_started = time.monotonic()
+            websocket.send(serialize_client_event(event))
+            state = transition_client(state, event)
+            completed = time.monotonic()
+            next_send = send_started + 1.0
+            if next_send <= completed:
+                next_send = completed + 1.0
 
-    def on_listen(self) -> None:
-        self.turn.on_listen(time.monotonic())
+        listen_seen = False
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not listen_seen:
+            event = parse_server_event(
+                websocket.recv(timeout=max(0.1, deadline - time.monotonic()))
+            )
+            state = transition_server(state, event)
+            if isinstance(event, ResponseDelta) and event.kind == "listen":
+                listen_seen = True
+            elif isinstance(event, ServerError):
+                raise RuntimeError(event.error)
 
-    def on_model_audio(self, pcm24k: np.ndarray) -> None:
-        if not self.turn.on_model_audio(time.monotonic()):
-            self.dropped += 1
-            return
-        if self.first_audio_dt is None and self.speech_end_t:
-            self.first_audio_dt = time.monotonic() - self.speech_end_t
-            log.info("first reply audio +%.2fs after speech end", self.first_audio_dt)
-        self.played_s += len(pcm24k) / 24000
+        close = session_close("probe_complete")
+        websocket.send(serialize_client_event(close))
+        state = transition_client(state, close)
+        while True:
+            event = parse_server_event(websocket.recv(timeout=5))
+            if isinstance(event, SessionClosed):
+                state = transition_server(state, event)
+                break
 
-    def on_text(self, text: str) -> None:
-        self.text.append(text)
-
-    def quiet(self) -> bool:
-        return True
+    print(
+        f"PASS session={created.session_id} listen={listen_seen} "
+        f"elapsed={time.monotonic() - started:.2f}s"
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--wav", required=True)
-    parser.add_argument("--barge-wav")
-    parser.add_argument("--url")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", default=OFFICIAL_REALTIME_URL)
+    parser.add_argument("--seconds", type=int, default=5)
+    parser.add_argument("--image", type=Path)
+    parser.add_argument("--tls-no-verify", action="store_true")
     args = parser.parse_args()
-    logging.basicConfig(level="INFO", format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
-
-    cfg = Config.from_env()
-    if args.url:
-        cfg = Config(**{**cfg.__dict__, "url": args.url})
-    sink = ProbeSink(cfg)
-    client = OmniClient(cfg, sink)
-    client.start()
-
-    while not sink.ready:
-        time.sleep(0.1)
-
-    chunk = 16000 * cfg.chunk_ms // 1000
-    speech = load_wav(args.wav)
-
-    def send(samples: np.ndarray, voice: bool) -> None:
-        for i in range(0, len(samples), chunk):
-            sink.turn.on_voice(voice, time.monotonic(), robot_speaking=sink.played_s > 0)
-            client.submit(samples[i:i + chunk], None, sink.turn.take_force_listen())
-            time.sleep(cfg.chunk_ms / 1000)
-
-    log.info("streaming %s (%.1fs)", args.wav, len(speech) / 16000)
-    send(np.zeros(8000, np.float32), False)
-    send(speech, True)
-    sink.speech_end_t = time.monotonic()
-    sink.turn.on_voice(False, sink.speech_end_t, robot_speaking=False)
-    send(np.zeros(16000 * 6, np.float32), False)
-
-    if args.barge_wav:
-        barge = load_wav(args.barge_wav)
-        log.info("BARGE-IN: streaming %s", args.barge_wav)
-        t0 = time.monotonic()
-        interrupted = sink.turn.on_voice(True, t0, robot_speaking=True)
-        log.info("turn gate interrupted=%s", interrupted)
-        send(barge, True)
-        sink.turn.on_voice(False, time.monotonic(), robot_speaking=False)
-        sink.speech_end_t, sink.first_audio_dt = time.monotonic(), None
-        send(np.zeros(16000 * 8, np.float32), False)
-        log.info("deltas dropped by turn gate: %d", sink.dropped)
-
-    log.info("reply: %r (%.1fs audio played)", "".join(sink.text), sink.played_s)
-    client.stop()
+    if not 1 <= args.seconds <= 30:
+        parser.error("--seconds must be 1..30")
+    probe(
+        args.url,
+        seconds=args.seconds,
+        image=args.image,
+        tls_verify=not args.tls_no_verify,
+    )
 
 
 if __name__ == "__main__":

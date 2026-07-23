@@ -1,3 +1,3 @@
-"""YRobot — full-duplex voice+vision live chat for Reachy Mini on MiniCPM-o 4.5."""
+"""YRobot: realtime voice, vision, direction, and motion for Reachy Mini."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
