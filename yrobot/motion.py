@@ -86,11 +86,24 @@ class SoundCompass(threading.Thread):
 
     def run(self) -> None:
         samples: list[tuple[float, float]] = []  # (time, world yaw)
-        while not self._halt.wait(1 / 12):
+        failures = 0
+        while not self._halt.wait(1 / 10):
             if not self._user_active():
                 samples.clear()
                 continue
-            reading = self._media.get_DoA()
+            try:
+                # The XVF3800 control interface shares the USB bus with the
+                # daemon and throws transient I/O errors under contention —
+                # they must never kill this thread, only slow it down.
+                reading = self._media.get_DoA()
+                failures = 0
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                if failures in (1, 10):
+                    logger.warning("DoA read failed (%s); backing off", exc)
+                if self._halt.wait(min(0.2 * failures, 5.0)):
+                    return
+                continue
             if reading is None:
                 continue
             angle, _pre_aec_speech = reading  # flag intentionally unused

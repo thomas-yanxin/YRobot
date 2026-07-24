@@ -1,10 +1,18 @@
 """Unit tests for DoA mapping and motion primitives (no hardware)."""
 
 import math
+import time
 
 import numpy as np
 
-from yrobot.motion import GazeSpring, circular_mean, doa_to_yaw_delta, head_yaw_of, rpy_pose
+from yrobot.motion import (
+    GazeSpring,
+    SoundCompass,
+    circular_mean,
+    doa_to_yaw_delta,
+    head_yaw_of,
+    rpy_pose,
+)
 
 
 def test_doa_angle_convention():
@@ -46,6 +54,29 @@ def test_gaze_spring_velocity_clamp():
     spring.target = 100.0
     spring.step(0.02)
     assert abs(spring.vel) <= 1.0
+
+
+def test_sound_compass_survives_usb_errors():
+    # XVF3800 control reads throw transient USB I/O errors under bus
+    # contention; the thread must back off, not die (hardware 2026-07-24).
+    class FlakyMedia:
+        def get_DoA(self):
+            raise OSError(5, "Input/Output Error")
+
+    compass = SoundCompass(
+        FlakyMedia(),
+        current_head_yaw=lambda: 0.0,
+        user_active=lambda: True,
+        on_target=lambda yaw: None,
+    )
+    compass.start()
+    time.sleep(0.5)
+    try:
+        assert compass.is_alive()  # backed off instead of crashing
+    finally:
+        compass.close()
+        compass.join(timeout=2)
+    assert not compass.is_alive()
 
 
 def test_gaze_spring_freeze_brakes_smoothly_and_holds():
