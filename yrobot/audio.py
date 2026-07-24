@@ -1,25 +1,15 @@
 """Audio capture, voice detection and interruptible playback.
 
-Reachy Mini Wireless routes the microphone through the XVF3800's hardware
-acoustic echo canceller, but the AEC residual of the robot's own speech
-still tracks the far-end envelope within a syllable — loud TTS passages
-pierce any static VAD threshold (hardware logs 2026-07-22 and 2026-07-24).
-Barge-in detection is therefore two-staged:
+Reachy Mini Wireless routes the microphone through the XVF3800 hardware
+front end.  The board defaults are not suitable for far-field double-talk,
+so startup applies the same verified AGC/AEC/noise-suppression profile as
+Pollen's conversation app before local VAD starts.
 
-1. ``EchoGuard`` predicts the expected residual from the exact audio we
-   played (we push every frame, so the far end is known) and only lets a
-   candidate through when the mic beats prediction + margin;
-2. a confirmed candidate only *ducks* playback (``Speaker.hold()`` — the
-   device queue is flushed but the un-played tail is retained). With the
-   speaker silent the echo path is dead, so the verify stage in
-   ``turn.DuckVerifier`` can trust the microphone: sustained voice commits
-   the destructive flush, silence resumes the held tail and the user hears
-   a short dip instead of losing the turn.
-
-Playback is epoch-tagged: a committed barge-in bumps the epoch, and
-everything queued under an older epoch is dropped while the GStreamer
-pipeline is flushed via ``clear_player()`` — always from the playback
-thread, the only thread allowed to touch the pipeline.
+Playback is epoch-tagged: a barge-in bumps the epoch, and everything queued
+under an older epoch is dropped while the GStreamer pipeline is flushed via
+``clear_player()`` — always from the playback thread, the only thread allowed
+to touch the pipeline.  Remote ``force_listen`` is handled separately by the
+turn controller; local silence never waits for a network acknowledgement.
 """
 
 from __future__ import annotations
@@ -39,6 +29,51 @@ logger = logging.getLogger(__name__)
 FRAME_MS = 20
 FRAME_SAMPLES = 16_000 * FRAME_MS // 1000  # 320
 SILENT_DB = -120.0
+WRITE_SETTLE_SECONDS = 0.1
+
+# Pollen's Reachy Mini conversation app applies this exact profile before
+# starting its realtime record/play loops.  In particular the hardware AGC
+# and double-talk settings operate before our software VAD; outbound AGC is
+# too late to recover a quiet interjection that VAD has already rejected.
+AUDIO_STARTUP_CONFIG: tuple[tuple[str, tuple[float | int, ...]], ...] = (
+    ("PP_AGCMAXGAIN", (10.0,)),
+    ("PP_MIN_NS", (0.8,)),
+    ("PP_MIN_NN", (0.8,)),
+    ("PP_GAMMA_E", (0.5,)),
+    ("PP_GAMMA_ETAIL", (0.5,)),
+    ("PP_NLATTENONOFF", (0,)),
+    ("PP_MGSCALE", (4.0, 1.0, 1.0)),
+)
+
+
+def apply_audio_startup_config(
+    media,
+    *,
+    verify: bool = True,
+    write_settle_seconds: float = WRITE_SETTLE_SECONDS,
+) -> bool:
+    """Best-effort application of the wireless XVF3800 duplex profile."""
+    audio = getattr(media, "audio", None)
+    apply_config = getattr(audio, "apply_audio_config", None)
+    if not callable(apply_config):
+        logger.warning("Reachy audio config API unavailable; continuing with board defaults")
+        return False
+    try:
+        applied = bool(
+            apply_config(
+                AUDIO_STARTUP_CONFIG,
+                verify=verify,
+                write_settle_seconds=write_settle_seconds,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — audio startup remains best effort
+        logger.warning("Reachy duplex audio config failed: %s", exc)
+        return False
+    if applied:
+        logger.info("Applied Reachy XVF3800 duplex audio profile")
+    else:
+        logger.warning("Reachy XVF3800 duplex audio profile was not applied")
+    return applied
 
 
 class Microphone:
@@ -69,7 +104,7 @@ class VoiceDetector:
                   turn gate (no hangover, so silence is detected promptly).
     ``active``  — voiced within the last 300 ms; gates DoA sampling and the
                   camera frame cadence.
-    ``last_db`` — level of the most recent frame, for the echo guard.
+    ``last_db`` — level of the most recent frame, used in interruption logs.
     """
 
     CONFIRM_FRAMES = 3
@@ -93,11 +128,9 @@ class VoiceDetector:
     def process(self, frame: np.ndarray, now: float, floor_frozen: bool = False) -> bool:
         """Feed one 20 ms mono float32 frame; returns confirmed ``voiced``.
 
-        ``floor_frozen`` must be True whenever the robot is audible: the
-        echo of its own speech is handled by the EchoGuard and must not be
-        learned as ambient noise — on hardware (2026-07-24) the floor
-        climbed to the echo level during a long monologue and the user
-        could no longer barge in at all.
+        ``floor_frozen`` must be True whenever the robot is audible. Its
+        post-AEC residual is not ambient noise: learning it raised the floor
+        during long replies until real double-talk could no longer pass.
         """
         rms = float(np.sqrt(np.mean(np.square(frame)))) if len(frame) else 0.0
         self.last_db = 20.0 * math.log10(rms + 1e-9)
@@ -167,59 +200,6 @@ class UplinkGain:
         return np.clip(chunk * self.gain, -1.0, 1.0).astype(np.float32)
 
 
-class EchoGuard:
-    """Rejects barge candidates that are the robot hearing its own speech.
-
-    The far end is known exactly, so the expected post-AEC residual is
-    ``playout_db + offset``: the offset (speaker → room → AEC leakage
-    ratio) learns upward fast from echo-only frames, decays slowly, and is
-    bumped after every false trigger the duck-verify stage catches — the
-    same residual level then stops re-triggering. Values were tuned on
-    hardware (2026-07-22 logs).
-    """
-
-    # Zero margin: XVF double-talk suppression pushes real interrupting
-    # speech down to within a few dB of the residual prediction (hardware
-    # log 2026-07-24: user at -27 dB vs a -22.9 dB threshold). A false duck
-    # costs a 0.8 s dip; a missed user is deafness — bias accordingly.
-    MARGIN_DB = 0.0
-    # Hardware 2026-07-24: the steady-state residual sits well below -20 dB
-    # (frame learning kept decaying the offset) and only TTS onset
-    # transients spike to ~ -14 dB. Pinning the floor at -14 gated real
-    # users out entirely — false-trigger bumps (+2.5 dB each, decaying at
-    # 0.1 dB/s) are the intended defence against transients, because a
-    # false duck now costs only a 0.8 s dip while a missed user is deafness.
-    OFFSET_INIT_DB = -18.0
-    OFFSET_RISE_DB = 0.5
-    OFFSET_DECAY_DB = 0.002
-    OFFSET_MIN_DB = -30.0
-    FALSE_TRIGGER_BUMP_DB = 2.5
-
-    def __init__(self) -> None:
-        self.offset_db = self.OFFSET_INIT_DB
-
-    def observe(self, mic_db: float, playout_db: float) -> bool:
-        """Feed one mic frame taken while the robot is audible.
-
-        Returns True when the level cannot be explained as our own echo.
-        Frames below the prediction train the leakage offset.
-        """
-        if playout_db <= -90.0:
-            return True  # nothing played recently: no echo to explain
-        if mic_db >= playout_db + self.offset_db + self.MARGIN_DB:
-            return True
-        ratio = mic_db - playout_db
-        if ratio > self.offset_db:
-            self.offset_db = min(self.offset_db + self.OFFSET_RISE_DB, ratio)
-        else:
-            self.offset_db = max(self.offset_db - self.OFFSET_DECAY_DB, self.OFFSET_MIN_DB)
-        return False
-
-    def penalize(self) -> None:
-        """A verified false trigger: raise the predicted leakage."""
-        self.offset_db = min(self.offset_db + self.FALSE_TRIGGER_BUMP_DB, 0.0)
-
-
 class StreamResampler:
     """Stateful linear resampler (24 kHz → 16 kHz) with phase continuity.
 
@@ -249,29 +229,21 @@ class StreamResampler:
 
 
 class Speaker(threading.Thread):
-    """Paced, interruptible, duckable playback of 24 kHz model audio.
+    """Paced, epoch-interruptible playback of 24 kHz model audio.
 
     TTS units arrive roughly once per second with jitter, so streaming them
     straight to the device underruns audibly. An adaptive start-of-utterance
     preroll (0.25–0.8 s: +0.15 on underrun, ×0.9 on a clean turn) absorbs the
     jitter, while the device backlog is capped so flushes stay cheap.
 
-    ``hold()`` silences the speaker *without* discarding the turn: the
-    un-played device tail is stashed for a lossless ``release_hold()``.
-    ``interrupt()`` is the destructive path (committed barge-in).
-
-    Every pushed block is logged as ``(start, duration, dB)`` so the echo
-    guard can query the playout envelope. The lookback must cover the full
-    playout-to-capture latency — the shared GStreamer pipeline reports up
-    to 1.256 s (hardware log 2026-07-22).
+    ``interrupt()`` advances the epoch before asking the playback thread to
+    clear the SDK player, so both already-buffered audio and late deltas from
+    the old turn are discarded. There is deliberately no resumable duck:
+    once local VAD qualifies a user interruption, old speech must not return.
     """
 
     PREROLL_MIN, PREROLL_MAX = 0.25, 0.8
     BACKLOG_CAP_S = 1.2
-    ENVELOPE_WINDOW_S = 1.6
-    ENVELOPE_KEEP_S = 3.0
-    TAIL_KEEP_SAMPLES = 2 * 16_000
-    LOG_BLOCK_SAMPLES = 3_200  # 200 ms envelope resolution
 
     def __init__(self, media) -> None:
         super().__init__(name="yrobot-speaker", daemon=True)
@@ -287,17 +259,9 @@ class Speaker(threading.Thread):
         self._streaming = False  # preroll satisfied, turn is being played
         self._end_requested = False  # listen boundary seen for this turn
         self._turn_underrun = False
-        self._holding = False
-        self._hold_req = False
-        self._resume_req = False
-        self._held_tail: np.ndarray | None = None
-        self._tail_ring = np.empty(0, np.float32)  # playback thread only
-        self._push_log: deque[tuple[float, float, float]] = deque()
-        self._log_lock = threading.Lock()
         self._command_lock = threading.Lock()
         self._flush_event = threading.Event()
-        self._hold_ack = threading.Event()
-        self._hold_completed_at = 0.0
+        self._flush_requested_at = 0.0
         self._flushed_epoch = 0
         self._flush_condition = threading.Condition()
         self._halt = threading.Event()
@@ -308,10 +272,6 @@ class Speaker(threading.Thread):
     def epoch(self) -> int:
         with self._command_lock:
             return self._epoch
-
-    @property
-    def holding(self) -> bool:
-        return self._holding or self._hold_req
 
     def play(self, epoch: int, pcm_24k: np.ndarray) -> None:
         with self._command_lock:
@@ -324,19 +284,9 @@ class Speaker(threading.Thread):
             self._epoch += 1
             self._flush_to = self._epoch
             epoch = self._epoch
-            self._hold_ack.clear()
+            self._flush_requested_at = time.monotonic()
             self._flush_event.set()
             return epoch
-
-    def hold(self) -> None:
-        """Duck: silence the device now, keep the turn resumable."""
-        self._hold_ack.clear()
-        self._hold_completed_at = 0.0
-        self._hold_req = True
-
-    def hold_completed_at(self) -> float | None:
-        """Physical clear completion time, or None while a hold is pending."""
-        return self._hold_completed_at if self._hold_ack.is_set() else None
 
     def wait_flushed(self, epoch: int, timeout: float | None = None) -> bool:
         """Wait until the playback thread has cleared through ``epoch``."""
@@ -349,10 +299,6 @@ class Speaker(threading.Thread):
                 self._flush_condition.wait(remaining)
             return True
 
-    def release_hold(self) -> None:
-        """The duck was a false alarm: re-inject the held tail and go on."""
-        self._resume_req = True
-
     def utterance_end(self) -> None:
         """Mark the turn boundary (a ``listen`` delta) — flush any short
         reply still waiting for preroll and adapt the preroll for next turn."""
@@ -364,33 +310,18 @@ class Speaker(threading.Thread):
         return (
             self._pushed_until - now > 0.02
             or self._buffered_s > 0
-            or self.holding
             or not self._q.empty()
         )
 
     def sounding(self, now: float | None = None) -> bool:
-        """Sound is physically coming out (or held mid-duck) — the only
-        states in which a barge candidate makes sense. During preroll the
-        speaker is silent: there is no echo to guard against, and ducking
-        would only delay the reply."""
+        """Whether audio is physically scheduled on the SDK player."""
         now = time.monotonic() if now is None else now
-        return self._pushed_until - now > 0.02 or self.holding
+        return self._pushed_until - now > 0.02
 
     def playing(self, now: float | None = None) -> bool:
-        """Whether audio is physically scheduled and not currently ducked."""
+        """Whether audio is physically scheduled on the SDK player."""
         now = time.monotonic() if now is None else now
-        return self._pushed_until - now > 0.02 and not self.holding
-
-    def playout_db(self, now: float) -> float:
-        """Loudest block scheduled within the envelope lookback window."""
-        loudest = SILENT_DB
-        with self._log_lock:
-            for start, duration, db in self._push_log:
-                if start > now:
-                    break
-                if start + duration >= now - self.ENVELOPE_WINDOW_S:
-                    loudest = max(loudest, db)
-        return loudest
+        return self._pushed_until - now > 0.02
 
     def close(self) -> None:
         self._halt.set()
@@ -404,25 +335,20 @@ class Speaker(threading.Thread):
             if self._flush_event.is_set():
                 with self._command_lock:
                     flushed_at = self._flush_to
+                    requested_at = self._flush_requested_at
                     self._flush_event.clear()
                 self._reset_turn()
                 self._clear_device()
+                if requested_at:
+                    logger.info(
+                        "playback epoch %d cleared locally in %.0f ms",
+                        flushed_at,
+                        (time.monotonic() - requested_at) * 1000,
+                    )
                 with self._flush_condition:
                     self._flushed_epoch = max(self._flushed_epoch, flushed_at)
                     self._flush_condition.notify_all()
                 continue
-            if self._hold_req:
-                self._hold_req = False
-                if not self._holding:
-                    self._duck()
-            if self._resume_req:
-                self._resume_req = False
-                if self._holding:
-                    self._holding = False
-                    if self._held_tail is not None and len(self._held_tail):
-                        self._push(self._held_tail)
-                    self._held_tail = None
-
             try:
                 epoch, pcm = self._q.get(timeout=0.05)
                 if epoch == self._epoch:
@@ -434,25 +360,12 @@ class Speaker(threading.Thread):
                     # the preroll of the next real turn.
                     self._end_requested = False
 
-            if self._holding:
-                continue  # the verify stage decides: resume or interrupt
             if not self._streaming and self._pending:
                 if self._buffered_s >= self._preroll or self._end_requested:
                     self._streaming = True
             if self._streaming:
                 self._stream_pending()
                 self._check_turn_end()
-
-    def _duck(self) -> None:
-        self._holding = True
-        now = time.monotonic()
-        keep = min(len(self._tail_ring), int(max(0.0, self._pushed_until - now) * 16_000))
-        self._held_tail = self._tail_ring[len(self._tail_ring) - keep :].copy() if keep else None
-        self._clear_device()
-        self._pushed_until = now
-        self._truncate_log(now)
-        self._hold_completed_at = time.monotonic()
-        self._hold_ack.set()
 
     def _stream_pending(self) -> None:
         while self._pending and not self._flush_event.is_set() and not self._halt.is_set():
@@ -464,20 +377,11 @@ class Speaker(threading.Thread):
             self._push(self._resampler.process(pcm))
 
     def _push(self, out: np.ndarray) -> None:
-        """Push 16 kHz audio and log its envelope for the echo guard."""
+        """Push one 16 kHz block and account for its physical schedule."""
         now = time.monotonic()
         self._media.push_audio_sample(out)
         start = max(self._pushed_until, now)
-        with self._log_lock:
-            for i in range(0, len(out), self.LOG_BLOCK_SAMPLES):
-                block = out[i : i + self.LOG_BLOCK_SAMPLES]
-                db = 20.0 * math.log10(float(np.sqrt(np.mean(np.square(block)))) + 1e-9)
-                self._push_log.append((start + i / 16_000, len(block) / 16_000, db))
-            horizon = now - self.ENVELOPE_KEEP_S
-            while self._push_log and self._push_log[0][0] + self._push_log[0][1] < horizon:
-                self._push_log.popleft()
         self._pushed_until = start + len(out) / 16_000
-        self._tail_ring = np.concatenate([self._tail_ring, out])[-self.TAIL_KEEP_SAMPLES :]
 
     def _check_turn_end(self) -> None:
         if self._pending:
@@ -504,17 +408,6 @@ class Speaker(threading.Thread):
         except Exception as exc:  # noqa: BLE001
             logger.warning("clear_player failed: %s", exc)
 
-    def _truncate_log(self, now: float) -> None:
-        """Drop scheduled-but-flushed blocks so the envelope stays physical."""
-        with self._log_lock:
-            kept = [
-                (start, min(duration, now - start), db)
-                for start, duration, db in self._push_log
-                if start < now
-            ]
-            self._push_log.clear()
-            self._push_log.extend(kept)
-
     def _reset_turn(self, drain_queue: bool = True) -> None:
         while drain_queue:
             try:
@@ -527,10 +420,4 @@ class Speaker(threading.Thread):
         self._streaming = False
         self._end_requested = False
         self._turn_underrun = False
-        self._holding = False
-        self._hold_req = False
-        self._resume_req = False
-        self._held_tail = None
-        self._tail_ring = np.empty(0, np.float32)
-        self._truncate_log(time.monotonic())
         self._resampler.reset()

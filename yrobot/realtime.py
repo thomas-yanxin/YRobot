@@ -7,7 +7,7 @@ Protocol (verified against https://minicpmo45.modelbest.cn/docs/en/realtime-api/
       <- session.queue_done                          (worker assigned)
       -> session.init {system_prompt, config}
       <- session.created                             (~14 s: server model reset)
-      -> input.append {audio, force_listen?}                  every chunk_ms
+      -> input.append {audio, input_id, force_listen?}        every 1 s
                        + video_frames only in mode=video
       <- response.output.delta kind in {listen,text,audio}
       -> session.close / <- session.closed
@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 DOWNLINK_RATE = 24_000
 UPLINK_RATE = 16_000
+UPLINK_UNIT_SAMPLES = UPLINK_RATE
 
 
 @dataclass(frozen=True)
@@ -142,9 +143,23 @@ class RealtimeClient:
             raise TimeoutError("session.created timeout")
         logger.info("session %s ready in %.1f s", self.session_id, time.monotonic() - t0)
 
-    def send_chunk(self, audio_16k: np.ndarray, jpeg: bytes | None, force_listen: bool) -> None:
-        """Send one uplink unit: mono float32 16 kHz audio + optional frame."""
-        payload: dict = {"audio": base64.b64encode(audio_16k.astype("<f4").tobytes()).decode()}
+    def send_chunk(
+        self,
+        audio_16k: np.ndarray,
+        jpeg: bytes | None,
+        force_listen: bool,
+        input_id: str,
+    ) -> None:
+        """Send one complete one-second inference unit plus an optional frame."""
+        if len(audio_16k) != UPLINK_UNIT_SAMPLES:
+            raise ValueError(
+                f"MiniCPM-o duplex input must contain {UPLINK_UNIT_SAMPLES} samples, "
+                f"got {len(audio_16k)}"
+            )
+        payload: dict = {
+            "audio": base64.b64encode(audio_16k.astype("<f4").tobytes()).decode(),
+            "input_id": input_id,
+        }
         if jpeg is not None:
             payload["video_frames"] = [base64.b64encode(jpeg).decode()]
             payload["max_slice_nums"] = 1

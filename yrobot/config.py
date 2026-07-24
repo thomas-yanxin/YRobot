@@ -58,9 +58,10 @@ class Settings:
     system_prompt: str = f"{TRAINED_SYSTEM_LINE}\n{DEFAULT_PERSONA}"
     length_penalty: float = 1.1
 
-    # Uplink cadence. 500 ms halves perceived reply latency versus the 1 s
-    # browser-demo cadence; 250 ms makes the model answer mid-utterance.
-    chunk_ms: int = 500
+    # MiniCPM-o 4.5 advances its duplex timeline in fixed one-second audio
+    # units. Sub-second input.append calls can return a synthetic listen
+    # without applying force_listen because no inference logits were produced.
+    chunk_ms: int = 1000
 
     # Audio mode is the latency-first default. Enabling video switches a bare
     # URL to mode=video; an explicitly contradictory URL is rejected.
@@ -79,8 +80,8 @@ class Settings:
     head_tracking_weight: float = 0.4
 
     def __post_init__(self) -> None:
-        if self.chunk_ms < 20 or self.chunk_ms % 20:
-            raise ValueError("YROBOT_CHUNK_MS must be a positive multiple of 20")
+        if self.chunk_ms != 1000:
+            raise ValueError("YROBOT_CHUNK_MS must be 1000 for MiniCPM-o 4.5 duplex")
         if self.send_video and self.realtime_mode != "video":
             raise ValueError("YROBOT_SEND_VIDEO requires realtime mode=video")
 
@@ -114,7 +115,7 @@ class Settings:
             tls_verify=_flag("YROBOT_TLS_VERIFY", True),
             system_prompt=f"{TRAINED_SYSTEM_LINE}\n{persona}" if persona else TRAINED_SYSTEM_LINE,
             length_penalty=_num("YROBOT_LENGTH_PENALTY", 1.1),
-            chunk_ms=int(_num("YROBOT_CHUNK_MS", 500)),
+            chunk_ms=int(_num("YROBOT_CHUNK_MS", 1000)),
             send_video=send_video,
             session_budget_s=_num("YROBOT_SESSION_BUDGET_S", default_session_budget),
             kv_budget_tokens=_num("YROBOT_KV_BUDGET", 7200.0),

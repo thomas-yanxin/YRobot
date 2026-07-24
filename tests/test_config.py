@@ -8,7 +8,7 @@ from yrobot.config import TRAINED_SYSTEM_LINE, Settings
 def test_defaults_target_official_gateway():
     s = Settings()
     assert s.url == "wss://minicpmo45.modelbest.cn/v1/realtime?mode=audio"
-    assert s.chunk_ms == 500
+    assert s.chunk_ms == 1000
     assert s.send_video is False
     assert s.realtime_mode == "audio"
     assert s.system_prompt.startswith(TRAINED_SYSTEM_LINE + "\n")
@@ -17,7 +17,7 @@ def test_defaults_target_official_gateway():
 def test_from_env_overrides(monkeypatch):
     monkeypatch.setenv("YROBOT_REALTIME_URL", "10.0.16.184:8006")
     monkeypatch.setenv("YROBOT_TLS_VERIFY", "0")
-    monkeypatch.setenv("YROBOT_CHUNK_MS", "500")
+    monkeypatch.setenv("YROBOT_CHUNK_MS", "1000")
     monkeypatch.setenv("YROBOT_PERSONA", "只说中文。")
     monkeypatch.setenv("YROBOT_SEND_VIDEO", "false")
     s = Settings.from_env()
@@ -50,6 +50,7 @@ def test_explicit_audio_mode_rejects_video_frames(monkeypatch):
         Settings.from_env()
 
 
-def test_chunk_size_must_align_to_capture_frames():
-    with pytest.raises(ValueError, match="multiple of 20"):
-        Settings(chunk_ms=333)
+@pytest.mark.parametrize("chunk_ms", [20, 500, 2000])
+def test_chunk_size_must_match_model_inference_unit(chunk_ms):
+    with pytest.raises(ValueError, match="must be 1000"):
+        Settings(chunk_ms=chunk_ms)

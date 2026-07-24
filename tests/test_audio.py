@@ -1,18 +1,18 @@
-"""Unit tests for capture, VAD gating, echo guard, resampling and playback."""
+"""Unit tests for capture, VAD gating, resampling and playback."""
 
-import threading
 import time
 
 import numpy as np
 
 from yrobot.audio import (
+    AUDIO_STARTUP_CONFIG,
     FRAME_SAMPLES,
-    EchoGuard,
     Microphone,
     Speaker,
     StreamResampler,
     UplinkGain,
     VoiceDetector,
+    apply_audio_startup_config,
 )
 
 
@@ -39,6 +39,28 @@ class FakeMedia:
 
     def clear_player(self):
         self.cleared += 1
+
+
+def test_duplex_audio_profile_uses_verified_sdk_config():
+    class ConfigurableAudio:
+        def __init__(self):
+            self.calls = []
+
+        def apply_audio_config(self, config, *, verify, write_settle_seconds):
+            self.calls.append((config, verify, write_settle_seconds))
+            return True
+
+    media = FakeMedia()
+    media.audio = ConfigurableAudio()
+
+    assert apply_audio_startup_config(media, write_settle_seconds=0) is True
+    assert media.audio.calls == [(AUDIO_STARTUP_CONFIG, True, 0)]
+
+
+def test_duplex_audio_profile_is_best_effort_without_sdk_api():
+    media = FakeMedia()
+    media.audio = object()
+    assert apply_audio_startup_config(media) is False
 
 
 def test_microphone_reframes_arbitrary_stereo_blocks():
@@ -86,16 +108,6 @@ def test_voice_detector_frozen_floor_keeps_barge_sensitivity():
     assert voiced is True  # without the freeze the floor would gate this out
 
 
-def test_echo_guard_decay_is_slow_and_bounded():
-    guard = EchoGuard()
-    for _ in range(500):  # 10 s of quiet playback frames: ~1 dB of decay
-        guard.observe(mic_db=-80.0, playout_db=-10.0)
-    assert guard.offset_db > EchoGuard.OFFSET_INIT_DB - 1.5
-    for _ in range(10_000):  # minutes of quiet: clamped at the floor
-        guard.observe(mic_db=-80.0, playout_db=-10.0)
-    assert guard.offset_db == EchoGuard.OFFSET_MIN_DB
-
-
 def test_uplink_gain_boosts_quiet_speech_not_noise():
     agc = UplinkGain()
     speech = np.full(8000, 0.03, np.float32)  # −30 dB: typical XVF capture
@@ -134,34 +146,6 @@ def test_uplink_gain_releases_in_playback_without_confirmed_user():
     assert 1.0 < agc.gain < boosted
 
 
-def test_echo_guard_passes_when_nothing_played():
-    assert EchoGuard().observe(mic_db=-40.0, playout_db=-120.0) is True
-
-
-def test_echo_guard_blocks_predicted_residual():
-    # leakage ratio -25 dB sits below the -18 dB initial prediction
-    assert EchoGuard().observe(mic_db=-35.0, playout_db=-10.0) is False
-
-
-def test_echo_guard_learns_leakage_from_false_triggers():
-    guard = EchoGuard()
-    # An onset transient (ratio -9 dB) pierces the initial prediction…
-    assert guard.observe(mic_db=-19.0, playout_db=-10.0) is True
-    # …a few verified false ducks teach it until the transient is gated…
-    for _ in range(4):
-        guard.penalize()
-    assert guard.observe(mic_db=-19.0, playout_db=-10.0) is False
-    # …while a user talking over the robot still passes.
-    assert guard.observe(mic_db=-5.0, playout_db=-10.0) is True
-
-
-def test_echo_guard_penalize_bumps_prediction():
-    guard = EchoGuard()
-    before = guard.offset_db
-    guard.penalize()
-    assert guard.offset_db == before + EchoGuard.FALSE_TRIGGER_BUMP_DB
-
-
 def test_resampler_ratio_and_continuity():
     rs = StreamResampler(24_000, 16_000)
     ramp = np.linspace(0.0, 1.0, 24_000, dtype=np.float32)
@@ -196,63 +180,14 @@ def test_speaker_plays_after_boundary_and_flushes_on_interrupt():
         speaker.join(timeout=2)
 
 
-def test_speaker_duck_then_resume_is_lossless():
+def test_speaker_reports_hard_interrupt_clear_completion():
     media = FakeMedia()
     speaker = Speaker(media)
     speaker.start()
     try:
-        speaker.play(speaker.epoch, np.ones(24_000, np.float32))  # 1 s turn
-        deadline = time.monotonic() + 2.0
-        while not media.pushed and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert media.pushed
-
-        speaker.hold()
-        assert speaker.hold_completed_at() is None
-        deadline = time.monotonic() + 2.0
-        while media.cleared == 0 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert media.cleared == 1
-        assert speaker.hold_completed_at() is not None
-        assert speaker.audible()  # the held turn is still live
-        assert speaker.playout_db(time.monotonic()) > -120.0  # envelope kept
-
-        speaker.release_hold()
-        deadline = time.monotonic() + 2.0
-        while len(media.pushed) < 2 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert len(media.pushed) == 2
-        assert 0 < len(media.pushed[1]) <= 16_000  # the un-played tail only
-    finally:
-        speaker.close()
-        speaker.join(timeout=2)
-
-
-def test_speaker_reports_clear_completion_not_request_time():
-    clear_allowed = threading.Event()
-
-    class BlockingClearMedia(FakeMedia):
-        def clear_player(self):
-            clear_allowed.wait(2.0)
-            super().clear_player()
-
-    media = BlockingClearMedia()
-    speaker = Speaker(media)
-    speaker.start()
-    try:
-        speaker.hold()
-        time.sleep(0.08)
-        assert speaker.hold_completed_at() is None
-        clear_allowed.set()
-        deadline = time.monotonic() + 2.0
-        while speaker.hold_completed_at() is None and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert speaker.hold_completed_at() is not None
-
         epoch = speaker.interrupt()
         assert speaker.wait_flushed(epoch, timeout=2.0)
-        assert media.cleared >= 2
+        assert media.cleared == 1
     finally:
-        clear_allowed.set()
         speaker.close()
         speaker.join(timeout=2)
