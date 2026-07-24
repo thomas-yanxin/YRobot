@@ -122,6 +122,33 @@ class VoiceDetector:
         return now - self._last_voiced_at < self.HANGOVER_S
 
 
+class UplinkGain:
+    """Automatic gain control for microphone audio sent to the model.
+
+    XVF3800 capture runs far below full scale (user speech measures
+    −33…−22 dB RMS on hardware, further suppressed during double-talk),
+    and the duplex model's server-side listen decisions miss faint audio —
+    after a barge-in it would resume its monologue as if the user had said
+    nothing. Gain moves smoothly toward TARGET_RMS/rms, is only updated on
+    speech-level chunks (never pumping up room noise), and is capped.
+    """
+
+    TARGET_RMS = 0.12
+    MAX_GAIN = 8.0
+    SPEECH_FLOOR_RMS = 0.006
+    SMOOTHING = 0.3
+
+    def __init__(self) -> None:
+        self.gain = 1.0
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        rms = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
+        if rms > self.SPEECH_FLOOR_RMS:
+            target = min(self.MAX_GAIN, max(1.0, self.TARGET_RMS / rms))
+            self.gain += (target - self.gain) * self.SMOOTHING
+        return np.clip(chunk * self.gain, -1.0, 1.0).astype(np.float32)
+
+
 class EchoGuard:
     """Rejects barge candidates that are the robot hearing its own speech.
 

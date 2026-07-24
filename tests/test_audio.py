@@ -10,6 +10,7 @@ from yrobot.audio import (
     Microphone,
     Speaker,
     StreamResampler,
+    UplinkGain,
     VoiceDetector,
 )
 
@@ -92,6 +93,28 @@ def test_echo_guard_decay_is_slow_and_bounded():
     for _ in range(10_000):  # minutes of quiet: clamped at the floor
         guard.observe(mic_db=-80.0, playout_db=-10.0)
     assert guard.offset_db == EchoGuard.OFFSET_MIN_DB
+
+
+def test_uplink_gain_boosts_quiet_speech_not_noise():
+    agc = UplinkGain()
+    speech = np.full(8000, 0.03, np.float32)  # −30 dB: typical XVF capture
+    first = agc.process(speech)
+    assert float(np.abs(first).max()) > 0.03  # boosting immediately
+    frozen = agc.gain
+    agc.process(np.full(8000, 0.001, np.float32))  # room noise: no update
+    assert agc.gain == frozen
+    for _ in range(20):
+        out = agc.process(speech)
+    assert abs(float(np.sqrt(np.mean(np.square(out)))) - UplinkGain.TARGET_RMS) < 0.02
+
+
+def test_uplink_gain_never_amplifies_loud_speech_or_clips():
+    agc = UplinkGain()
+    loud = np.full(8000, 0.5, np.float32)
+    for _ in range(10):
+        out = agc.process(loud)
+    assert agc.gain == 1.0
+    assert float(np.abs(out).max()) <= 1.0
 
 
 def test_echo_guard_passes_when_nothing_played():

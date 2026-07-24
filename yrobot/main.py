@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from reachy_mini.apps.app import ReachyMiniApp
 from reachy_mini.reachy_mini import ReachyMini
 
-from yrobot.audio import EchoGuard, Microphone, Speaker, VoiceDetector
+from yrobot.audio import EchoGuard, Microphone, Speaker, UplinkGain, VoiceDetector
 from yrobot.config import Settings
 from yrobot.motion import IDLE, LISTEN, SPEAK, Choreographer, SoundCompass
 from yrobot.realtime import Delta, RealtimeClient, ThinkFilter
@@ -47,6 +47,8 @@ class Conversation:
         self._gate = TurnGate()
         self._verifier = DuckVerifier()
         self._echo_guard = EchoGuard()
+        self._agc = UplinkGain()
+        self._barge_flush = False
         self._choreo = Choreographer(mini)
         self._compass = SoundCompass(
             mini.media,
@@ -106,11 +108,17 @@ class Conversation:
         kv_est = 0.0
         while not self._stop.is_set() and not self._session_dead.is_set():
             frames.extend(self._process_mic())
-            if len(frames) < chunk_frames:
+            # A confirmed barge flushes the partial chunk immediately so
+            # force_listen and the user's onset reach the model without
+            # waiting out the chunk boundary.
+            urgent = self._barge_flush and frames
+            if len(frames) < chunk_frames and not urgent:
                 continue
+            self._barge_flush = False
             now = time.monotonic()
-            chunk = np.concatenate(frames[:chunk_frames])
-            del frames[:chunk_frames]
+            n = min(len(frames), chunk_frames)
+            chunk = self._agc.process(np.concatenate(frames[:n]))
+            del frames[:n]
             jpeg = self._next_frame(now)
             try:
                 client.send_chunk(chunk, jpeg, self._gate.chunk_force_listen(now))
@@ -143,6 +151,7 @@ class Conversation:
             if verdict == "commit":
                 self._gate.user_frame(True, True, now)
                 self._speaker.interrupt()
+                self._barge_flush = True
                 logger.info("barge-in confirmed: turn discarded")
                 now += FRAME_S
                 continue
