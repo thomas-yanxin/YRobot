@@ -117,31 +117,43 @@ class DuckVerifier:
     SETTLE_S = 0.6
     WINDOW_S = 1.0  # total, measured from the duck request
     CONFIRM_FRAMES = 3  # 60 ms of voice after the settle
+    EARLY_RESUME_S = 0.2  # pure post-settle silence: don't wait out the window
+    COOLDOWN_S = 1.2  # the resumed tail echoes too — block back-to-back ducks
 
     def __init__(self) -> None:
         self.active = False
         self._settle_end = 0.0
         self._deadline = 0.0
         self._streak = 0
+        self._voice_seen = False
+        self._cooldown_until = 0.0
+
+    def ready(self, now: float) -> bool:
+        """Whether a new duck may start (not verifying, not cooling down)."""
+        return not self.active and now >= self._cooldown_until
 
     def start(self, now: float) -> None:
         self.active = True
         self._settle_end = now + self.SETTLE_S
         self._deadline = now + self.WINDOW_S
         self._streak = 0
+        self._voice_seen = False
 
     def frame(self, voiced: bool, now: float) -> str | None:
         """Feed one VAD frame; returns "commit", "resume" or None."""
         if not self.active or now < self._settle_end:
             return None
         if voiced:
+            self._voice_seen = True
             self._streak += 1
             if self._streak >= self.CONFIRM_FRAMES:
                 self.active = False
                 return "commit"
         else:
             self._streak = 0
-        if now >= self._deadline:
+        early = not self._voice_seen and now >= self._settle_end + self.EARLY_RESUME_S
+        if early or now >= self._deadline:
             self.active = False
+            self._cooldown_until = now + self.COOLDOWN_S
             return "resume"
         return None

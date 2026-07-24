@@ -154,7 +154,8 @@ class Conversation:
                 real_voice = self._echo_guard.observe(
                     self._detector.last_db, self._speaker.playout_db(now)
                 )
-                if voiced and real_voice and not self._speaker.holding:
+                may_duck = self._verifier.ready(now) and not self._speaker.holding
+                if voiced and real_voice and may_duck:
                     self._speaker.hold()  # silent within one tick, lossless
                     self._verifier.start(now)
                     logger.info("barge candidate: playback ducked for verify")

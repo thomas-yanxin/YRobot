@@ -90,19 +90,31 @@ def test_latch_expires_at_cap():
     assert not gate.latched
 
 
-def test_verifier_ignores_in_flight_echo_during_settle():
+def test_verifier_early_resumes_on_pure_silence_with_cooldown():
     v = DuckVerifier()
     v.start(0.0)
     t = 0.0
     while t < DuckVerifier.SETTLE_S:  # muted speech still in the air
         assert v.frame(True, t) is None
         t += 0.02
-    # echo dies with the speaker silent: quiet until the window closes
-    while t < DuckVerifier.WINDOW_S:
-        assert v.frame(False, t) is None
+    verdict = None
+    while verdict is None:  # echo died with the speaker: resume early
+        verdict = v.frame(False, t)
         t += 0.02
+    assert verdict == "resume"
+    assert t <= DuckVerifier.SETTLE_S + DuckVerifier.EARLY_RESUME_S + 0.05
+    assert not v.ready(t)  # the resumed tail echoes: cooldown blocks a re-duck
+    assert v.ready(t + DuckVerifier.COOLDOWN_S)
+
+
+def test_verifier_waits_out_the_window_after_a_voice_blip():
+    v = DuckVerifier()
+    v.start(0.0)
+    t = DuckVerifier.SETTLE_S + 0.01
+    v.frame(True, t)  # a single blip forfeits the early resume
+    assert v.frame(False, t + 0.02) is None
+    assert v.frame(False, DuckVerifier.SETTLE_S + DuckVerifier.EARLY_RESUME_S + 0.1) is None
     assert v.frame(False, DuckVerifier.WINDOW_S) == "resume"
-    assert not v.active
 
 
 def test_verifier_commits_on_sustained_post_settle_voice():

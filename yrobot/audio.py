@@ -126,11 +126,15 @@ class EchoGuard:
     """
 
     MARGIN_DB = 3.0
-    OFFSET_INIT_DB = -18.0
+    # Hardware 2026-07-24: onset transients reached a ratio of ≥ -14 dB and
+    # a -18 dB start plus 1 dB bumps let three false ducks through before
+    # converging — start closer and learn in bigger steps. Frame learning
+    # only happens on *blocked* frames, so the bump is the main teacher.
+    OFFSET_INIT_DB = -14.0
     OFFSET_RISE_DB = 0.5
     OFFSET_DECAY_DB = 0.01
     OFFSET_MIN_DB = -50.0
-    FALSE_TRIGGER_BUMP_DB = 1.0
+    FALSE_TRIGGER_BUMP_DB = 2.5
 
     def __init__(self) -> None:
         self.offset_db = self.OFFSET_INIT_DB
@@ -217,7 +221,7 @@ class Speaker(threading.Thread):
         self._epoch = 0
         self._flush_to = 0
         self._resampler = StreamResampler()
-        self._preroll = 0.4
+        self._preroll = 0.3
         self._pending: deque[np.ndarray] = deque()
         self._buffered_s = 0.0
         self._pushed_until = 0.0  # monotonic time the device runs dry
