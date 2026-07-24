@@ -129,9 +129,13 @@ class GazeSpring:
         self.vel = 0.0
         self.target = 0.0
 
-    def step(self, dt: float) -> float:
+    def step(self, dt: float, freeze: float = 0.0) -> float:
+        """Advance by ``dt``. ``freeze`` in [0, 1] brakes smoothly to a stop
+        (drive scaled out, velocity exponentially damped) — used while the
+        robot holds still, so mid-turn motion never stops with a jerk."""
         acc = self._omega * self._omega * (self.target - self.pos) - 2 * self._omega * self.vel
-        self.vel = max(-self._max_vel, min(self._max_vel, self.vel + acc * dt))
+        self.vel += acc * (1.0 - freeze) * dt
+        self.vel = max(-self._max_vel, min(self._max_vel, self.vel)) * (1.0 - 0.6 * freeze)
         self.pos += self.vel * dt
         return self.pos
 
@@ -160,6 +164,8 @@ class Choreographer(threading.Thread):
         self._saccade = (0.0, 0.0)
         self._next_saccade_at = 0.0
         self._antennas = np.array([self.ANTENNA_NEUTRAL, self.ANTENNA_NEUTRAL])
+        self._still_until = 0.0
+        self._still = 0.0  # blended stillness scalar, continuous like modes
 
     # -- thread-safe inputs -------------------------------------------------
 
@@ -172,6 +178,19 @@ class Choreographer(threading.Thread):
 
     def current_yaw(self) -> float:
         return self._gaze.pos
+
+    def hold_still(self, until: float) -> None:
+        """Freeze all self-motion until ``until`` (monotonic time).
+
+        Called when a barge candidate ducks playback: with the speaker
+        already silent, the motors are the robot's only remaining noise
+        source, and a servo knock during the verify window reads as voice.
+        Doubling as body language — the robot visibly stops to listen.
+        """
+        self._still_until = max(self._still_until, until)
+
+    def release_still(self) -> None:
+        self._still_until = 0.0
 
     def close(self) -> None:
         self._halt.set()
@@ -213,27 +232,33 @@ class Choreographer(threading.Thread):
     def _compose(self, t: float, now: float, dt: float) -> tuple[np.ndarray, list[float]]:
         idle, listen, speak = (self._mode_blend[m] for m in (IDLE, LISTEN, SPEAK))
 
+        # Stillness ramps in ~150 ms; scales every oscillator so a freeze
+        # is silent (no servo noise) yet never steps.
+        still_goal = 1.0 if now < self._still_until else 0.0
+        self._still += max(-dt / 0.15, min(dt / 0.15, still_goal - self._still))
+        calm = 1.0 - 0.95 * self._still
+
         # Breathing — quieter while listening (attention), fuller when idle.
-        amp = 0.5 + 0.5 * idle
+        amp = (0.5 + 0.5 * idle) * calm
         z = 0.004 * amp * math.sin(2 * math.pi * 0.16 * t)
         pitch = 0.020 * amp * math.sin(2 * math.pi * 0.16 * t + 0.9)
         roll = 0.012 * amp * math.sin(2 * math.pi * 0.11 * t + 2.1)
 
         # Idle saccades: brief held glances, walked back when engaged.
-        if now >= self._next_saccade_at:
+        if now >= self._next_saccade_at and self._still < 0.1:
             self._next_saccade_at = now + random.uniform(4.0, 9.0)
             self._saccade = (random.uniform(-0.25, 0.25), random.uniform(-0.10, 0.12))
-        sac_yaw, sac_pitch = (s * idle for s in self._saccade)
+        sac_yaw, sac_pitch = (s * idle * calm for s in self._saccade)
 
         # Conversation posture.
         pitch += 0.06 * listen - 0.03 * speak  # lean in to listen, lift to speak
-        roll += 0.05 * listen * math.sin(2 * math.pi * 0.05 * t)  # slow curious tilt
+        roll += 0.05 * listen * calm * math.sin(2 * math.pi * 0.05 * t)  # curious tilt
 
         # After long silence, drift the gaze home.
         if now - self._last_voice_at > 45.0:
             self._gaze.target *= 0.999
 
-        yaw = self._gaze.step(dt) + sac_yaw
+        yaw = self._gaze.step(dt, freeze=self._still) + sac_yaw
         pose = rpy_pose(roll, pitch + sac_pitch, yaw, z)
 
         # Antennas: perked and still when listening, dancing when speaking.
@@ -242,5 +267,6 @@ class Choreographer(threading.Thread):
             2 * math.pi * 1.4 * t
         )
         goal = np.array([target + sway, target - sway])
+        goal = goal * (1.0 - self._still) + self._antennas * self._still  # freeze in place
         self._antennas += (goal - self._antennas) * min(dt / 0.12, 1.0)
         return pose, [float(self._antennas[0]), float(self._antennas[1])]

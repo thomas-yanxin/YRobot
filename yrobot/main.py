@@ -149,8 +149,9 @@ class Conversation:
             if verdict == "resume":
                 self._echo_guard.penalize()
                 self._speaker.release_hold()
+                self._choreo.release_still()
                 logger.info(
-                    "barge candidate was our own echo: resumed (leakage %.1f dB)",
+                    "barge candidate was not a voice: resumed (leakage %.1f dB)",
                     self._echo_guard.offset_db,
                 )
             if not self._verifier.active and self._speaker.sounding(now):
@@ -168,6 +169,10 @@ class Conversation:
                 may_duck = self._verifier.ready(now) and not self._speaker.holding
                 if voiced and (real_voice or insistent) and may_duck:
                     self._speaker.hold()  # silent within one tick, lossless
+                    # Motors are the last self-noise source: a servo knock
+                    # during the verify window reads as voice, so the robot
+                    # freezes to listen (which also looks right).
+                    self._choreo.hold_still(now + DuckVerifier.WINDOW_S + 0.3)
                     self._verifier.start(now)
                     logger.info(
                         "barge candidate (%s): ducked (mic %.1f dB, playout %.1f dB)",

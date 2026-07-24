@@ -46,3 +46,17 @@ def test_gaze_spring_velocity_clamp():
     spring.target = 100.0
     spring.step(0.02)
     assert abs(spring.vel) <= 1.0
+
+
+def test_gaze_spring_freeze_brakes_smoothly_and_holds():
+    spring = GazeSpring()
+    spring.target = 2.0
+    for _ in range(10):
+        spring.step(0.02)  # mid-turn
+    assert abs(spring.vel) > 0.1
+    for _ in range(25):
+        spring.step(0.02, freeze=1.0)  # 0.5 s of hold-still
+    assert abs(spring.vel) < 0.01  # braked, no jerk, no drive
+    held = spring.pos
+    spring.step(0.02, freeze=1.0)
+    assert abs(spring.pos - held) < 1e-3
