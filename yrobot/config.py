@@ -56,7 +56,6 @@ class Settings:
     local_frame_ms: int = 20
     mic_channel: int = 0
     playback_preroll_ms: int = 0
-    playback_buffers: int = 2
 
     vad_mode: int = 2
     vad_min_rms: float = 0.006
@@ -69,7 +68,7 @@ class Settings:
     camera_width: int = 640
     camera_jpeg_quality: int = 72
     camera_fps: float = 1.0
-    vision_send_interval_seconds: float = 2.0
+    vision_send_interval_seconds: float = 1.0
     doa_hz: float = 10.0
     doa_hold_seconds: float = 3.0
     motion_hz: float = 50.0
@@ -90,7 +89,6 @@ class Settings:
             session_seconds=_float("YROBOT_SESSION_SECONDS", 285.0),
             reconnect_max_seconds=_float("YROBOT_RECONNECT_MAX_SECONDS", 8.0),
             playback_preroll_ms=_int("YROBOT_PLAYBACK_PREROLL_MS", 0),
-            playback_buffers=_int("YROBOT_PLAYBACK_BUFFERS", 2),
             mic_channel=_int("YROBOT_MIC_CHANNEL", 0),
             vad_mode=_int("YROBOT_VAD_MODE", 2),
             vad_min_rms=_float("YROBOT_VAD_MIN_RMS", 0.006),
@@ -104,7 +102,7 @@ class Settings:
             camera_fps=_float("YROBOT_CAMERA_FPS", 1.0),
             vision_send_interval_seconds=_float(
                 "YROBOT_VISION_SEND_INTERVAL_SECONDS",
-                2.0,
+                1.0,
             ),
             doa_hz=_float("YROBOT_DOA_HZ", 10.0),
             doa_hold_seconds=_float("YROBOT_DOA_HOLD_SECONDS", 3.0),
@@ -134,8 +132,6 @@ class Settings:
             raise ValueError("YROBOT_MIC_CHANNEL must be -1 (mean), 0, or 1")
         if not 0 <= self.playback_preroll_ms <= 250:
             raise ValueError("YROBOT_PLAYBACK_PREROLL_MS must be 0..250")
-        if not 1 <= self.playback_buffers <= 8:
-            raise ValueError("YROBOT_PLAYBACK_BUFFERS must be 1..8")
         if self.vad_mode not in range(4):
             raise ValueError("YROBOT_VAD_MODE must be 0..3")
         if (

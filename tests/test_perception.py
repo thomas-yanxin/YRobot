@@ -152,6 +152,22 @@ def test_daemon_doa_source_reuses_session_and_parses_endpoint_payload() -> None:
         source.read()
 
 
+def test_daemon_doa_recovery_probe_uses_non_usb_status_endpoint() -> None:
+    session = _Session([{"state": "running"}])
+    source = DaemonDoASource(
+        "http://localhost:8000/api/state/doa",
+        timeout_seconds=0.2,
+        session=session,
+    )
+
+    source.probe_ready()
+
+    assert session.requests == [
+        ("http://localhost:8000/api/daemon/status", 0.2),
+    ]
+    source.close()
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -187,6 +203,7 @@ def test_doa_worker_skips_self_playback_then_wakes_for_near_end_speech() -> None
             self.closed = True
 
     near_end_speech = threading.Event()
+    wake = threading.Event()
     source = Source()
     tracker = DoATracker()
     worker = DoAWorker(
@@ -196,10 +213,13 @@ def test_doa_worker_skips_self_playback_then_wakes_for_near_end_speech() -> None
         head_pose=lambda: np.eye(4),
         playback_active=lambda: True,
         hz=20,
+        idle_hz=0.2,
+        wake_event=wake,
     )
     worker.start()
     assert not source.polled.wait(0.15)
     near_end_speech.set()
+    wake.set()
     assert source.polled.wait(0.2)
     assert worker.stop()
     assert source.closed
@@ -318,6 +338,7 @@ def test_doa_worker_active_cadence_is_anchored_to_request_start() -> None:
         playback_active=lambda: False,
         hz=10,
         slow_request_seconds=1.0,
+        max_usb_duty_cycle=1.0,
     )
 
     worker.start()
@@ -414,20 +435,23 @@ def test_doa_worker_treats_daemon_null_as_unavailable(
     assert "DoA polling recovered after 1 failure(s)" in caplog.messages
 
 
-def test_doa_worker_read_timeout_opens_circuit_for_this_run(
+def test_doa_worker_read_timeout_opens_recoverable_circuit(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class Source:
         def __init__(self) -> None:
             self.calls = 0
-            self.closed = threading.Event()
+            self.recovery_probe = threading.Event()
+            self.closed = False
 
         def read(self) -> tuple[float, bool]:
             self.calls += 1
+            if self.calls >= 2:
+                self.recovery_probe.set()
             raise requests.exceptions.ReadTimeout("USB control transfer stalled")
 
         def close(self) -> None:
-            self.closed.set()
+            self.closed = True
 
     caplog.set_level(logging.INFO)
     source = Source()
@@ -437,31 +461,79 @@ def test_doa_worker_read_timeout_opens_circuit_for_this_run(
         lambda: False,
         head_pose=lambda: np.eye(4),
         playback_active=lambda: False,
+        circuit_initial_seconds=0.01,
+        circuit_max_seconds=0.01,
     )
 
     worker.start()
-    assert source.closed.wait(1.0)
+    assert source.recovery_probe.wait(1.0)
+    assert worker.is_alive
     assert worker.stop()
 
-    assert source.calls == 1
-    assert any("DoA disabled for this run" in message for message in caplog.messages)
+    assert source.closed
+    assert source.calls >= 2
+    assert any("recovery probe" in message for message in caplog.messages)
+    assert not any("disabled for this run" in message for message in caplog.messages)
 
 
-def test_doa_worker_repeated_slow_reads_open_circuit(
+def test_doa_timeout_waits_for_daemon_health_before_usb_recovery_probe() -> None:
+    class Source:
+        def __init__(self) -> None:
+            self.read_calls = 0
+            self.health_calls = 0
+            self.recovered = threading.Event()
+
+        def read(self) -> tuple[float, bool]:
+            self.read_calls += 1
+            if self.read_calls == 1:
+                raise requests.exceptions.ReadTimeout("USB still blocked")
+            self.recovered.set()
+            return (math.pi / 2, True)
+
+        def probe_ready(self) -> None:
+            self.health_calls += 1
+            if self.health_calls < 3:
+                raise requests.exceptions.ReadTimeout("daemon loop blocked")
+
+        def close(self) -> None: ...
+
+    source = Source()
+    worker = DoAWorker(
+        source,
+        DoATracker(),
+        lambda: True,
+        head_pose=lambda: np.eye(4),
+        playback_active=lambda: False,
+        circuit_initial_seconds=0.01,
+        circuit_max_seconds=0.02,
+    )
+
+    worker.start()
+    assert source.recovered.wait(1.0)
+    assert worker.stop()
+
+    assert source.health_calls == 3
+    assert source.read_calls == 2
+
+
+def test_doa_worker_repeated_slow_reads_open_recoverable_circuit(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class Source:
         def __init__(self) -> None:
             self.calls = 0
-            self.closed = threading.Event()
+            self.recovery_probe = threading.Event()
+            self.closed = False
 
         def read(self) -> tuple[float, bool]:
             self.calls += 1
+            if self.calls >= 4:
+                self.recovery_probe.set()
             time.sleep(0.005)
             return (math.pi / 2, True)
 
         def close(self) -> None:
-            self.closed.set()
+            self.closed = True
 
     caplog.set_level(logging.INFO)
     source = Source()
@@ -475,14 +547,102 @@ def test_doa_worker_repeated_slow_reads_open_circuit(
         idle_hz=20,
         slow_request_seconds=0.001,
         slow_request_limit=3,
+        max_usb_duty_cycle=1.0,
+        circuit_initial_seconds=0.01,
+        circuit_max_seconds=0.01,
     )
 
     worker.start()
-    assert source.closed.wait(1.0)
+    assert source.recovery_probe.wait(1.0)
+    assert worker.is_alive
     assert worker.stop()
 
-    assert source.calls == 3
-    assert any("consecutive daemon reads exceeded" in message for message in caplog.messages)
+    assert source.closed
+    assert source.calls >= 4
+    assert any("DoA circuit open" in message for message in caplog.messages)
+
+
+def test_doa_worker_accepts_normal_50_ms_class_reads_without_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Source:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.ready = threading.Event()
+
+        def read(self) -> tuple[float, bool]:
+            self.calls += 1
+            time.sleep(0.035)
+            if self.calls >= 2:
+                self.ready.set()
+            return (math.pi / 2, True)
+
+        def close(self) -> None: ...
+
+    caplog.set_level(logging.WARNING)
+    source = Source()
+    worker = DoAWorker(
+        source,
+        DoATracker(),
+        lambda: True,
+        head_pose=lambda: np.eye(4),
+        playback_active=lambda: False,
+        hz=10,
+        slow_request_seconds=0.08,
+        max_usb_duty_cycle=1.0,
+    )
+
+    worker.start()
+    assert source.ready.wait(1.0)
+    assert worker.stop()
+
+    assert not any("exceeded" in message or "circuit" in message for message in caplog.messages)
+
+
+def test_vad_wakeups_cannot_bypass_usb_duty_limit() -> None:
+    class Source:
+        def __init__(self) -> None:
+            self.started_at: list[float] = []
+            self.ready = threading.Event()
+
+        def read(self) -> tuple[float, bool]:
+            self.started_at.append(time.monotonic())
+            time.sleep(0.035)
+            if len(self.started_at) >= 3:
+                self.ready.set()
+            return (math.pi / 2, True)
+
+        def close(self) -> None: ...
+
+    wake = threading.Event()
+    source = Source()
+    worker = DoAWorker(
+        source,
+        DoATracker(),
+        lambda: True,
+        head_pose=lambda: np.eye(4),
+        playback_active=lambda: False,
+        hz=20,
+        idle_hz=20,
+        max_usb_duty_cycle=0.2,
+        wake_event=wake,
+    )
+    stop_waking = threading.Event()
+
+    def spam_wakeups() -> None:
+        while not stop_waking.wait(0.01):
+            wake.set()
+
+    spammer = threading.Thread(target=spam_wakeups)
+    spammer.start()
+    worker.start()
+    assert source.ready.wait(1.0)
+    assert worker.stop()
+    stop_waking.set()
+    spammer.join(1.0)
+
+    intervals = np.diff(source.started_at[:3])
+    assert np.all(intervals >= 0.15)
 
 
 def test_doa_worker_stop_before_start_closes_source() -> None:

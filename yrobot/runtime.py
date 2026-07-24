@@ -20,6 +20,7 @@ from .audio import (
     PlaybackPacket,
     VoiceDecision,
 )
+from .audio_config import apply_audio_startup_config
 from .config import Settings
 from .motion import MotionController
 from .perception import CameraWorker, DoATracker, DoAWorker, LatestFrame
@@ -73,11 +74,15 @@ class _NearEndState:
         self._lock = threading.Lock()
         self._current = False
         self._updated_at = 0.0
+        self.wake_event = threading.Event()
 
     def update(self, decision: VoiceDecision) -> None:
         with self._lock:
-            self._current = decision.current_near_end
+            rising = decision.near_end and not self._current
+            self._current = decision.near_end
             self._updated_at = decision.timestamp
+        if rising:
+            self.wake_event.set()
 
     def current(self) -> bool:
         with self._lock:
@@ -141,7 +146,6 @@ class YRobotRuntime:
             echo,
             input_sample_rate=settings.output_sample_rate,
             output_sample_rate=settings.input_sample_rate,
-            max_queue=settings.playback_buffers,
             preroll_ms=settings.playback_preroll_ms,
         )
         detector = NearEndDetector(
@@ -176,6 +180,7 @@ class YRobotRuntime:
             head_pose=mini.get_current_head_pose,
             playback_active=self.playback.echo_guard_active,
             hz=settings.doa_hz,
+            wake_event=self.near_end.wake_event,
         )
         self.client = RealtimeClient(
             settings,
@@ -222,6 +227,7 @@ class YRobotRuntime:
             playing_started = True
             media.start_recording()
             recording_started = True
+            apply_audio_startup_config(self.mini, logger=log)
             self.playback.start()
             playback_started = True
             self.motion.start()
@@ -296,13 +302,14 @@ class YRobotRuntime:
         samples: np.ndarray,
         epoch: int,
         response_id: str | None,
+        received_at: float,
     ) -> None:
         self.playback.enqueue(
             PlaybackPacket(
                 epoch,
                 samples,
                 response_id,
-                received_at=time.monotonic(),
+                received_at=received_at,
             )
         )
 
@@ -343,12 +350,14 @@ class YRobotRuntime:
             self.stop_event.set()
             return
         log.info(
-            "Barge-in: VAD attack=%d ms, player flush=%.1f ms, total≈%.1f ms (rms=%.4f echo=%.2f)",
+            "Barge-in: VAD attack=%d ms, player flush=%.1f ms, total≈%.1f ms "
+            "(rms=%.4f echo=%.2f fit=%.2f)",
             self.settings.barge_attack_ms,
             (flush_ms := (time.perf_counter() - started) * 1_000),
             self.settings.barge_attack_ms + flush_ms,
             decision.rms,
             decision.echo_similarity,
+            decision.echo_fit,
         )
 
     def _daemon_doa_url(self) -> str:

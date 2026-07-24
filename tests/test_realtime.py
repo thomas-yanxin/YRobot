@@ -14,7 +14,7 @@ import pytest
 from websockets.asyncio.server import serve
 
 from yrobot.config import Settings
-from yrobot.protocol import Phase, ProtocolState, session_init
+from yrobot.protocol import Phase, ProtocolState, input_append, session_close, session_init
 from yrobot.realtime import RealtimeClient, RealtimeError, _Lifecycle
 from yrobot.state import InteractionPhase, TurnCoordinator
 
@@ -23,7 +23,7 @@ def make_client(
     coordinator: TurnCoordinator | None = None,
     *,
     latest_frame: Callable[[], bytes | None] = lambda: None,
-    on_audio: Callable[[np.ndarray, int, str | None], None] = lambda *_: None,
+    on_audio: Callable[[np.ndarray, int, str | None, float], None] = lambda *_: None,
     on_listen: Callable[[int], None] = lambda *_: None,
 ) -> RealtimeClient:
     return RealtimeClient(
@@ -56,6 +56,71 @@ class FakeWebSocket:
         self.sent.append(json.loads(raw))
         if self.on_send:
             self.on_send()
+
+
+def test_slow_uplink_write_does_not_block_downlink_lifecycle() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingWebSocket:
+            async def send(self, _raw: str) -> None:
+                started.set()
+                await release.wait()
+
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.STREAMING, "sess-1")
+        sending = asyncio.create_task(
+            lifecycle.send(
+                BlockingWebSocket(),  # type: ignore[arg-type]
+                input_append(np.zeros(16_000, dtype="<f4").tobytes()),
+            )
+        )
+        await started.wait()
+        raw = json.dumps(
+            {
+                "type": "response.output.delta",
+                "kind": "text",
+                "session_id": "sess-1",
+                "response_id": "resp-1",
+                "text": "still receiving",
+                "metrics": {},
+            }
+        )
+        received = await asyncio.wait_for(lifecycle.receive(raw), timeout=0.05)
+        assert received.text == "still receiving"  # type: ignore[union-attr]
+        release.set()
+        await sending
+
+    asyncio.run(scenario())
+
+
+def test_session_close_is_skipped_when_server_closes_during_send_race() -> None:
+    async def scenario() -> None:
+        websocket = FakeWebSocket()
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        async with lifecycle.send_lock:
+            closing = asyncio.create_task(
+                lifecycle.try_send_close(  # type: ignore[arg-type]
+                    websocket,
+                    session_close("test"),
+                )
+            )
+            await asyncio.sleep(0)
+            await lifecycle.receive(
+                json.dumps(
+                    {
+                        "type": "session.closed",
+                        "session_id": "sess-1",
+                        "reason": "server_stop",
+                    }
+                )
+            )
+        assert await closing is False
+        assert websocket.sent == []
+
+    asyncio.run(scenario())
 
 
 def test_uplink_is_exact_and_latest_only() -> None:
@@ -732,7 +797,7 @@ def test_interrupted_audio_is_dropped_until_listen_boundary() -> None:
     listens: list[int] = []
     client = make_client(
         turns,
-        on_audio=lambda _samples, epoch, response: received.append((epoch, response)),
+        on_audio=lambda _samples, epoch, response, _received_at: received.append((epoch, response)),
         on_listen=listens.append,
     )
     lifecycle = _Lifecycle()
@@ -751,6 +816,59 @@ def test_interrupted_audio_is_dropped_until_listen_boundary() -> None:
     assert listens == [interrupted_epoch]
     assert turns.snapshot().phase is InteractionPhase.SPEAKING
     assert lifecycle.state.phase is Phase.CLOSED
+
+
+def test_audio_callback_receives_raw_timestamp_before_packet_diagnostics() -> None:
+    encoded = base64.b64encode(np.zeros(240, dtype="<f4").tobytes()).decode("ascii")
+    websocket = FakeWebSocket(
+        [
+            {
+                "type": "response.output.delta",
+                "kind": "audio",
+                "session_id": "sess-1",
+                "response_id": "resp-1",
+                "audio": encoded,
+                "metrics": {},
+            },
+            {
+                "type": "session.closed",
+                "session_id": "sess-1",
+                "reason": "test",
+            },
+        ]
+    )
+    turns = TurnCoordinator()
+    turns.new_session()
+    order: list[str] = []
+    timestamps: list[float] = []
+
+    def on_audio(
+        _samples: np.ndarray,
+        _epoch: int,
+        _response: str | None,
+        received_at: float,
+    ) -> None:
+        timestamps.append(received_at)
+        order.append("audio")
+
+    client = make_client(turns, on_audio=on_audio)
+    client._log_first_response_packet = lambda *_args, **_kwargs: order.append(  # type: ignore[method-assign]
+        "diagnostics"
+    )
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.STREAMING, "sess-1")
+    before = time.monotonic()
+
+    asyncio.run(
+        client._receiver(  # type: ignore[arg-type]
+            websocket,
+            lifecycle,
+            asyncio.Event(),
+        )
+    )
+
+    assert order == ["audio", "diagnostics"]
+    assert before <= timestamps[0] <= time.monotonic()
 
 
 def test_response_first_packet_logs_once_per_kind_with_server_segments(
@@ -817,7 +935,7 @@ def test_response_first_packet_logs_once_per_kind_with_server_segments(
     client._last_input_send_at = time.monotonic() - 0.1
     lifecycle = _Lifecycle()
     lifecycle.state = ProtocolState(Phase.STREAMING, "sess-1")
-    caplog.set_level(logging.INFO, logger="yrobot.realtime")
+    caplog.set_level(logging.DEBUG, logger="yrobot.realtime")
 
     asyncio.run(
         client._receiver(  # type: ignore[arg-type]
@@ -830,22 +948,32 @@ def test_response_first_packet_logs_once_per_kind_with_server_segments(
     first_packet_logs = [
         record.getMessage()
         for record in caplog.records
-        if record.name == "yrobot.realtime" and record.getMessage().startswith("MiniCPM-o first ")
+        if record.name == "yrobot.realtime"
+        and record.getMessage().startswith("MiniCPM-o first ")
+        and " packet:" in record.getMessage()
     ]
     assert len(first_packet_logs) == 2
     assert first_packet_logs[0].startswith("MiniCPM-o first text packet:")
-    assert "latest_input_send_age_ms=" in first_packet_logs[0]
-    assert "server_send_ts=" in first_packet_logs[0]
-    assert "server_to_client_excess_ms=" in first_packet_logs[0]
+    assert "time_since_last_uplink_ms=" in first_packet_logs[0]
+    assert "downlink_excess_ms=" in first_packet_logs[0]
     assert "server_prefill_ms=12.5" in first_packet_logs[0]
     assert "server_wall_clock_ms=31" in first_packet_logs[0]
     assert "server_prefill_ms=999" not in " ".join(first_packet_logs)
     assert first_packet_logs[1].startswith("MiniCPM-o first audio packet:")
-    assert "server_vision_slices=1" in first_packet_logs[1]
-    assert "server_kv_cache_length=384" in first_packet_logs[1]
-    assert "server_kv_cache_length=999" not in " ".join(first_packet_logs)
     assert "e2e" not in " ".join(first_packet_logs).lower()
-    assert client.metrics.latest_input_to_first_audio.count == 1
+    diagnostic_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "yrobot.realtime"
+        and record.getMessage().startswith("MiniCPM-o first ")
+        and "diagnostics:" in record.getMessage()
+    ]
+    assert "server_send_ts=" in diagnostic_logs[0]
+    assert "server_to_client_excess_ms=" in diagnostic_logs[0]
+    assert "server_vision_slices=1" in diagnostic_logs[1]
+    assert "server_kv_cache_length=384" in diagnostic_logs[1]
+    assert "server_kv_cache_length=999" not in " ".join(diagnostic_logs)
+    assert client.metrics.first_audio_downlink_excess.count == 1
 
 
 def test_real_websockets15_full_lifecycle() -> None:
@@ -923,7 +1051,9 @@ def test_real_websockets15_full_lifecycle() -> None:
                 Settings(realtime_url=(f"ws://127.0.0.1:{port}/v1/realtime?mode=video")),
                 turns,
                 latest_frame=lambda: None,
-                on_audio=lambda _samples, _epoch, response: received_audio.append(str(response)),
+                on_audio=lambda _samples, _epoch, response, _received_at: received_audio.append(
+                    str(response)
+                ),
                 on_listen=lambda _epoch: stop.set(),
                 on_text=lambda *_: None,
                 on_session=on_session,
