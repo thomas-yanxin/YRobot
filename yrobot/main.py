@@ -152,6 +152,7 @@ class Conversation:
                 self._gate.user_frame(True, True, now)
                 self._speaker.interrupt()
                 self._barge_flush = True
+                self._set_tracking(self._s.head_tracking_weight)
                 logger.info("barge-in confirmed: turn discarded")
                 now += FRAME_S
                 continue
@@ -159,6 +160,7 @@ class Conversation:
                 self._echo_guard.penalize()
                 self._speaker.release_hold()
                 self._choreo.release_still()
+                self._set_tracking(self._s.head_tracking_weight)
                 logger.info(
                     "barge candidate was not a voice: resumed (leakage %.1f dB)",
                     self._echo_guard.offset_db,
@@ -168,20 +170,25 @@ class Conversation:
                 playout = self._speaker.playout_db(now)
                 real_voice = self._echo_guard.observe(mic_db, playout)
                 self._voiced_run = self._voiced_run + 1 if voiced else 0
-                # Fallback: 350 ms of sustained voice within 6 dB of the
+                # Fallback: 350 ms of sustained voice within 10 dB of the
                 # predicted echo also earns a duck — the verify stage is
                 # the arbiter, and hardware double-talk suppression leaves
                 # real interrupting speech hovering around the gate.
                 insistent = (
-                    self._voiced_run >= 17 and mic_db >= playout + self._echo_guard.offset_db - 6.0
+                    self._voiced_run >= 17 and mic_db >= playout + self._echo_guard.offset_db - 10.0
                 )
+                # 100 ms of continuous voice for a candidate: impulsive
+                # servo knocks confirm the 60 ms VAD streak but rarely this.
+                strong = self._detector.streak >= 5
                 may_duck = self._verifier.ready(now) and not self._speaker.holding
-                if voiced and (real_voice or insistent) and may_duck:
+                if strong and (real_voice or insistent) and may_duck:
                     self._speaker.hold()  # silent within one tick, lossless
-                    # Motors are the last self-noise source: a servo knock
-                    # during the verify window reads as voice, so the robot
-                    # freezes to listen (which also looks right).
+                    # Silence every self-noise source for the verify: our
+                    # motion freezes and daemon-side face tracking pauses —
+                    # its servo noise confirmed false barges (hardware log
+                    # 2026-07-24, 7th run: mic -19.7 dB during a hold).
                     self._choreo.hold_still(now + DuckVerifier.WINDOW_S + 0.3)
+                    self._set_tracking(0.0)
                     self._verifier.start(now)
                     logger.info(
                         "barge candidate (%s): ducked (mic %.1f dB, playout %.1f dB)",
@@ -215,6 +222,15 @@ class Conversation:
         else:
             self._choreo.set_mode(IDLE)
         return out
+
+    def _set_tracking(self, weight: float) -> None:
+        """Adjust daemon face tracking; weight 0 pauses it cheaply."""
+        if self._s.head_tracking_weight <= 0:
+            return
+        try:
+            self._mini.start_head_tracking(weight=weight)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("head tracking adjust failed: %s", exc)
 
     def _next_frame(self, now: float) -> bytes | None:
         """Attach a camera frame unless only the robot is talking.

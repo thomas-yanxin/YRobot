@@ -84,6 +84,12 @@ class VoiceDetector:
         self._last_voiced_at = -1e9
         self.last_db = SILENT_DB
 
+    @property
+    def streak(self) -> int:
+        """Consecutive raw-voiced frames — longer streaks reject impulsive
+        servo knocks (the head motors sit centimetres from the mic array)."""
+        return self._streak
+
     def process(self, frame: np.ndarray, now: float, floor_frozen: bool = False) -> bool:
         """Feed one 20 ms mono float32 frame; returns confirmed ``voiced``.
 
