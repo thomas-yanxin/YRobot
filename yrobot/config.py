@@ -100,7 +100,9 @@ class Settings:
         if requested_mode is not None:
             requested_mode = requested_mode.strip().lower()
         else:
-            raw_query = parse_qs(urlsplit(raw_url if "://" in raw_url else f"wss://{raw_url}").query)
+            raw_query = parse_qs(
+                urlsplit(raw_url if "://" in raw_url else f"wss://{raw_url}").query
+            )
             # Keep an explicit URL mode authoritative. For legacy deployments
             # that only set SEND_VIDEO, select the protocol mode that can
             # actually carry frames.

@@ -487,9 +487,11 @@ class Conversation:
         over = elapsed > self._s.session_budget_s or kv_est > self._s.kv_budget_tokens
         if not over:
             return False
-        quiet = not self._gate_latched() and not self._speaker.audible(
-            now
-        ) and not self._confirmed_user_active(now)
+        quiet = (
+            not self._gate_latched()
+            and not self._speaker.audible(now)
+            and not self._confirmed_user_active(now)
+        )
         return quiet or elapsed > self._s.session_budget_s + 30.0
 
     # -- gateway callbacks (yrobot-recv thread) -------------------------------

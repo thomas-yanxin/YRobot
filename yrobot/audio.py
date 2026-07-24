@@ -307,11 +307,7 @@ class Speaker(threading.Thread):
     def audible(self, now: float | None = None) -> bool:
         """A turn is live somewhere between queue and device."""
         now = time.monotonic() if now is None else now
-        return (
-            self._pushed_until - now > 0.02
-            or self._buffered_s > 0
-            or not self._q.empty()
-        )
+        return self._pushed_until - now > 0.02 or self._buffered_s > 0 or not self._q.empty()
 
     def sounding(self, now: float | None = None) -> bool:
         """Whether audio is physically scheduled on the SDK player."""

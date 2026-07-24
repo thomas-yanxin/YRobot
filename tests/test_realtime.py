@@ -18,10 +18,7 @@ def test_normalize_url_variants():
         normalize_url("wss://minicpmo45.modelbest.cn/v1/realtime?mode=video")
         == "wss://minicpmo45.modelbest.cn/v1/realtime?mode=video"
     )
-    assert (
-        normalize_url("wss://minicpmo45.modelbest.cn/v1/realtime?mode=video", "audio")
-        == full
-    )
+    assert normalize_url("wss://minicpmo45.modelbest.cn/v1/realtime?mode=video", "audio") == full
     assert (
         normalize_url("wss://10.0.16.184:8006") == "wss://10.0.16.184:8006/v1/realtime?mode=audio"
     )

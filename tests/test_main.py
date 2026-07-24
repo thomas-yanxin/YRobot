@@ -233,9 +233,7 @@ def test_interrupted_multi_branch_output_waits_for_force_listen_boundary():
     with conversation._turn_lock:
         assert conversation._gate.chunk_force_listen(started + 0.08)
         conversation._gate.force_sent("forced-input", started + 0.08)
-    conversation._on_delta(
-        Delta(kind="listen", input_id="wrong-input", received_at=started + 0.09)
-    )
+    conversation._on_delta(Delta(kind="listen", input_id="wrong-input", received_at=started + 0.09))
     assert conversation._gate.latched
     conversation._on_delta(
         Delta(kind="listen", input_id="forced-input", received_at=started + 0.10)
