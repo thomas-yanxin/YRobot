@@ -45,6 +45,19 @@ class PlaybackPacket:
 
 
 @dataclass(frozen=True, slots=True)
+class PlaybackGate:
+    """Atomic playback state used to arm barge-in on real speaker output."""
+
+    generation: int = 0
+    epoch: int | None = None
+    response_id: str | None = None
+    armed: bool = False
+    armed_at: float | None = None
+    audible: bool = False
+    echo_guard_active: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class VoiceDecision:
     timestamp: float
     rms: float
@@ -59,6 +72,13 @@ class VoiceDecision:
     echo_fit: float
     echo_like: bool
     barge_in: bool
+    barge_armed: bool
+    barge_candidate_frames: int
+    fresh_attack_ms: int
+    playback_epoch: int | None
+    playback_response_id: str | None
+    playback_generation: int
+    speaker_started_age_ms: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +415,7 @@ class NearEndDetector:
         if not 0 < echo_correlation < 1:
             raise ValueError("echo correlation must be between zero and one")
         self.sample_rate = sample_rate
+        self._frame_ms = frame_ms
         self.frame_samples = sample_rate * frame_ms // 1_000
         self._vad = vad or WebRtcSpeechDetector(vad_mode)
         self._echo = echo_reference
@@ -407,12 +428,18 @@ class NearEndDetector:
         self._debounce = barge_debounce_ms / 1_000
         self._hold = near_end_hold_ms / 1_000
         self._noise_floor = max(1e-5, min_rms / noise_ratio)
-        self._candidate_frames = 0
+        self._near_candidate_frames = 0
+        self._barge_candidate_frames = 0
         self._last_near = -math.inf
         self._last_barge = -math.inf
         self._barge_latched = False
+        self._playback_generation: int | None = None
+        self._barge_armed = False
+        self._barge_observed_at: float | None = None
+        self._blocked_capture_id: int | None = None
         self._echo_frames: deque[FloatAudio] = deque(maxlen=self._attack_frames)
         self._guard_candidates: deque[bool] = deque(maxlen=self._attack_frames)
+        self._barge_candidates: deque[bool] = deque(maxlen=self._attack_frames)
 
     def process(
         self,
@@ -420,6 +447,8 @@ class NearEndDetector:
         *,
         output_active: bool,
         echo_guard_active: bool | None = None,
+        playback_gate: PlaybackGate | None = None,
+        capture_block_id: int | None = None,
         timestamp: float | None = None,
     ) -> VoiceDecision:
         data = _mono_float32(frame)
@@ -429,7 +458,44 @@ class NearEndDetector:
         rms = float(np.sqrt(np.mean(np.square(data, dtype=np.float64))))
         threshold = max(self._min_rms, self._noise_floor * self._noise_ratio)
         vad_speech = self._vad.is_speech(data, self.sample_rate)
-        guard_active = output_active if echo_guard_active is None else echo_guard_active
+        if playback_gate is None:
+            guard_active = output_active if echo_guard_active is None else echo_guard_active
+            gate = PlaybackGate(
+                generation=int(output_active),
+                armed=output_active,
+                audible=output_active,
+                echo_guard_active=guard_active,
+            )
+        else:
+            gate = playback_gate
+            output_active = gate.audible
+            guard_active = gate.echo_guard_active
+        legacy_gate = playback_gate is None
+
+        first_gate = self._playback_generation is None
+        generation_changed = self._playback_generation != gate.generation
+        armed_changed = self._barge_armed != gate.armed
+        if first_gate or generation_changed or armed_changed:
+            self._barge_candidate_frames = 0
+            self._barge_latched = False
+            self._barge_candidates.clear()
+            self._playback_generation = gate.generation
+            self._barge_armed = gate.armed
+            self._barge_observed_at = (
+                (now - self._frame_ms / 1_000 if legacy_gate else now) if gate.armed else None
+            )
+            # A block pulled while the first speaker push completed may still
+            # contain pre-playback microphone audio. Keep it for near-end/DoA,
+            # but never count it as fresh barge-in evidence.
+            self._blocked_capture_id = (
+                capture_block_id
+                if gate.armed and (first_gate or generation_changed or armed_changed)
+                else None
+            )
+            if generation_changed:
+                self._echo_frames.clear()
+                self._guard_candidates.clear()
+
         raw_candidate = vad_speech and rms >= threshold
         probe_ready = True
         if guard_active and self._echo is not None:
@@ -452,43 +518,73 @@ class NearEndDetector:
             if probe_ready and echo_like:
                 for index in range(len(self._guard_candidates)):
                     self._guard_candidates[index] = False
-                self._candidate_frames = 0
+                self._near_candidate_frames = 0
             elif probe_ready:
-                self._candidate_frames = 0
+                self._near_candidate_frames = 0
                 for is_candidate in reversed(self._guard_candidates):
                     if not is_candidate:
                         break
-                    self._candidate_frames += 1
+                    self._near_candidate_frames += 1
             elif raw_candidate:
-                self._candidate_frames += 1
+                self._near_candidate_frames += 1
             else:
-                self._candidate_frames = 0
+                self._near_candidate_frames = 0
         else:
             self._echo_frames.clear()
             self._guard_candidates.clear()
             similarity = 0.0
             echo_fit = 0.0
             echo_like = False
-            self._candidate_frames = self._candidate_frames + 1 if raw_candidate else 0
+            self._near_candidate_frames = self._near_candidate_frames + 1 if raw_candidate else 0
 
         candidate = raw_candidate and not echo_like and probe_ready
-        if not candidate:
+        if not raw_candidate or (probe_ready and echo_like) or not gate.armed:
             self._barge_latched = False
 
-        if candidate and self._candidate_frames >= self._near_frames:
+        if candidate and self._near_candidate_frames >= self._near_frames:
             self._last_near = now
         near_end = now - self._last_near <= self._hold
 
+        capture_blocked = (
+            capture_block_id is not None and capture_block_id == self._blocked_capture_id
+        )
+        if not gate.armed or capture_blocked:
+            self._barge_candidates.clear()
+            self._barge_candidate_frames = 0
+        else:
+            self._barge_candidates.append(raw_candidate)
+            if probe_ready and echo_like:
+                self._barge_candidates.clear()
+            self._barge_candidate_frames = 0
+            for is_candidate in reversed(self._barge_candidates):
+                if not is_candidate:
+                    break
+                self._barge_candidate_frames += 1
+
         barge_in = False
+        attack_seconds = self._attack_frames * self._frame_ms / 1_000
+        fresh_window_elapsed = (
+            self._barge_observed_at is not None
+            and now - self._barge_observed_at >= attack_seconds - 1e-9
+        )
         if (
-            output_active
-            and self._candidate_frames >= self._attack_frames
+            gate.armed
+            and not capture_blocked
+            and fresh_window_elapsed
+            and probe_ready
+            and raw_candidate
+            and not echo_like
+            and self._barge_candidate_frames >= self._attack_frames
             and not self._barge_latched
             and now - self._last_barge >= self._debounce
         ):
             barge_in = True
             self._barge_latched = True
             self._last_barge = now
+
+        speaker_started_age_ms = (
+            None if gate.armed_at is None else max(0.0, (now - gate.armed_at) * 1_000)
+        )
 
         if not vad_speech and not echo_like:
             alpha = 0.08 if rms < self._noise_floor else 0.02
@@ -508,15 +604,28 @@ class NearEndDetector:
             echo_fit=echo_fit,
             echo_like=echo_like,
             barge_in=barge_in,
+            barge_armed=gate.armed,
+            barge_candidate_frames=self._barge_candidate_frames,
+            fresh_attack_ms=self._barge_candidate_frames * self._frame_ms,
+            playback_epoch=gate.epoch,
+            playback_response_id=gate.response_id,
+            playback_generation=gate.generation,
+            speaker_started_age_ms=speaker_started_age_ms,
         )
 
     def reset(self) -> None:
-        self._candidate_frames = 0
+        self._near_candidate_frames = 0
+        self._barge_candidate_frames = 0
         self._last_near = -math.inf
         self._last_barge = -math.inf
         self._barge_latched = False
+        self._playback_generation = None
+        self._barge_armed = False
+        self._barge_observed_at = None
+        self._blocked_capture_id = None
         self._echo_frames.clear()
         self._guard_candidates.clear()
+        self._barge_candidates.clear()
 
 
 class PlaybackEngine:
@@ -572,6 +681,14 @@ class PlaybackEngine:
         self._playing_until = 0.0
         self._echo_guard_until = 0.0
         self._echo_tail_seconds = 0.18
+        self._gate_generation = 0
+        self._gate_key: tuple[int, int, str | None] | None = None
+        self._gate_epoch: int | None = None
+        self._gate_response_id: str | None = None
+        self._gate_armed = False
+        self._gate_armed_at: float | None = None
+        self._gate_close_when_silent = False
+        self._closed_stream_generation = 0
         self._enqueued = 0
         self._dropped = 0
         self._stale = 0
@@ -626,6 +743,14 @@ class PlaybackEngine:
 
         with self._condition:
             self._stream_generation += 1
+            closed_stream_generation = self._stream_generation
+        with self._activity_lock:
+            self._closed_stream_generation = closed_stream_generation
+            if self._gate_armed:
+                self._gate_close_when_silent = True
+                now = self._clock()
+                if now >= self._playing_until:
+                    self._disarm_gate_locked()
 
     def interrupt(self, epoch: int) -> bool:
         """Fence first, then serialize a hardware flush against every push."""
@@ -659,6 +784,7 @@ class PlaybackEngine:
                         self._echo_guard_until,
                         now + self._echo_tail_seconds,
                     )
+                self._disarm_gate_locked()
         return cleared
 
     def output_active(self) -> bool:
@@ -673,6 +799,63 @@ class PlaybackEngine:
                 self._playing_until,
                 self._echo_guard_until,
             )
+
+    def gate_snapshot(self) -> PlaybackGate:
+        """Return one atomic barge-in gate snapshot for a microphone block."""
+
+        with self._activity_lock:
+            now = self._clock()
+            self._close_gate_if_silent_locked(now)
+            return PlaybackGate(
+                generation=self._gate_generation,
+                epoch=self._gate_epoch,
+                response_id=self._gate_response_id,
+                armed=self._gate_armed,
+                armed_at=self._gate_armed_at,
+                audible=now < self._playing_until,
+                echo_guard_active=now
+                < max(
+                    self._playing_until,
+                    self._echo_guard_until,
+                ),
+            )
+
+    def gate_is_current(
+        self,
+        generation: int,
+        epoch: int,
+        response_id: str | None,
+    ) -> bool:
+        """Validate that a completed VAD decision still targets this playback."""
+
+        with self._activity_lock:
+            self._close_gate_if_silent_locked(self._clock())
+            return (
+                self._gate_armed
+                and self._gate_generation == generation
+                and self._gate_epoch == epoch
+                and self._gate_response_id == response_id
+            )
+
+    def commit_if_gate_current(
+        self,
+        generation: int,
+        epoch: int,
+        response_id: str | None,
+        commit: Callable[[bool], int | None],
+    ) -> int | None:
+        """Validate playback and commit its turn fence as one transaction."""
+
+        with self._activity_lock:
+            self._close_gate_if_silent_locked(self._clock())
+            if (
+                not self._gate_armed
+                or self._gate_generation != generation
+                or self._gate_epoch != epoch
+                or self._gate_response_id != response_id
+            ):
+                return None
+            return commit(self._clock() < self._playing_until)
 
     def stats(self) -> PlaybackStats:
         with self._condition:
@@ -718,6 +901,7 @@ class PlaybackEngine:
             now = self._clock()
             self._playing_until = now
             self._echo_guard_until = now
+            self._disarm_gate_locked()
         return stopped
 
     def _run(self) -> None:
@@ -796,6 +980,21 @@ class PlaybackEngine:
             self._echo.append_played(output)
             with self._activity_lock:
                 now = self._clock()
+                push_key = (
+                    packet.epoch,
+                    packet.stream_generation,
+                    packet.response_id,
+                )
+                if push_key != self._gate_key:
+                    self._gate_generation += 1
+                    self._gate_key = push_key
+                    self._gate_epoch = packet.epoch
+                    self._gate_response_id = packet.response_id
+                    self._gate_armed = True
+                    self._gate_armed_at = now
+                    self._gate_close_when_silent = (
+                        packet.stream_generation < self._closed_stream_generation
+                    )
                 self._playing_until = max(now, self._playing_until) + (
                     output.size / self._output_rate
                 )
@@ -867,6 +1066,18 @@ class PlaybackEngine:
         with self._condition:
             self._errors += 1
 
+    def _disarm_gate_locked(self) -> None:
+        self._gate_key = None
+        self._gate_epoch = None
+        self._gate_response_id = None
+        self._gate_armed = False
+        self._gate_armed_at = None
+        self._gate_close_when_silent = False
+
+    def _close_gate_if_silent_locked(self, now: float) -> None:
+        if self._gate_armed and self._gate_close_when_silent and now >= self._playing_until:
+            self._disarm_gate_locked()
+
 
 class AudioCaptureWorker:
     """Own the non-blocking microphone pull loop, but never media lifecycle."""
@@ -879,6 +1090,7 @@ class AudioCaptureWorker:
         detector: NearEndDetector,
         output_active: Callable[[], bool],
         echo_guard_active: Callable[[], bool] | None = None,
+        playback_gate: Callable[[], PlaybackGate] | None = None,
         on_unit: Callable[[AudioUnit], None],
         on_voice: Callable[[VoiceDecision], None] | None = None,
         on_barge_in: Callable[[VoiceDecision], None] | None = None,
@@ -892,6 +1104,7 @@ class AudioCaptureWorker:
         self._detector = detector
         self._output_active = output_active
         self._echo_guard_active = echo_guard_active or output_active
+        self._playback_gate = playback_gate
         self._on_unit = on_unit
         self._on_voice = on_voice
         self._on_barge_in = on_barge_in
@@ -900,6 +1113,9 @@ class AudioCaptureWorker:
         self._logger = logger or logging.getLogger(__name__)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._capture_block_id = 0
+        self._capture_gate_signature: tuple[int, bool] | None = None
+        self._detector_gate_signature: tuple[int, bool] | None = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -931,19 +1147,54 @@ class AudioCaptureWorker:
                 self._logger.exception("discarding malformed microphone samples")
                 continue
             now = time.monotonic()
+            self._capture_block_id += 1
+            try:
+                if self._playback_gate is None:
+                    audible = self._output_active()
+                    gate = PlaybackGate(
+                        generation=int(audible),
+                        armed=audible,
+                        audible=audible,
+                        echo_guard_active=self._echo_guard_active(),
+                    )
+                else:
+                    gate = self._playback_gate()
+            except Exception:
+                self._logger.exception("failed to read playback gate; disarming barge-in")
+                gate = PlaybackGate()
+            gate_signature = (gate.generation, gate.armed)
+            capture_transition = self._capture_gate_signature != gate_signature
+            armed_capture_transition = gate.armed and capture_transition
+            if armed_capture_transition:
+                # No partial frame pulled before the first speaker push may
+                # become fresh evidence when completed by the next block.
+                self._frames.reset()
+            frames = self._frames.push(mono)
+            self._capture_gate_signature = gate_signature
+            detector_transition = self._detector_gate_signature != gate_signature
+            armed_detector_transition = gate.armed and detector_transition and bool(frames)
+            if armed_capture_transition or armed_detector_transition:
+                # The detector deliberately rejects this entire crossing
+                # block. Drop its sub-frame tail instead of relabeling it
+                # with the next capture block.
+                self._frames.reset()
             # Evaluate barge-in before publishing a unit completed by the same
             # capture block, so its wire event can already carry force_listen.
-            for frame in self._frames.push(mono):
+            for frame in frames:
                 decision = self._detector.process(
                     frame,
-                    output_active=self._output_active(),
-                    echo_guard_active=self._echo_guard_active(),
+                    output_active=gate.audible,
+                    echo_guard_active=gate.echo_guard_active,
+                    playback_gate=gate,
+                    capture_block_id=self._capture_block_id,
                     timestamp=now,
                 )
                 if self._on_voice is not None:
                     self._call(self._on_voice, decision, "voice-state callback failed")
                 if decision.barge_in and self._on_barge_in is not None:
                     self._call(self._on_barge_in, decision, "barge-in callback failed")
+            if frames:
+                self._detector_gate_signature = gate_signature
             for unit in self._units.push(mono, captured_at=now):
                 self._call(self._on_unit, unit, "audio unit callback failed")
 

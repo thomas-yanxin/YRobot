@@ -25,7 +25,7 @@ from .config import Settings
 from .motion import MotionController
 from .perception import CameraWorker, DoATracker, DoAWorker, LatestFrame
 from .realtime import RealtimeClient
-from .state import InteractionPhase, TurnCoordinator
+from .state import TurnCoordinator
 
 log = logging.getLogger(__name__)
 
@@ -195,8 +195,9 @@ class YRobotRuntime:
             media,
             channel=settings.mic_channel,
             detector=detector,
-            output_active=self._model_output_active,
+            output_active=self.playback.output_active,
             echo_guard_active=self.playback.echo_guard_active,
+            playback_gate=self.playback.gate_snapshot,
             on_unit=self._on_unit,
             on_voice=self.near_end.update,
             on_barge_in=self._on_barge_in,
@@ -340,8 +341,25 @@ class YRobotRuntime:
 
     def _on_barge_in(self, decision: VoiceDecision) -> None:
         started = time.perf_counter()
-        epoch = self.coordinator.interrupt()
+        if decision.playback_epoch is None or decision.speaker_started_age_ms is None:
+            log.debug("ignored unarmed barge-in decision")
+            return
+        epoch = self.playback.commit_if_gate_current(
+            decision.playback_generation,
+            decision.playback_epoch,
+            decision.playback_response_id,
+            lambda playback_audible: self.coordinator.interrupt_if_epoch(
+                decision.playback_epoch,
+                playback_audible=playback_audible,
+            ),
+        )
         if epoch is None:
+            log.debug(
+                "ignored stale barge-in decision: epoch=%d response_id=%s generation=%d",
+                decision.playback_epoch,
+                decision.playback_response_id or "-",
+                decision.playback_generation,
+            )
             return
         self._barge_count += 1
         self.transcript.clear()
@@ -350,14 +368,17 @@ class YRobotRuntime:
             self.stop_event.set()
             return
         log.info(
-            "Barge-in: VAD attack=%d ms, player flush=%.1f ms, total≈%.1f ms "
-            "(rms=%.4f echo=%.2f fit=%.2f)",
-            self.settings.barge_attack_ms,
+            "Barge-in: fresh_vad=%d ms, speaker_age=%.1f ms, "
+            "player_flush=%.1f ms, stop_after_fresh_speech≈%.1f ms "
+            "(rms=%.4f echo=%.2f fit=%.2f generation=%d)",
+            decision.fresh_attack_ms,
+            decision.speaker_started_age_ms,
             (flush_ms := (time.perf_counter() - started) * 1_000),
-            self.settings.barge_attack_ms + flush_ms,
+            decision.fresh_attack_ms + flush_ms,
             decision.rms,
             decision.echo_similarity,
             decision.echo_fit,
+            decision.playback_generation,
         )
 
     def _daemon_doa_url(self) -> str:
@@ -367,9 +388,3 @@ class YRobotRuntime:
         if not isinstance(host, str) or not host or not isinstance(port, int):
             raise RuntimeError("Reachy Mini daemon address is unavailable")
         return f"http://{host}:{port}/api/state/doa"
-
-    def _model_output_active(self) -> bool:
-        return (
-            self.playback.output_active()
-            or self.coordinator.snapshot().phase is InteractionPhase.SPEAKING
-        )
