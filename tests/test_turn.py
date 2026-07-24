@@ -1,10 +1,9 @@
 """Unit tests for the barge-in turn gate and duck verifier — the reliability core."""
 
 from yrobot.turn import (
-    CLEAN_LISTENS,
-    FORCE_ACK_S,
     LATCH_CAP_S,
     QUIET_S,
+    USER_TAIL_S,
     DuckVerifier,
     TurnGate,
 )
@@ -34,24 +33,24 @@ def test_stale_audio_discarded_while_latched():
     assert gate.model_audio(2.0) is False
 
 
-def test_response_identity_releases_new_reply_but_never_old_tail():
+def test_different_response_ids_do_not_release_stale_monologue():
     gate = TurnGate()
-    assert gate.model_audio(0.5, "response-old") is True
     assert barge(gate, 1.0) is True
-    assert gate.model_audio(1.1, "response-old") is False
-    assert gate.model_audio(1.2, "response-new") is True
+    assert gate.chunk_force_listen(1.05) is True
+    for i in range(20):
+        assert gate.model_audio(1.10 + i * 0.02, f"branch-{i}") is False
+    assert gate.latched
+
+
+def test_text_branches_are_suppressed_until_safe_listen_boundary():
+    gate = TurnGate()
+    assert barge(gate, 1.0) is True
+    gate.chunk_force_listen(1.05)
+    assert gate.model_text(1.10, "branch-old-1") is False
+    assert gate.model_text(1.12, "branch-old-2") is False
+    assert gate.model_listen(1.20) is True
+    assert gate.model_text(1.0 + QUIET_S + 0.01, "branch-new") is True
     assert not gate.latched
-    # The old identity stays invalid even after the new response starts.
-    assert gate.model_audio(1.3, "response-old") is False
-
-
-def test_text_identity_tracks_response_before_first_audio():
-    gate = TurnGate()
-    assert gate.model_text(0.5, "response-old") is True
-    assert barge(gate, 1.0) is True
-    assert gate.model_text(1.1, "response-old") is False
-    assert gate.model_text(1.2, "response-new") is True
-    assert gate.model_audio(1.3, "response-new") is True
 
 
 def test_force_listen_rides_chunks_while_user_talks():
@@ -63,51 +62,60 @@ def test_force_listen_rides_chunks_while_user_talks():
     assert gate.chunk_force_listen(1.5) is True
 
 
-def test_reforce_when_stale_audio_arrives_after_quiet():
+def test_new_user_speech_invalidates_an_earlier_listen_ack():
     gate = TurnGate()
     barge(gate, 1.0)
-    gate.chunk_force_listen(1.1)
-    gate.model_audio(1.1 + QUIET_S + 1.1)  # quiet + past re-force spacing
-    assert gate.chunk_force_listen(1.1 + QUIET_S + 1.2) is True
+    assert gate.chunk_force_listen(1.05) is True
+    assert gate.model_listen(1.10) is True
+    gate.user_frame(True, False, 1.20)
+    assert gate.model_audio(1.20 + QUIET_S + 0.1, "different-branch") is False
+    assert gate.chunk_force_listen(1.20 + QUIET_S + 0.11) is True
 
 
-def test_unlatch_needs_two_clean_listens():
+def test_final_user_tail_requires_force_then_listen_before_new_answer():
     gate = TurnGate()
     barge(gate, 1.0)
-    t = 1.0 + FORCE_ACK_S + QUIET_S + 0.1
-    gate.model_listen(t)
-    assert gate.latched  # one clean listen is the resume signature's prefix
-    gate.model_listen(t + 1.0)
+    assert gate.chunk_force_listen(1.05) is True
+    assert gate.model_listen(1.10) is True
+    assert gate.should_flush_user_tail(1.0 + USER_TAIL_S + 0.01) is True
+    assert gate.model_audio(1.0 + QUIET_S + 0.01, "stale") is False
+    assert gate.chunk_force_listen(1.0 + QUIET_S + 0.02) is True
+    assert gate.model_listen(1.0 + QUIET_S + 0.05) is True
+    assert gate.model_audio(1.0 + QUIET_S + 0.10, "new-answer") is True
     assert not gate.latched
 
 
-def test_model_audio_resets_clean_streak():
+def test_listen_before_first_force_is_not_a_boundary():
     gate = TurnGate()
     barge(gate, 1.0)
-    t = 1.0 + FORCE_ACK_S + QUIET_S + 0.1
-    gate.model_listen(t)
-    gate.model_audio(t + 0.2)  # the resumed monologue arrives
-    gate.model_listen(t + 1.0)
-    assert gate.latched  # streak restarted
-    gate.model_listen(t + 2.0)
-    assert not gate.latched
-    assert CLEAN_LISTENS == 2
-
-
-def test_listen_near_our_force_is_only_an_ack():
-    gate = TurnGate()
-    barge(gate, 1.0)
-    gate.chunk_force_listen(5.0)
-    gate.model_listen(5.0 + FORCE_ACK_S - 0.1)  # ack, not genuine
-    gate.model_listen(5.0 + FORCE_ACK_S - 0.05)
+    assert gate.model_listen(1.01) is False
+    assert gate.model_audio(1.0 + QUIET_S + 0.1) is False
     assert gate.latched
 
 
-def test_latch_expires_at_cap():
+def test_user_tail_flushes_only_once_per_voice_run():
     gate = TurnGate()
     barge(gate, 1.0)
-    assert gate.model_audio(1.0 + LATCH_CAP_S + 0.1) is True  # cap released it
+    assert gate.should_flush_user_tail(1.0 + USER_TAIL_S + 0.01) is True
+    assert gate.should_flush_user_tail(1.0 + USER_TAIL_S + 0.02) is False
+    gate.user_frame(True, False, 2.0)
+    assert gate.should_flush_user_tail(2.0 + USER_TAIL_S + 0.01) is True
+
+
+def test_cancel_barge_releases_false_duck():
+    gate = TurnGate()
+    barge(gate, 1.0)
+    gate.cancel_barge()
+    assert gate.model_audio(1.1, "old-branch") is True
     assert not gate.latched
+
+
+def test_latch_timeout_never_auto_releases_stale_output():
+    gate = TurnGate()
+    barge(gate, 1.0)
+    assert gate.timed_out(1.0 + LATCH_CAP_S + 0.1)
+    assert gate.model_audio(1.0 + LATCH_CAP_S + 0.2, "stale") is False
+    assert gate.latched
 
 
 def test_verifier_early_resumes_on_pure_silence_with_cooldown():

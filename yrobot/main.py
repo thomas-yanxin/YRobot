@@ -172,7 +172,7 @@ class Conversation:
         self._voiced_run = 0
         self._server_kv: float | None = None
         self._video_kv_est = 0.0
-        self._seen_audio_responses: set[str] = set()
+        self._last_logged_audio_onset_at = -1e9
 
     def run(self) -> None:
         self._mini.media.start_recording()
@@ -203,7 +203,7 @@ class Conversation:
         self._captions = ThinkFilter()
         self._server_kv = None
         self._video_kv_est = 0.0
-        self._seen_audio_responses.clear()
+        self._last_logged_audio_onset_at = -1e9
         with self._turn_lock:
             self._gate = TurnGate()
         client = RealtimeClient(self._s, on_delta=self._on_delta, on_closed=self._on_closed)
@@ -264,13 +264,20 @@ class Conversation:
                     logger.warning("microphone loop gap %.0f ms", capture_gap * 1000)
                     last_gap_log = poll_at
                 frames.extend(self._process_mic())
-                # A confirmed barge flushes the partial chunk immediately so
-                # force_listen and the user's onset do not wait for 500 ms.
-                urgent = self._barge_flush and frames
+                now = time.monotonic()
+                with self._turn_lock:
+                    tail_flush = bool(frames) and self._gate.should_flush_user_tail(now)
+                    timed_out = self._gate.timed_out(now)
+                    urgent = bool(frames) and (self._barge_flush or tail_flush)
+                    if urgent:
+                        self._barge_flush = False
+                if timed_out:
+                    logger.error("barge-in boundary timed out; reconnecting instead of replaying")
+                    return
+                # Candidate onset and the final user tail both bypass the
+                # normal 500 ms boundary.
                 if len(frames) < chunk_frames and not urgent:
                     continue
-                self._barge_flush = False
-                now = time.monotonic()
                 n = min(len(frames), chunk_frames)
                 raw_chunk = np.concatenate(frames[:n])
                 del frames[:n]
@@ -329,6 +336,12 @@ class Conversation:
                 self._session_dead.set()
                 return
             send_ms = (time.monotonic() - started) * 1000
+            if packet.force_listen:
+                logger.info(
+                    "force_listen sent: %.0f ms queue age, %.0f ms websocket",
+                    queue_ms,
+                    send_ms,
+                )
             if jpeg is not None:
                 self._video_kv_est += KV_PER_FRAME
             if send_ms > 300 or queue_ms > 150:
@@ -374,9 +387,10 @@ class Conversation:
         """Read mic frames; run VAD, barge-in and posture per 20 ms frame.
 
         Barge-in is two-staged: a voiced frame that beats the echo guard's
-        residual prediction only ducks playback; ``DuckVerifier`` then
-        listens with the speaker silent and either commits the destructive
-        flush or resumes the held audio (false trigger → the guard learns).
+        residual prediction immediately ducks playback, forces the model to
+        listen and suppresses its old output. ``DuckVerifier`` then listens
+        with the speaker silent and either commits the destructive flush or
+        resumes held audio (false trigger → the guard learns).
         """
         out = self._mic.read_frames()
         # A device read may return several frames. Approximate their capture
@@ -398,6 +412,9 @@ class Conversation:
                 continue
             if verdict == "resume":
                 self._echo_guard.penalize()
+                with self._turn_lock:
+                    self._gate.cancel_barge()
+                    self._barge_flush = False
                 self._speaker.release_hold()
                 self._choreo.release_still()
                 self._set_tracking(self._s.head_tracking_weight)
@@ -427,6 +444,7 @@ class Conversation:
                 strong = self._detector.streak >= 5
                 may_duck = self._verifier.ready(now) and not self._speaker.holding
                 if strong and (real_voice or insistent) and may_duck:
+                    self._begin_barge(now)
                     if self._verifier.in_retry(now):
                         # The user is insisting right after a wrong resume:
                         # two independent candidates within seconds — commit
@@ -469,7 +487,7 @@ class Conversation:
                 self._voiced_run = 0
             # Only post-echo speech drives DoA, camera activity and repeated
             # force-listen requests. Raw VAD may be our own loudspeaker.
-            if voiced and not robot_sounding:
+            if voiced and (not robot_sounding or self._verifier.active):
                 self._mark_user_voice(now)
                 with self._turn_lock:
                     self._gate.user_frame(True, False, now)
@@ -495,17 +513,31 @@ class Conversation:
         logger.debug("barge verifier armed %.0f ms after physical clear", (now - cleared_at) * 1000)
 
     def _commit_barge(self, now: float, source: str) -> None:
-        """Atomically invalidate the response and advance playback generation."""
+        """Destructively discard playback after provisional verification."""
         with self._turn_lock:
-            self._gate.user_frame(True, True, now)
+            if not self._gate.latched:
+                self._gate.user_frame(True, True, now)
+            else:
+                self._gate.user_frame(True, False, now)
             epoch = self._speaker.interrupt()
             self._captions = ThinkFilter()
+            self._barge_flush = True
         self._duck_pending = False
-        self._barge_flush = True
         self._mark_user_voice(now)
         self._choreo.release_still()
         self._set_tracking(self._s.head_tracking_weight)
         logger.info("barge-in confirmed (%s): turn discarded at epoch %d", source, epoch)
+
+    def _begin_barge(self, now: float) -> None:
+        """Immediately force listen and suppress output while voice is verified."""
+        with self._turn_lock:
+            started = self._gate.user_frame(True, True, now)
+            if started:
+                self._captions = ThinkFilter()
+                self._barge_flush = True
+        if started:
+            self._mark_user_voice(now)
+            logger.info("barge-in provisional: forcing listen immediately")
 
     def _mark_user_voice(self, now: float) -> None:
         if now - self._last_voice_at >= VoiceDetector.HANGOVER_S:
@@ -573,26 +605,42 @@ class Conversation:
             self._server_kv = float(kv)
         if delta.kind == "listen":
             with self._turn_lock:
-                self._gate.model_listen(now)
+                acknowledged = self._gate.model_listen(now)
                 if not self._gate.latched:
                     self._speaker.utterance_end()
+            if acknowledged:
+                logger.info("force_listen acknowledged: waiting for user turn end")
         elif delta.kind == "audio":
             with self._turn_lock:
-                if self._gate.model_audio(now, delta.response_id):
+                was_latched = self._gate.latched
+                allowed = self._gate.model_audio(now, delta.response_id)
+                if not allowed and self._gate.force_pending:
+                    self._barge_flush = True
+                if allowed:
                     epoch = self._speaker.epoch
                     self._speaker.play(epoch, delta.audio)
-                    if delta.response_id and delta.response_id not in self._seen_audio_responses:
-                        self._seen_audio_responses.add(delta.response_id)
-                        if now - self._last_user_onset_at < 30.0:
-                            logger.info(
-                                "response %s first audio %.0f ms after confirmed voice onset",
-                                delta.response_id,
-                                (now - self._last_user_onset_at) * 1000,
-                            )
+            if was_latched and allowed:
+                logger.info("barge-in boundary complete: accepting new model response")
+            if (
+                allowed
+                and self._last_user_onset_at > self._last_logged_audio_onset_at
+                and now - self._last_user_onset_at < 30.0
+            ):
+                self._last_logged_audio_onset_at = self._last_user_onset_at
+                logger.info(
+                    "first accepted audio %.0f ms after confirmed voice onset (response %s)",
+                    (now - self._last_user_onset_at) * 1000,
+                    delta.response_id or "unknown",
+                )
         elif delta.kind == "text":
             with self._turn_lock:
+                was_latched = self._gate.latched
                 allowed = self._gate.model_text(now, delta.response_id)
+                if not allowed and self._gate.force_pending:
+                    self._barge_flush = True
                 caption = self._captions.feed(delta.text).strip() if allowed else ""
+            if was_latched and allowed:
+                logger.info("barge-in boundary complete: accepting new model response")
             if caption:
                 logger.info("robot: %s", caption)
 

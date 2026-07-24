@@ -11,6 +11,7 @@ import yrobot.main as main_module
 from yrobot.config import Settings
 from yrobot.main import FRAME_MAX_DIM, Conversation, LatestCamera, UplinkPacket, shrink_jpeg
 from yrobot.realtime import Delta
+from yrobot.turn import QUIET_S
 
 
 def test_shrink_jpeg_downscales_to_model_vision_size():
@@ -111,27 +112,60 @@ def test_slow_websocket_sender_does_not_block_packet_producer():
         sender.join(timeout=2)
 
 
-def test_interrupted_response_audio_cannot_reenter_new_epoch():
+def _conversation_without_hardware() -> Conversation:
     class FakeMedia:
         pass
 
     class FakeMini:
         media = FakeMedia()
 
-    conversation = Conversation(
+    return Conversation(
         Settings(head_tracking_weight=0.0),
         FakeMini(),
         threading.Event(),
     )
+
+
+def test_barge_candidate_forces_listen_before_verifier_commit():
+    conversation = _conversation_without_hardware()
+    started = time.monotonic()
+
+    conversation._begin_barge(started)
+
+    assert conversation._barge_flush
+    assert conversation._gate.latched
+    with conversation._turn_lock:
+        assert conversation._gate.chunk_force_listen(started + 0.01)
+
+
+def test_interrupted_multi_branch_output_waits_for_force_listen_boundary():
+    conversation = _conversation_without_hardware()
     pcm = np.ones(2400, np.float32)
     conversation._on_delta(Delta(kind="audio", audio=pcm, response_id="old"))
     conversation._speaker._q.get_nowait()
 
-    conversation._commit_barge(time.monotonic(), "test")
-    conversation._on_delta(Delta(kind="audio", audio=pcm, response_id="old"))
+    started = time.monotonic()
+    conversation._begin_barge(started)
+    conversation._commit_barge(started + 0.02, "test")
+    conversation._on_delta(
+        Delta(kind="audio", audio=pcm, response_id="old-branch-2", received_at=started + 0.04)
+    )
+    conversation._on_delta(
+        Delta(kind="audio", audio=pcm, response_id="old-branch-3", received_at=started + 0.06)
+    )
     assert conversation._speaker._q.empty()
 
-    conversation._on_delta(Delta(kind="audio", audio=pcm, response_id="new"))
+    with conversation._turn_lock:
+        assert conversation._gate.chunk_force_listen(started + 0.08)
+    conversation._on_delta(Delta(kind="listen", received_at=started + 0.10))
+    conversation._on_delta(
+        Delta(
+            kind="audio",
+            audio=pcm,
+            response_id="new-answer",
+            received_at=started + QUIET_S + 0.10,
+        )
+    )
     epoch, queued = conversation._speaker._q.get_nowait()
     assert epoch == conversation._speaker.epoch
     assert queued is pcm
