@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import yrobot.main as main_module
+from yrobot.audio import EchoMatch
 from yrobot.config import Settings
 from yrobot.main import FRAME_MAX_DIM, Conversation, LatestCamera, UplinkPacket, shrink_jpeg
 from yrobot.realtime import Delta
@@ -166,23 +167,38 @@ def test_barge_candidate_hard_stops_and_latches_force():
         assert conversation._gate.chunk_force_listen(started + 0.01)
 
 
-def test_qualified_local_vad_interrupts_without_echo_level_gate():
-    conversation = _conversation_without_hardware()
+def _install_barge_fakes(
+    conversation: Conversation,
+    match: EchoMatch | list[EchoMatch],
+    vad_pattern: list[bool] | None = None,
+) -> object:
+    matches = list(match) if isinstance(match, list) else [match]
+    frame_count = (
+        main_module.BARGE_MATCH_FRAMES + (len(matches) - 1) * main_module.BARGE_RECHECK_FRAMES
+    )
+    if vad_pattern is not None:
+        frame_count = len(vad_pattern)
+    frames = [np.full(320, 0.01, np.float32) for _ in range(frame_count)]
 
     class FakeMic:
         def read_frames(self):
-            return [np.full(320, 0.01, np.float32)]
+            return frames
 
     class FakeDetector:
-        streak = 5
+        streak = 0
         last_db = -40.0
+        frame_index = 0
 
         def process(self, frame, now, floor_frozen=False):
-            return True
+            raw = True if vad_pattern is None else vad_pattern[self.frame_index]
+            self.frame_index += 1
+            self.streak = self.streak + 1 if raw else 0
+            return self.streak >= 3
 
     class FakeSpeaker:
         epoch = 0
         interrupted = 0
+        match_index = 0
 
         def sounding(self, now):
             return True
@@ -193,6 +209,11 @@ def test_qualified_local_vad_interrupts_without_echo_level_gate():
         def playing(self, now):
             return self.interrupted == 0
 
+        def echo_match(self, candidate, now):
+            result = matches[min(self.match_index, len(matches) - 1)]
+            self.match_index += 1
+            return result
+
         def interrupt(self):
             self.interrupted += 1
             self.epoch += 1
@@ -202,16 +223,83 @@ def test_qualified_local_vad_interrupts_without_echo_level_gate():
         def set_mode(self, mode):
             self.mode = mode
 
+    speaker = FakeSpeaker()
     conversation._mic = FakeMic()
     conversation._detector = FakeDetector()
-    conversation._speaker = FakeSpeaker()
+    conversation._speaker = speaker
     conversation._choreo = FakeChoreo()
+    return speaker
+
+
+def test_unexplained_local_voice_interrupts_playback():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        EchoMatch(similarity=0.2, unexplained_db=-40.0, lag_ms=400.0),
+    )
 
     conversation._process_mic()
 
-    assert conversation._speaker.interrupted == 1
+    assert speaker.interrupted == 1
     assert conversation._gate.latched
     assert conversation._gate.force_pending
+
+
+def test_playback_echo_does_not_interrupt_or_clear_player():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        EchoMatch(similarity=0.94, unexplained_db=-49.0, lag_ms=520.0),
+    )
+
+    conversation._process_mic()
+
+    assert speaker.interrupted == 0
+    assert not conversation._gate.latched
+
+
+def test_weak_double_talk_interrupts_despite_far_end_similarity():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        EchoMatch(similarity=0.88, unexplained_db=-40.0, lag_ms=520.0),
+    )
+
+    conversation._process_mic()
+
+    assert speaker.interrupted == 1
+    assert conversation._gate.latched
+
+
+def test_user_entering_continuous_echo_is_detected_on_recheck():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        [
+            EchoMatch(similarity=0.95, unexplained_db=-50.0, lag_ms=520.0),
+            EchoMatch(similarity=0.82, unexplained_db=-39.0, lag_ms=500.0),
+        ],
+    )
+
+    conversation._process_mic()
+
+    assert speaker.match_index == 2
+    assert speaker.interrupted == 1
+    assert conversation._gate.latched
+
+
+def test_short_xvf_suppression_gap_does_not_lose_real_barge():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        EchoMatch(similarity=0.3, unexplained_db=-39.0, lag_ms=480.0),
+        vad_pattern=[True] * 5 + [False] + [True] * 5,
+    )
+
+    conversation._process_mic()
+
+    assert speaker.interrupted == 1
+    assert conversation._gate.latched
 
 
 def test_interrupted_multi_branch_output_waits_for_force_listen_boundary():

@@ -3,7 +3,9 @@
 Reachy Mini Wireless routes the microphone through the XVF3800 hardware
 front end.  The board defaults are not suitable for far-field double-talk,
 so startup applies the same verified AGC/AEC/noise-suppression profile as
-Pollen's conversation app before local VAD starts.
+Pollen's conversation app before local VAD starts. Residual speech-shaped
+echo is rejected against the exact scheduled playout waveform rather than a
+static level threshold, preserving weak near-end double-talk.
 
 Playback is epoch-tagged: a barge-in bumps the epoch, and everything queued
 under an older epoch is dropped while the GStreamer pipeline is flushed via
@@ -20,6 +22,7 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 import webrtcvad
@@ -161,6 +164,119 @@ class VoiceDetector:
         return now - self._last_voiced_at < self.HANGOVER_S
 
 
+@dataclass(frozen=True)
+class EchoMatch:
+    """How much a microphone window can be explained by recent playout."""
+
+    similarity: float = 0.0
+    unexplained_db: float = SILENT_DB
+    lag_ms: float = 0.0
+
+
+class PlaybackEchoMatcher:
+    """Match a voiced microphone window against exact recent speaker PCM.
+
+    XVF3800 AEC removes most far-end energy, but the remaining waveform still
+    follows the exact audio sent to the speaker. A normalized correlation is
+    searched over the whole capture/pipeline latency range instead of assuming
+    one fixed delay. The best linear match also estimates how much microphone
+    energy remains unexplained; genuine double-talk retains near-end energy
+    even when some far-end correlation is present.
+
+    Matching is decimated to 2 kHz after box filtering. This retains enough
+    speech structure for echo identification while keeping the 20 ms capture
+    loop bounded on the Reachy Mini CM4.
+    """
+
+    SAMPLE_RATE = 16_000
+    HISTORY_S = 2.0
+    DECIMATION = 8
+    MIN_REFERENCE_RMS = 1e-4
+
+    def __init__(self) -> None:
+        self._blocks: deque[tuple[float, np.ndarray]] = deque()
+        self._lock = threading.Lock()
+
+    def record(self, start: float, pcm_16k: np.ndarray) -> None:
+        """Record one block at its scheduled physical playout time."""
+        pcm = np.asarray(pcm_16k, dtype=np.float32).reshape(-1).copy()
+        if len(pcm) == 0:
+            return
+        cutoff = start - self.HISTORY_S - 0.5
+        with self._lock:
+            self._blocks.append((start, pcm))
+            while self._blocks:
+                block_start, block = self._blocks[0]
+                block_end = block_start + len(block) / self.SAMPLE_RATE
+                if block_end >= cutoff:
+                    break
+                self._blocks.popleft()
+
+    def match(self, mic_16k: np.ndarray, now: float) -> EchoMatch:
+        """Return the strongest delayed far-end match for ``mic_16k``."""
+        mic = np.asarray(mic_16k, dtype=np.float32).reshape(-1)
+        if len(mic) < FRAME_SAMPLES:
+            return EchoMatch()
+
+        origin = now - self.HISTORY_S
+        reference = np.zeros(round(self.HISTORY_S * self.SAMPLE_RATE), np.float32)
+        with self._lock:
+            blocks = tuple(self._blocks)
+        for start, block in blocks:
+            dst_start = round((start - origin) * self.SAMPLE_RATE)
+            src_start = max(0, -dst_start)
+            dst_start = max(0, dst_start)
+            count = min(len(block) - src_start, len(reference) - dst_start)
+            if count > 0:
+                reference[dst_start : dst_start + count] = block[src_start : src_start + count]
+
+        ref = self._prepare(reference)
+        probe = self._prepare(mic)
+        if len(probe) == 0 or len(ref) < len(probe):
+            return EchoMatch()
+        probe_energy = float(np.dot(probe, probe))
+        if probe_energy <= 1e-12:
+            return EchoMatch()
+
+        # np.correlate is implemented in C; after 8x decimation this is a
+        # small bounded search (~1M multiply-adds for a 200 ms candidate).
+        correlation = np.correlate(ref, probe, mode="valid")
+        squared = np.square(ref, dtype=np.float64)
+        cumulative = np.concatenate(([0.0], np.cumsum(squared)))
+        window_energy = cumulative[len(probe) :] - cumulative[: -len(probe)]
+        minimum_energy = (self.MIN_REFERENCE_RMS**2) * len(probe)
+        denominator = np.sqrt(np.maximum(window_energy, minimum_energy) * probe_energy)
+        scores = np.divide(
+            np.abs(correlation),
+            denominator,
+            out=np.zeros_like(correlation, dtype=np.float64),
+            where=window_energy >= minimum_energy,
+        )
+        best_index = int(np.argmax(scores))
+        similarity = min(1.0, float(scores[best_index]))
+
+        mic_rms = float(np.sqrt(np.mean(np.square(mic, dtype=np.float64))))
+        unexplained_rms = mic_rms * math.sqrt(max(0.0, 1.0 - similarity * similarity))
+        unexplained_db = 20.0 * math.log10(unexplained_rms + 1e-9)
+        matched_end = origin + ((best_index + len(probe)) * self.DECIMATION / self.SAMPLE_RATE)
+        return EchoMatch(
+            similarity=similarity,
+            unexplained_db=unexplained_db,
+            lag_ms=max(0.0, (now - matched_end) * 1000.0),
+        )
+
+    @classmethod
+    def _prepare(cls, pcm: np.ndarray) -> np.ndarray:
+        """Low-pass, decimate and high-pass one correlation vector."""
+        usable = len(pcm) // cls.DECIMATION * cls.DECIMATION
+        if usable == 0:
+            return np.empty(0, np.float32)
+        downsampled = pcm[:usable].reshape(-1, cls.DECIMATION).mean(axis=1)
+        prepared = np.diff(downsampled, prepend=downsampled[0])
+        prepared -= float(np.mean(prepared))
+        return prepared.astype(np.float32, copy=False)
+
+
 class UplinkGain:
     """Automatic gain control for microphone audio sent to the model.
 
@@ -265,6 +381,7 @@ class Speaker(threading.Thread):
         self._flushed_epoch = 0
         self._flush_condition = threading.Condition()
         self._halt = threading.Event()
+        self._echo_matcher = PlaybackEchoMatcher()
 
     # -- called from other threads ----------------------------------------
 
@@ -318,6 +435,10 @@ class Speaker(threading.Thread):
         """Whether audio is physically scheduled on the SDK player."""
         now = time.monotonic() if now is None else now
         return self._pushed_until - now > 0.02
+
+    def echo_match(self, mic_16k: np.ndarray, now: float) -> EchoMatch:
+        """Compare a microphone candidate with recent scheduled playout."""
+        return self._echo_matcher.match(mic_16k, now)
 
     def close(self) -> None:
         self._halt.set()
@@ -373,10 +494,11 @@ class Speaker(threading.Thread):
             self._push(self._resampler.process(pcm))
 
     def _push(self, out: np.ndarray) -> None:
-        """Push one 16 kHz block and account for its physical schedule."""
+        """Push one 16 kHz block, recording its physical echo reference."""
         now = time.monotonic()
         self._media.push_audio_sample(out)
         start = max(self._pushed_until, now)
+        self._echo_matcher.record(start, out)
         self._pushed_until = start + len(out) / 16_000
 
     def _check_turn_end(self) -> None:

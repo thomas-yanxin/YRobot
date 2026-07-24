@@ -77,6 +77,10 @@ class Settings:
     reconnect_delay_s: float = 2.5
 
     vad_aggressiveness: int = 2
+    # A candidate is treated as self-echo only when it both matches recent
+    # playout and leaves less than this much unexplained near-end energy.
+    barge_echo_similarity: float = 0.75
+    barge_unexplained_db: float = -42.0
     head_tracking_weight: float = 0.4
 
     def __post_init__(self) -> None:
@@ -84,6 +88,10 @@ class Settings:
             raise ValueError("YROBOT_CHUNK_MS must be 1000 for MiniCPM-o 4.5 duplex")
         if self.send_video and self.realtime_mode != "video":
             raise ValueError("YROBOT_SEND_VIDEO requires realtime mode=video")
+        if not 0.0 <= self.barge_echo_similarity <= 1.0:
+            raise ValueError("YROBOT_BARGE_ECHO_SIMILARITY must be between 0 and 1")
+        if not -120.0 <= self.barge_unexplained_db <= 0.0:
+            raise ValueError("YROBOT_BARGE_UNEXPLAINED_DB must be between -120 and 0")
 
     @property
     def realtime_mode(self) -> str:
@@ -123,5 +131,7 @@ class Settings:
             kv_budget_tokens=_num("YROBOT_KV_BUDGET", 7200.0),
             reconnect_delay_s=_num("YROBOT_RECONNECT_DELAY_S", 2.5),
             vad_aggressiveness=int(_num("YROBOT_VAD_AGGRESSIVENESS", 2)),
+            barge_echo_similarity=_num("YROBOT_BARGE_ECHO_SIMILARITY", 0.75),
+            barge_unexplained_db=_num("YROBOT_BARGE_UNEXPLAINED_DB", -42.0),
             head_tracking_weight=_num("YROBOT_HEAD_TRACKING_WEIGHT", 0.4),
         )

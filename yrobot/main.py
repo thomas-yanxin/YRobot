@@ -17,6 +17,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover
     cv2 = None
 
 from yrobot.audio import (
+    EchoMatch,
     Microphone,
     Speaker,
     UplinkGain,
@@ -57,6 +59,13 @@ KV_PER_S_IDLE, KV_PER_S_BUSY, KV_PER_FRAME = 13.0, 28.0, 64.0
 # JPEG is pure uplink waste and stalls audio on weak wifi.
 FRAME_MAX_DIM = 448
 FRAME_JPEG_QUALITY = 80
+# During live playout, collect enough speech structure to distinguish the
+# exact far-end waveform from genuine double-talk. Re-evaluate a blocked
+# continuous run every 100 ms so a user can still enter over a long vowel.
+BARGE_MATCH_FRAMES = 10
+BARGE_RECHECK_FRAMES = 5
+BARGE_GAP_FRAMES = 2
+BARGE_ECHO_LOG_PERIOD_S = 2.0
 
 
 def shrink_jpeg(bgr_frame: np.ndarray | None) -> bytes | None:
@@ -172,6 +181,10 @@ class Conversation:
         self._video_kv_est = 0.0
         self._last_logged_audio_onset_at = -1e9
         self._input_sequence = 0
+        self._barge_frames: deque[np.ndarray] = deque(maxlen=BARGE_MATCH_FRAMES)
+        self._barge_frames_since_match = 0
+        self._barge_quiet_frames = 0
+        self._last_echo_rejection_log_at = -1e9
 
     def run(self) -> None:
         self._mini.media.start_recording()
@@ -208,6 +221,7 @@ class Conversation:
         self._video_kv_est = 0.0
         self._last_logged_audio_onset_at = -1e9
         self._input_sequence = 0
+        self._reset_barge_candidate()
         with self._turn_lock:
             self._gate = TurnGate()
         client = RealtimeClient(self._s, on_delta=self._on_delta, on_closed=self._on_closed)
@@ -403,12 +417,13 @@ class Conversation:
     def _process_mic(self) -> list[np.ndarray]:
         """Read mic frames; run VAD, barge-in and posture per 20 ms frame.
 
-        The XVF3800 profile conditions double-talk before WebRTC VAD. Once
-        VAD confirms 100 ms of speech over a live robot turn, interruption is
-        destructive and immediate: advance the playback epoch, request a
-        device flush, latch output suppression and keep force_listen active
-        on complete model units. Old audio is never resumed after a qualified
-        human onset.
+        The XVF3800 profile conditions double-talk before WebRTC VAD. During a
+        live robot turn, a 200 ms candidate is compared with the exact recent
+        speaker PCM over the variable capture latency. Echo-explained voice is
+        ignored without touching playback; unexplained near-end voice advances
+        the epoch, flushes the player and latches force_listen. A continuously
+        echo-like run is rechecked every 100 ms so later double-talk still
+        interrupts promptly.
         """
         out = self._mic.read_frames()
         # A device read may return several frames. Approximate their capture
@@ -419,13 +434,10 @@ class Conversation:
             robot_sounding = self._speaker.sounding(now)
             robot_turn_live = self._speaker.audible(now)
             voiced = self._detector.process(frame, now, floor_frozen=robot_sounding)
-            if (
-                voiced
-                and self._detector.streak >= 5
-                and robot_turn_live
-                and not self._gate_latched()
-            ):
-                self._begin_barge(now)
+            if robot_turn_live and not self._gate_latched():
+                self._consider_barge(frame, voiced, now)
+            else:
+                self._reset_barge_candidate()
             # Once a barge is latched, every voiced frame keeps force sticky.
             # While the robot is silent, ordinary user speech still drives
             # DoA/camera activity without creating an interruption.
@@ -443,7 +455,65 @@ class Conversation:
             self._choreo.set_mode(IDLE)
         return out
 
-    def _begin_barge(self, now: float) -> None:
+    def _consider_barge(self, frame: np.ndarray, voiced: bool, now: float) -> None:
+        """Commit only voice that cannot be explained by recent playout."""
+        if self._detector.streak <= 0:
+            self._barge_quiet_frames += 1
+            if not self._barge_frames or self._barge_quiet_frames > BARGE_GAP_FRAMES:
+                self._reset_barge_candidate()
+            else:
+                # XVF double-talk suppression can punch a 20–40 ms hole in
+                # quiet real speech. Keep the acoustic window contiguous,
+                # but never classify until WebRTC VAD confirms again.
+                self._barge_frames.append(frame)
+                self._barge_frames_since_match += 1
+            return
+        self._barge_quiet_frames = 0
+        self._barge_frames.append(frame)
+        self._barge_frames_since_match += 1
+        if (
+            not voiced
+            or len(self._barge_frames) < BARGE_MATCH_FRAMES
+            or self._barge_frames_since_match < BARGE_RECHECK_FRAMES
+        ):
+            return
+
+        self._barge_frames_since_match = 0
+        candidate = np.concatenate(tuple(self._barge_frames))
+        match = self._speaker.echo_match(candidate, now)
+        echo_explained = (
+            match.similarity >= self._s.barge_echo_similarity
+            and match.unexplained_db < self._s.barge_unexplained_db
+        )
+        if echo_explained:
+            if now - self._last_echo_rejection_log_at >= BARGE_ECHO_LOG_PERIOD_S:
+                self._last_echo_rejection_log_at = now
+                logger.info(
+                    "barge candidate rejected as playback echo: mic %.1f dB, "
+                    "similarity %.2f, unexplained %.1f dB, lag %.0f ms",
+                    self._detector.last_db,
+                    match.similarity,
+                    match.unexplained_db,
+                    match.lag_ms,
+                )
+            return
+
+        onset_at = now - (len(self._barge_frames) - 1) * FRAME_S
+        self._reset_barge_candidate()
+        self._begin_barge(now, onset_at=onset_at, match=match)
+
+    def _reset_barge_candidate(self) -> None:
+        self._barge_frames.clear()
+        self._barge_frames_since_match = 0
+        self._barge_quiet_frames = 0
+
+    def _begin_barge(
+        self,
+        now: float,
+        *,
+        onset_at: float | None = None,
+        match: EchoMatch | None = None,
+    ) -> None:
         """Atomically suppress output and hard-stop the interrupted local turn."""
         with self._turn_lock:
             started = self._gate.user_frame(True, True, now)
@@ -451,13 +521,25 @@ class Conversation:
                 self._captions = ThinkFilter()
                 epoch = self._speaker.interrupt()
         if started:
-            self._mark_user_voice(now)
-            logger.info(
-                "barge-in: local playback discarded at epoch %d (mic %.1f dB); "
-                "force latched for next complete unit",
-                epoch,
-                self._detector.last_db,
-            )
+            self._mark_user_voice(now if onset_at is None else onset_at)
+            if match is None:
+                logger.info(
+                    "barge-in: local playback discarded at epoch %d (mic %.1f dB); "
+                    "force latched for next complete unit",
+                    epoch,
+                    self._detector.last_db,
+                )
+            else:
+                logger.info(
+                    "barge-in: unexplained near-end voice discarded playback at epoch %d "
+                    "(mic %.1f dB, similarity %.2f, unexplained %.1f dB, lag %.0f ms); "
+                    "force latched for next complete unit",
+                    epoch,
+                    self._detector.last_db,
+                    match.similarity,
+                    match.unexplained_db,
+                    match.lag_ms,
+                )
 
     def _mark_user_voice(self, now: float) -> None:
         if now - self._last_voice_at >= VoiceDetector.HANGOVER_S:

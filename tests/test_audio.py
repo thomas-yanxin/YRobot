@@ -8,6 +8,7 @@ from yrobot.audio import (
     AUDIO_STARTUP_CONFIG,
     FRAME_SAMPLES,
     Microphone,
+    PlaybackEchoMatcher,
     Speaker,
     StreamResampler,
     UplinkGain,
@@ -106,6 +107,43 @@ def test_voice_detector_frozen_floor_keeps_barge_sensitivity():
     for i in range(3):
         voiced = det.process(speech, 11.0 + i * 0.02, floor_frozen=True)
     assert voiced is True  # without the freeze the floor would gate this out
+
+
+def _speech_like_pcm(samples: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    excitation = rng.normal(size=samples + 4)
+    colored = np.convolve(excitation, [0.03, 0.12, 0.35, 0.12, 0.03], mode="valid")
+    envelope = np.repeat(
+        np.clip(rng.normal(0.6, 0.25, samples // 160 + 1), 0.05, 1.0),
+        160,
+    )[:samples]
+    return (colored * envelope * 0.2).astype(np.float32)
+
+
+def test_playback_echo_matcher_finds_delayed_filtered_echo():
+    matcher = PlaybackEchoMatcher()
+    playout = _speech_like_pcm(32_000, seed=1)
+    matcher.record(8.0, playout)
+
+    source = playout[24_000:27_200]
+    filtered = np.convolve(source, [0.2, 0.6, 0.2], mode="same")
+    mic = (filtered * 0.12).astype(np.float32)
+    match = matcher.match(mic, now=10.0)
+
+    assert match.similarity > 0.9
+    assert match.unexplained_db < -42.0
+    assert 250.0 < match.lag_ms < 750.0
+
+
+def test_playback_echo_matcher_leaves_unrelated_near_end_energy():
+    matcher = PlaybackEchoMatcher()
+    matcher.record(8.0, _speech_like_pcm(32_000, seed=2))
+    user = _speech_like_pcm(3_200, seed=3) * 0.25
+
+    match = matcher.match(user, now=10.0)
+
+    assert match.similarity < 0.5
+    assert match.unexplained_db > -42.0
 
 
 def test_uplink_gain_boosts_quiet_speech_not_noise():
