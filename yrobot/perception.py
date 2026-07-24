@@ -54,6 +54,10 @@ class DaemonDoASource:
         if timeout_seconds <= 0:
             raise ValueError("DoA request timeout must be positive")
         self._url = url
+        marker = "/api/state/doa"
+        self._health_url = (
+            f"{url[: -len(marker)]}/api/daemon/status" if url.endswith(marker) else url
+        )
         self._timeout_seconds = timeout_seconds
         if session is None:
             session = requests.Session()
@@ -81,6 +85,17 @@ class DaemonDoASource:
         if not isinstance(speech_detected, bool):
             raise ValueError("DoA speech_detected must be a boolean")
         return angle, speech_detected
+
+    def probe_ready(self) -> None:
+        """Confirm the daemon event loop responds before another USB read."""
+
+        if self._closed:
+            raise RuntimeError("DoA source is closed")
+        response = self._session.get(
+            self._health_url,
+            timeout=self._timeout_seconds,
+        )
+        response.raise_for_status()
 
     def close(self) -> None:
         if self._closed:
@@ -402,8 +417,12 @@ class DoAWorker:
         retry_initial_seconds: float = 0.25,
         retry_max_seconds: float = 2.0,
         warning_interval_seconds: float = 5.0,
-        slow_request_seconds: float = 0.03,
+        slow_request_seconds: float = 0.15,
         slow_request_limit: int = 3,
+        max_usb_duty_cycle: float = 0.2,
+        circuit_initial_seconds: float = 5.0,
+        circuit_max_seconds: float = 60.0,
+        wake_event: threading.Event | None = None,
     ) -> None:
         if not math.isfinite(hz) or not 10.0 <= hz <= 20.0:
             raise ValueError("DoA polling rate must be within 10..20 Hz")
@@ -422,6 +441,15 @@ class DoAWorker:
             raise ValueError("DoA slow-request threshold must be positive")
         if slow_request_limit <= 0:
             raise ValueError("DoA slow-request limit must be positive")
+        if not 0 < max_usb_duty_cycle <= 1:
+            raise ValueError("DoA USB duty cycle must be within 0..1")
+        if (
+            not math.isfinite(circuit_initial_seconds)
+            or not math.isfinite(circuit_max_seconds)
+            or circuit_initial_seconds <= 0
+            or circuit_max_seconds < circuit_initial_seconds
+        ):
+            raise ValueError("DoA circuit timings are invalid")
         self._source = (
             DaemonDoASource(source, timeout_seconds=request_timeout_seconds)
             if isinstance(source, str)
@@ -438,6 +466,10 @@ class DoAWorker:
         self._warning_interval = warning_interval_seconds
         self._slow_request_seconds = slow_request_seconds
         self._slow_request_limit = slow_request_limit
+        self._max_usb_duty_cycle = max_usb_duty_cycle
+        self._circuit_initial = circuit_initial_seconds
+        self._circuit_max = circuit_max_seconds
+        self._wake_event = wake_event
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._close_lock = threading.Lock()
@@ -483,9 +515,12 @@ class DoAWorker:
     def _run(self) -> None:
         last_warning = -math.inf
         last_processing_warning = -math.inf
-        last_poll = -math.inf
+        next_poll = -math.inf
+        next_usb_at = -math.inf
         failures = 0
         slow_requests = 0
+        circuit_opens = 0
+        was_near_end = False
         try:
             while not self._stop.is_set():
                 now = time.monotonic()
@@ -496,19 +531,23 @@ class DoAWorker:
                     if now - last_processing_warning >= self._warning_interval:
                         LOGGER.warning("DoA gate processing failed", exc_info=True)
                         last_processing_warning = now
-                    self._stop.wait(self._active_period)
+                    self._wait(self._active_period)
                     continue
 
                 # Hardware speech detection can react to the robot's own speaker.
-                # Echo-guarded near-end VAD wakes polling within one active period.
+                # Echo-guarded near-end VAD wakes polling immediately.
                 if playback_active and not near_end_speech:
-                    self._stop.wait(self._active_period)
+                    was_near_end = False
+                    self._wait(self._active_period)
                     continue
 
+                if near_end_speech and not was_near_end:
+                    next_poll = max(now, next_usb_at)
+                was_near_end = near_end_speech
                 period = self._active_period if near_end_speech else self._idle_period
-                until_poll = period - (now - last_poll)
+                until_poll = next_poll - now
                 if until_poll > 0:
-                    self._stop.wait(min(self._active_period, until_poll))
+                    self._wait(until_poll)
                     continue
 
                 request_started = time.monotonic()
@@ -517,19 +556,60 @@ class DoAWorker:
                     if result is None:
                         raise RuntimeError("daemon returned null (audio/DoA unavailable)")
                 except requests.exceptions.ReadTimeout:
+                    failures += 1
+                    circuit_opens += 1
+                    cooldown = min(
+                        self._circuit_initial * (2 ** min(circuit_opens - 1, 30)),
+                        self._circuit_max,
+                    )
                     LOGGER.error(
-                        "DoA disabled for this run after a daemon read timeout; "
-                        "restart the Reachy daemon or device before retrying"
+                        "DoA daemon read timed out; circuit open for %.1f s "
+                        "before a recovery probe",
+                        cooldown,
                     )
                     LOGGER.debug("DoA daemon read timeout", exc_info=True)
-                    break
+                    slow_requests = 0
+                    recovery_probe = getattr(self._source, "probe_ready", None)
+                    while not self._stop.is_set():
+                        if self._wait(cooldown, allow_wake=False):
+                            break
+                        if not callable(recovery_probe):
+                            break
+                        try:
+                            recovery_probe()
+                        except Exception as error:
+                            circuit_opens += 1
+                            cooldown = min(
+                                self._circuit_initial * (2 ** min(circuit_opens - 1, 30)),
+                                self._circuit_max,
+                            )
+                            LOGGER.warning(
+                                "Reachy daemon is still unresponsive (%s); "
+                                "DoA circuit remains open for %.1f s",
+                                error,
+                                cooldown,
+                            )
+                            continue
+                        LOGGER.info("Reachy daemon event loop recovered; allowing one DoA probe")
+                        break
+                    if self._stop.is_set():
+                        break
+                    next_poll = time.monotonic()
+                    continue
                 except Exception as error:
                     slow_requests = 0
                     failures += 1
+                    failed_at = time.monotonic()
+                    request_seconds = failed_at - request_started
+                    next_usb_at = max(
+                        next_usb_at,
+                        request_started + request_seconds / self._max_usb_duty_cycle,
+                    )
                     retry = min(
                         self._retry_initial * (2 ** min(failures - 1, 30)),
                         self._retry_max,
                     )
+                    retry = max(retry, next_usb_at - failed_at)
                     if now - last_warning >= self._warning_interval:
                         LOGGER.warning(
                             "DoA daemon polling failed (%s); retrying in %.2f s",
@@ -538,35 +618,52 @@ class DoAWorker:
                         )
                         last_warning = now
                     LOGGER.debug("DoA daemon polling failure", exc_info=True)
-                    if self._stop.wait(retry):
+                    if self._wait(retry, allow_wake=False):
                         break
+                    next_poll = time.monotonic()
                     continue
 
                 request_finished = time.monotonic()
                 request_seconds = request_finished - request_started
-                # Healthy reads are paced start-to-start. If a synchronous
-                # daemon read overruns the period, add one cooldown instead of
-                # immediately hammering the already slow control endpoint.
-                last_poll = request_finished if request_seconds >= period else request_started
+                effective_period = max(
+                    period,
+                    request_seconds / self._max_usb_duty_cycle,
+                )
+                next_usb_at = request_started + (request_seconds / self._max_usb_duty_cycle)
+                next_poll = max(
+                    request_started + effective_period,
+                    next_usb_at,
+                )
+                open_circuit = False
+                cooldown = 0.0
                 if request_seconds > self._slow_request_seconds:
                     slow_requests += 1
                     if slow_requests == 1:
                         LOGGER.warning(
-                            "DoA daemon read is slow (%.1f ms); disabling after "
-                            "%d consecutive slow reads",
+                            "DoA daemon read exceeded %.1f ms (%.1f ms); "
+                            "opening a temporary circuit after %d consecutive reads",
+                            self._slow_request_seconds * 1_000,
                             request_seconds * 1_000,
                             self._slow_request_limit,
                         )
                     if slow_requests >= self._slow_request_limit:
+                        circuit_opens += 1
+                        cooldown = min(
+                            self._circuit_initial * (2 ** min(circuit_opens - 1, 30)),
+                            self._circuit_max,
+                        )
                         LOGGER.error(
-                            "DoA disabled for this run after %d consecutive "
-                            "daemon reads exceeded %.1f ms",
+                            "DoA circuit open for %.1f s after %d consecutive "
+                            "reads exceeded %.1f ms; it will recover automatically",
+                            cooldown,
                             slow_requests,
                             self._slow_request_seconds * 1_000,
                         )
-                        break
+                        slow_requests = 0
+                        open_circuit = True
                 else:
                     slow_requests = 0
+                    circuit_opens = 0
 
                 if failures:
                     LOGGER.info("DoA polling recovered after %d failure(s)", failures)
@@ -586,8 +683,27 @@ class DoAWorker:
                     if request_finished - last_processing_warning >= self._warning_interval:
                         LOGGER.warning("DoA sample processing failed", exc_info=True)
                         last_processing_warning = request_finished
+                if open_circuit:
+                    if self._wait(cooldown, allow_wake=False):
+                        break
+                    next_poll = time.monotonic()
         finally:
             self._close_source()
+
+    def _wait(self, seconds: float, *, allow_wake: bool = True) -> bool:
+        """Wait interruptibly; a VAD rising edge wakes an idle DoA probe."""
+
+        deadline = time.monotonic() + max(0.0, seconds)
+        while not self._stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._stop.wait(min(remaining, 0.05)):
+                return True
+            if allow_wake and self._wake_event is not None and self._wake_event.is_set():
+                self._wake_event.clear()
+                return False
+        return True
 
     def _publish(
         self,

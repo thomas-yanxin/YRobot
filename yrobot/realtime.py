@@ -79,7 +79,7 @@ class RealtimeMetrics:
     listen_deltas: int
     unit_ready_to_send: TimingSummary
     send_interval: TimingSummary
-    latest_input_to_first_audio: TimingSummary
+    first_audio_downlink_excess: TimingSummary
 
 
 class _Counters:
@@ -95,7 +95,7 @@ class _Counters:
         self.timings: dict[str, deque[float]] = {
             "unit_ready_to_send": deque(maxlen=256),
             "send_interval": deque(maxlen=256),
-            "latest_input_to_first_audio": deque(maxlen=256),
+            "first_audio_downlink_excess": deque(maxlen=256),
         }
 
     def add(self, name: str, amount: int = 1) -> None:
@@ -120,8 +120,8 @@ class _Counters:
                 listen_deltas=self.listen_deltas,
                 unit_ready_to_send=_timing_summary(self.timings["unit_ready_to_send"]),
                 send_interval=_timing_summary(self.timings["send_interval"]),
-                latest_input_to_first_audio=_timing_summary(
-                    self.timings["latest_input_to_first_audio"]
+                first_audio_downlink_excess=_timing_summary(
+                    self.timings["first_audio_downlink_excess"]
                 ),
             )
 
@@ -149,7 +149,8 @@ class _Lifecycle:
 
     def __init__(self) -> None:
         self.state = ProtocolState()
-        self.lock = asyncio.Lock()
+        self.state_lock = asyncio.Lock()
+        self.send_lock = asyncio.Lock()
 
     async def send(self, websocket: ClientConnection, event: dict[str, Any]) -> None:
         await self.send_then(websocket, event)
@@ -160,22 +161,42 @@ class _Lifecycle:
         event: dict[str, Any],
         after_send: Callable[[], None] | None = None,
     ) -> None:
-        async with self.lock:
-            next_state = transition_client(self.state, event)  # type: ignore[arg-type]
-            await websocket.send(serialize_client_event(event))  # type: ignore[arg-type]
-            self.state = next_state
+        serialized = serialize_client_event(event)  # type: ignore[arg-type]
+        async with self.send_lock:
+            async with self.state_lock:
+                next_state = transition_client(self.state, event)  # type: ignore[arg-type]
+                # Commit before the write. A send failure terminates this
+                # session, while an in-flight uplink must not block downlink.
+                self.state = next_state
+            await websocket.send(serialized)
             if after_send is not None:
                 after_send()
 
     async def receive(self, raw: str | bytes) -> object:
         event = parse_server_event(raw)  # type: ignore[arg-type]
-        async with self.lock:
+        async with self.state_lock:
             # A best-effort close may race already-buffered output. It is
             # neither a new turn nor a lifecycle violation; callers discard it.
             if self.state.phase is Phase.CLOSE and isinstance(event, ResponseDelta):
                 return event
             self.state = transition_server(self.state, event)
         return event
+
+    async def try_send_close(
+        self,
+        websocket: ClientConnection,
+        event: dict[str, Any],
+    ) -> bool:
+        """Atomically skip a close already completed by the server."""
+
+        serialized = serialize_client_event(event)  # type: ignore[arg-type]
+        async with self.send_lock:
+            async with self.state_lock:
+                if self.state.phase not in {Phase.CREATED, Phase.STREAMING}:
+                    return False
+                self.state = transition_client(self.state, event)  # type: ignore[arg-type]
+            await websocket.send(serialized)
+        return True
 
 
 class RealtimeClient:
@@ -192,7 +213,7 @@ class RealtimeClient:
         coordinator: TurnCoordinator,
         *,
         latest_frame: Callable[[], bytes | None],
-        on_audio: Callable[[np.ndarray, int, str | None], None],
+        on_audio: Callable[[np.ndarray, int, str | None, float], None],
         on_listen: Callable[[int], None],
         on_text: Callable[[str, int, str | None], None],
         on_session: Callable[[bool, int], None],
@@ -565,9 +586,9 @@ class RealtimeClient:
                         await sender
                 return should_stop
 
-            if lifecycle.state.phase in {Phase.CREATED, Phase.STREAMING} and not receiver.done():
+            if not receiver.done():
                 close_send = asyncio.create_task(
-                    lifecycle.send(websocket, session_close(reason)),
+                    lifecycle.try_send_close(websocket, session_close(reason)),
                     name="minicpmo-session-close",
                 )
                 try:
@@ -589,8 +610,9 @@ class RealtimeClient:
                         reason=reason,
                     )
                     return should_stop
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(closed.wait(), timeout=2.0)
+                if close_send.result():
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(closed.wait(), timeout=2.0)
             return should_stop
         finally:
             for task in tasks:
@@ -805,6 +827,12 @@ class RealtimeClient:
             epoch = self.coordinator.accept_audio(event.response_id)
             if epoch is None:
                 continue
+            samples = np.frombuffer(event.audio.pcm_f32le, dtype="<f4").copy()
+            if not np.all(np.isfinite(samples)):
+                raise RealtimeError("MiniCPM-o output contains non-finite samples")
+            self._metrics.add("audio_deltas")
+            # Hand audio to the lossless playout queue before diagnostics.
+            self.on_audio(samples, epoch, event.response_id, received_monotonic)
             self._log_first_response_packet(
                 event,
                 received_monotonic=received_monotonic,
@@ -812,11 +840,6 @@ class RealtimeClient:
                 last_input_send_at=last_input_send_at,
                 server_to_client_excess_ms=downlink_excess_ms,
             )
-            samples = np.frombuffer(event.audio.pcm_f32le, dtype="<f4").copy()
-            if not np.all(np.isfinite(samples)):
-                raise RealtimeError("MiniCPM-o output contains non-finite samples")
-            self._metrics.add("audio_deltas")
-            self.on_audio(samples, epoch, event.response_id)
 
     def _log_first_response_packet(
         self,
@@ -837,22 +860,33 @@ class RealtimeClient:
             return
         self._logged_first_packets.add(marker)
 
-        fields = [
+        summary = [f"response_id={event.response_id or '-'}"]
+        details = [
             f"response_id={event.response_id or '-'}",
             f"client_receive_ts={received_wall:.6f}",
         ]
         if last_input_send_at is not None:
             latest_input_age_ms = (received_monotonic - last_input_send_at) * 1_000
-            fields.append(f"latest_input_send_age_ms={latest_input_age_ms:.1f}")
+            summary.append(f"time_since_last_uplink_ms={latest_input_age_ms:.1f}")
+            details.append(f"time_since_last_uplink_ms={latest_input_age_ms:.1f}")
+        if event.server_send_ts is not None:
+            details.append(f"server_send_ts={event.server_send_ts:.6f}")
+        if server_to_client_excess_ms is not None:
+            summary.append(f"downlink_excess_ms={server_to_client_excess_ms:.1f}")
+            details.append(f"server_to_client_excess_ms={server_to_client_excess_ms:.1f}")
             if event.kind == "audio":
                 self._metrics.observe(
-                    "latest_input_to_first_audio",
-                    latest_input_age_ms,
+                    "first_audio_downlink_excess",
+                    server_to_client_excess_ms,
                 )
-        if event.server_send_ts is not None:
-            fields.append(f"server_send_ts={event.server_send_ts:.6f}")
-        if server_to_client_excess_ms is not None:
-            fields.append(f"server_to_client_excess_ms={server_to_client_excess_ms:.1f}")
+        for name in (
+            "prefill_ms",
+            "generate_ms",
+            "wall_clock_ms",
+        ):
+            value = _finite_metric(event.metrics.get(name))
+            if value is not None:
+                summary.append(f"server_{name}={value:g}")
         for name in (
             "prefill_ms",
             "generate_ms",
@@ -867,11 +901,16 @@ class RealtimeClient:
         ):
             value = _finite_metric(event.metrics.get(name))
             if value is not None:
-                fields.append(f"server_{name}={value:g}")
+                details.append(f"server_{name}={value:g}")
         log.info(
             "MiniCPM-o first %s packet: %s",
             event.kind,
-            " ".join(fields),
+            " ".join(summary),
+        )
+        log.debug(
+            "MiniCPM-o first %s diagnostics: %s",
+            event.kind,
+            " ".join(details),
         )
 
     def _server_to_client_excess_ms(

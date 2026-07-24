@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+from logging.handlers import QueueHandler
 from typing import Any
 
 import numpy as np
 
 from yrobot.config import Settings
-from yrobot.main import Yrobot, cli
+from yrobot.main import Yrobot, cli, configure_logging, shutdown_logging
 from yrobot.perception import LatestFrame
 from yrobot.runtime import YRobotRuntime, _VisionUplink
 
@@ -23,6 +25,18 @@ class FakeAudioBackend:
 
     def clear_player(self) -> None:
         self.events.append("audio.clear")
+
+    def apply_audio_config(
+        self,
+        _config: object,
+        *,
+        verify: bool,
+        write_settle_seconds: float,
+    ) -> bool:
+        assert verify is True
+        assert write_settle_seconds == 0.1
+        self.events.append("audio.config")
+        return True
 
 
 class FakeMedia:
@@ -118,6 +132,8 @@ def test_runtime_owns_media_once_and_stops_in_dependency_order(
 
     assert events.index("motors.enable") < events.index("media.play")
     assert events.index("media.play") < events.index("media.record")
+    assert events.index("media.record") < events.index("audio.config")
+    assert events.index("audio.config") < events.index("client.run")
     assert events.index("media.record") < events.index("client.run")
     assert events.index("client.run") < events.index("media.stop_play")
     assert events.index("wobble.disable") < events.index("media.stop_play")
@@ -131,6 +147,35 @@ def test_reachy_app_requests_the_wireless_local_media_backend() -> None:
     assert Yrobot.request_media_backend == "local"
     assert Yrobot.dont_start_webserver is True
     assert Yrobot.custom_app_url is None
+
+
+def test_logging_queue_covers_sdk_and_yrobot_loggers() -> None:
+    root = logging.getLogger()
+    package = logging.getLogger("yrobot")
+    original_root_level = root.level
+    original_handlers = tuple(root.handlers)
+    original_package_state = (
+        package.level,
+        tuple(package.handlers),
+        package.propagate,
+    )
+
+    configure_logging("INFO")
+    try:
+        assert len(root.handlers) == 1
+        assert isinstance(root.handlers[0], QueueHandler)
+        assert logging.getLogger("reachy_mini.media.audio_gstreamer").propagate
+        assert logging.getLogger("yrobot.realtime").propagate
+    finally:
+        shutdown_logging()
+
+    assert tuple(root.handlers) == original_handlers
+    assert root.level == original_root_level
+    assert (
+        package.level,
+        tuple(package.handlers),
+        package.propagate,
+    ) == original_package_state
 
 
 def test_vision_uplink_sends_only_new_frames_at_model_cadence() -> None:

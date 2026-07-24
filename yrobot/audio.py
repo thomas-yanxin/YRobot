@@ -41,6 +41,7 @@ class PlaybackPacket:
     response_id: str | None = None
     stream_generation: int = 0
     received_at: float | None = None
+    enqueued_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ class VoiceDecision:
     output_active: bool
     echo_guard_active: bool
     echo_similarity: float
+    echo_fit: float
     echo_like: bool
     barge_in: bool
 
@@ -162,22 +164,17 @@ class StreamingResampler:
 
         self._buffer = data if self._buffer.size == 0 else np.concatenate((self._buffer, data))
         end_index = self._buffer_start + self._buffer.size - 1
-        output: list[float] = []
-        while True:
-            low, remainder = divmod(self._next_numerator, self.output_rate)
-            high = low if remainder == 0 else low + 1
-            if high > end_index:
-                break
-            offset = low - self._buffer_start
-            if remainder == 0:
-                value = self._buffer[offset]
-            else:
-                fraction = remainder / self.output_rate
-                value = (
-                    self._buffer[offset] * (1.0 - fraction) + self._buffer[offset + 1] * fraction
-                )
-            output.append(float(value))
-            self._next_numerator += self.input_rate
+        available_numerator = end_index * self.output_rate - self._next_numerator
+        if available_numerator < 0:
+            return np.empty(0, dtype=np.float32)
+        count = available_numerator // self.input_rate + 1
+        numerators = self._next_numerator + self.input_rate * np.arange(count, dtype=np.int64)
+        low, remainder = np.divmod(numerators, self.output_rate)
+        offsets = low - self._buffer_start
+        fractions = remainder.astype(np.float32) / self.output_rate
+        upper_offsets = offsets + (remainder != 0)
+        output = self._buffer[offsets] * (1.0 - fractions) + self._buffer[upper_offsets] * fractions
+        self._next_numerator += int(count) * self.input_rate
 
         next_low = self._next_numerator // self.output_rate
         discard = min(
@@ -190,7 +187,7 @@ class StreamingResampler:
                 dtype=np.float32,
             )
             self._buffer_start += discard
-        return np.asarray(output, dtype=np.float32)
+        return np.ascontiguousarray(output, dtype=np.float32)
 
 
 class FrameSplitter:
@@ -306,19 +303,33 @@ class EchoReference:
             self._samples = np.ascontiguousarray(combined[-self._max_samples :], dtype=np.float32)
 
     def similarity(self, captured_frame: npt.ArrayLike) -> float:
+        similarity, _ = self._match(captured_frame, filtered=False)
+        return similarity
+
+    def match(self, captured_frame: npt.ArrayLike) -> tuple[float, float]:
+        """Return direct correlation and a short-FIR echo explanation score."""
+
+        return self._match(captured_frame, filtered=True)
+
+    def _match(
+        self,
+        captured_frame: npt.ArrayLike,
+        *,
+        filtered: bool,
+    ) -> tuple[float, float]:
         frame = _mono_float32(captured_frame)
         usable = frame.size // self._downsample * self._downsample
         if usable == 0:
-            return 0.0
+            return 0.0, 0.0
         probe = frame[:usable].reshape(-1, self._downsample).mean(axis=1, dtype=np.float32)
         probe = probe - float(probe.mean())
         probe_norm = float(np.linalg.norm(probe))
         if probe_norm < 1e-8:
-            return 0.0
+            return 0.0, 0.0
         with self._lock:
             reference = self._samples.copy()
         if reference.size < probe.size:
-            return 0.0
+            return 0.0, 0.0
         reference = reference - float(reference.mean())
         dots = np.correlate(reference, probe, mode="valid")
         squared = np.square(reference, dtype=np.float32)
@@ -328,7 +339,30 @@ class EchoReference:
         window_energy = cumulative[probe.size :] - cumulative[: -probe.size]
         denominator = np.sqrt(np.maximum(window_energy, 1e-16)) * probe_norm
         correlations = np.abs(dots) / denominator
-        return float(np.clip(np.max(correlations, initial=0.0), 0.0, 1.0))
+        best_index = int(np.argmax(correlations))
+        similarity = float(np.clip(correlations[best_index], 0.0, 1.0))
+        if not filtered or probe.size < 32:
+            return similarity, similarity
+
+        half_taps = 6
+        columns = []
+        for offset in range(-half_taps, half_taps + 1):
+            start = best_index + offset
+            if 0 <= start and start + probe.size <= reference.size:
+                column = reference[start : start + probe.size].copy()
+                column -= float(column.mean())
+                columns.append(column)
+        if len(columns) < 3:
+            return similarity, similarity
+        design = np.stack(columns, axis=1)
+        coefficients, *_ = np.linalg.lstsq(design, probe, rcond=None)
+        residual = probe - design @ coefficients
+        residual_ratio = float(np.dot(residual, residual)) / max(
+            float(np.dot(probe, probe)),
+            1e-16,
+        )
+        filtered_similarity = math.sqrt(max(0.0, 1.0 - residual_ratio))
+        return similarity, float(np.clip(filtered_similarity, 0.0, 1.0))
 
     def clear(self) -> None:
         with self._lock:
@@ -377,6 +411,8 @@ class NearEndDetector:
         self._last_near = -math.inf
         self._last_barge = -math.inf
         self._barge_latched = False
+        self._echo_frames: deque[FloatAudio] = deque(maxlen=self._attack_frames)
+        self._guard_candidates: deque[bool] = deque(maxlen=self._attack_frames)
 
     def process(
         self,
@@ -394,17 +430,52 @@ class NearEndDetector:
         threshold = max(self._min_rms, self._noise_floor * self._noise_ratio)
         vad_speech = self._vad.is_speech(data, self.sample_rate)
         guard_active = output_active if echo_guard_active is None else echo_guard_active
-        similarity = self._echo.similarity(data) if guard_active and self._echo is not None else 0.0
-        echo_like = guard_active and similarity >= self._echo_correlation
-        candidate = vad_speech and rms >= threshold and not echo_like
-
-        if candidate:
-            self._candidate_frames += 1
+        raw_candidate = vad_speech and rms >= threshold
+        probe_ready = True
+        if guard_active and self._echo is not None:
+            self._echo_frames.append(data.copy())
+            self._guard_candidates.append(raw_candidate)
+            probe = np.concatenate(tuple(self._echo_frames))
+            probe_ready = len(self._echo_frames) >= self._attack_frames
+            if probe_ready:
+                similarity, echo_fit = self._echo.match(probe)
+            else:
+                similarity = self._echo.similarity(probe)
+                echo_fit = similarity
+            # Correlation preserves double-talk; the short-FIR score catches
+            # room-filtered robot echo that direct correlation misses.
+            echo_like = (
+                echo_fit >= max(self._echo_correlation, 0.82)
+                if probe_ready
+                else similarity >= self._echo_correlation
+            )
+            if probe_ready and echo_like:
+                for index in range(len(self._guard_candidates)):
+                    self._guard_candidates[index] = False
+                self._candidate_frames = 0
+            elif probe_ready:
+                self._candidate_frames = 0
+                for is_candidate in reversed(self._guard_candidates):
+                    if not is_candidate:
+                        break
+                    self._candidate_frames += 1
+            elif raw_candidate:
+                self._candidate_frames += 1
+            else:
+                self._candidate_frames = 0
         else:
-            self._candidate_frames = 0
+            self._echo_frames.clear()
+            self._guard_candidates.clear()
+            similarity = 0.0
+            echo_fit = 0.0
+            echo_like = False
+            self._candidate_frames = self._candidate_frames + 1 if raw_candidate else 0
+
+        candidate = raw_candidate and not echo_like and probe_ready
+        if not candidate:
             self._barge_latched = False
 
-        if self._candidate_frames >= self._near_frames:
+        if candidate and self._candidate_frames >= self._near_frames:
             self._last_near = now
         near_end = now - self._last_near <= self._hold
 
@@ -434,6 +505,7 @@ class NearEndDetector:
             output_active=output_active,
             echo_guard_active=guard_active,
             echo_similarity=similarity,
+            echo_fit=echo_fit,
             echo_like=echo_like,
             barge_in=barge_in,
         )
@@ -443,10 +515,12 @@ class NearEndDetector:
         self._last_near = -math.inf
         self._last_barge = -math.inf
         self._barge_latched = False
+        self._echo_frames.clear()
+        self._guard_candidates.clear()
 
 
 class PlaybackEngine:
-    """One playback writer with bounded latency and an epoch race barrier."""
+    """Lossless paced playback with a small device queue and an epoch fence."""
 
     def __init__(
         self,
@@ -456,14 +530,15 @@ class PlaybackEngine:
         *,
         input_sample_rate: int = 24_000,
         output_sample_rate: int = 16_000,
-        max_queue: int = 2,
         preroll_ms: int = 0,
+        output_chunk_ms: int = 40,
+        max_ahead_ms: int = 120,
         clock: Callable[[], float] = time.monotonic,
         logger: logging.Logger | None = None,
     ) -> None:
         if input_sample_rate <= 0 or output_sample_rate <= 0:
             raise ValueError("playback sample rates must be positive")
-        if max_queue <= 0 or preroll_ms < 0:
+        if preroll_ms < 0 or output_chunk_ms <= 0 or max_ahead_ms < output_chunk_ms:
             raise ValueError("playback queue parameters are invalid")
         self._media = media
         self._epoch_supplier = epoch_supplier
@@ -477,9 +552,10 @@ class PlaybackEngine:
         self._resampler_key: tuple[int, int, str | None] | None = None
         self._logged_first_pushes: set[tuple[int, int, str | None]] = set()
         self._stream_generation = 0
-        self._max_queue = max_queue
         self._preroll_samples = input_sample_rate * preroll_ms // 1_000
         self._preroll_seconds = preroll_ms / 1_000
+        self._output_chunk_samples = max(1, output_sample_rate * output_chunk_ms // 1_000)
+        self._max_ahead_seconds = max_ahead_ms / 1_000
         self._clock = clock
         self._logger = logger or logging.getLogger(__name__)
 
@@ -512,7 +588,9 @@ class PlaybackEngine:
             player = getattr(self._media, "audio", None)
             if player is None or not hasattr(player, "clear_player"):
                 raise RuntimeError("the local media audio backend is unavailable")
-            player.set_max_output_buffers(self._max_queue)
+            # A positive SDK limit makes GStreamer's appsrc leaky and silently
+            # drops old speech. Pacing below keeps the device queue short.
+            player.set_max_output_buffers(0)
             self._started = True
             self._thread = threading.Thread(target=self._run, name="yrobot-playback", daemon=True)
             self._thread.start()
@@ -530,13 +608,11 @@ class PlaybackEngine:
                 response_id=packet.response_id,
                 stream_generation=self._stream_generation,
                 received_at=packet.received_at,
+                enqueued_at=self._clock(),
             )
             if self._stopping or not self._is_current(normalized):
                 self._stale += 1
                 return False
-            while len(self._queue) >= self._max_queue:
-                self._queue.popleft()
-                self._dropped += 1
             self._queue.append(normalized)
             stream_key = (normalized.epoch, normalized.stream_generation)
             if self._preroll_samples:
@@ -649,6 +725,7 @@ class PlaybackEngine:
             packet = self._take_packet()
             if packet is None:
                 return
+            resample_started = time.perf_counter()
             if self._input_rate == self._output_rate:
                 output = packet.samples
             else:
@@ -661,47 +738,91 @@ class PlaybackEngine:
                     self._resampler.reset()
                     self._resampler_key = resampler_key
                 output = self._resampler.process(packet.samples)
+            resample_ms = (time.perf_counter() - resample_started) * 1_000
             if output.size == 0:
                 continue
             output = np.ascontiguousarray(output, dtype=np.float32)
-            with self._output_lock:
-                with self._condition:
-                    valid = not self._stopping and self._is_current(packet)
-                    if not valid:
-                        self._stale += 1
-                if not valid:
-                    continue
-                try:
-                    self._media.push_audio_sample(output)
-                except Exception:
-                    self._record_error()
-                    self._logger.exception("failed to push Reachy Mini audio")
-                    continue
-                self._echo.append_played(output)
+            for start in range(0, output.size, self._output_chunk_samples):
+                chunk = np.ascontiguousarray(
+                    output[start : start + self._output_chunk_samples],
+                    dtype=np.float32,
+                )
+                if not self._wait_for_device_capacity(packet, chunk.size / self._output_rate):
+                    break
+                if not self._push_chunk(packet, chunk, resample_ms):
+                    break
+                resample_ms = 0.0
+
+    def _wait_for_device_capacity(
+        self,
+        packet: PlaybackPacket,
+        chunk_seconds: float,
+    ) -> bool:
+        with self._condition:
+            while True:
+                if self._stopping or not self._is_current(packet):
+                    self._stale += 1
+                    return False
                 with self._activity_lock:
                     now = self._clock()
-                    self._playing_until = max(now, self._playing_until) + (
-                        output.size / self._output_rate
-                    )
-                    self._echo_guard_until = self._playing_until + self._echo_tail_seconds
-                with self._condition:
-                    self._pushed += 1
-                    push_key = (
-                        packet.epoch,
-                        packet.stream_generation,
-                        packet.response_id,
-                    )
-                    log_first_push = push_key not in self._logged_first_pushes
-                    if log_first_push:
-                        self._logged_first_pushes.add(push_key)
-                if log_first_push and packet.received_at is not None:
-                    self._logger.info(
-                        "Reachy first audio push: response_id=%s "
-                        "receive_to_push_ms=%.1f chunk_ms=%.1f",
-                        packet.response_id or "-",
-                        max(0.0, (self._clock() - packet.received_at) * 1_000),
-                        output.size / self._output_rate * 1_000,
-                    )
+                    ahead_after_push = max(now, self._playing_until) + chunk_seconds - now
+                delay = ahead_after_push - self._max_ahead_seconds
+                if delay <= 0:
+                    return True
+                self._condition.wait(min(delay, 0.02))
+
+    def _push_chunk(
+        self,
+        packet: PlaybackPacket,
+        output: FloatAudio,
+        resample_ms: float,
+    ) -> bool:
+        push_started = self._clock()
+        with self._output_lock:
+            with self._condition:
+                valid = not self._stopping and self._is_current(packet)
+                if not valid:
+                    self._stale += 1
+            if not valid:
+                return False
+            push_perf_started = time.perf_counter()
+            try:
+                self._media.push_audio_sample(output)
+            except Exception:
+                self._record_error()
+                self._logger.exception("failed to push Reachy Mini audio")
+                return False
+            media_push_ms = (time.perf_counter() - push_perf_started) * 1_000
+            self._echo.append_played(output)
+            with self._activity_lock:
+                now = self._clock()
+                self._playing_until = max(now, self._playing_until) + (
+                    output.size / self._output_rate
+                )
+                self._echo_guard_until = self._playing_until + self._echo_tail_seconds
+            with self._condition:
+                self._pushed += 1
+                push_key = (
+                    packet.epoch,
+                    packet.stream_generation,
+                    packet.response_id,
+                )
+                log_first_push = push_key not in self._logged_first_pushes
+                if log_first_push:
+                    self._logged_first_pushes.add(push_key)
+        if log_first_push and packet.received_at is not None:
+            enqueued_at = packet.enqueued_at or packet.received_at
+            self._logger.info(
+                "Reachy first audio push: response_id=%s raw_to_enqueue_ms=%.1f "
+                "enqueue_to_push_ms=%.1f resample_ms=%.1f media_push_ms=%.1f chunk_ms=%.1f",
+                packet.response_id or "-",
+                max(0.0, (enqueued_at - packet.received_at) * 1_000),
+                max(0.0, (push_started - enqueued_at) * 1_000),
+                resample_ms,
+                media_push_ms,
+                output.size / self._output_rate * 1_000,
+            )
+        return True
 
     def _take_packet(self) -> PlaybackPacket | None:
         with self._condition:

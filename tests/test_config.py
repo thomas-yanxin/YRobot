@@ -17,10 +17,10 @@ def test_official_realtime_defaults_are_fixed_to_video_duplex() -> None:
     assert settings.input_unit_ms == 1_000
     assert settings.camera_width == 640
     assert settings.camera_fps == 1.0
-    assert settings.vision_send_interval_seconds == 2.0
+    assert settings.vision_send_interval_seconds == 1.0
     assert settings.playback_preroll_ms == 0
-    assert settings.playback_buffers == 2
     assert settings.barge_attack_ms == 80
+    assert settings.echo_correlation == 0.72
     assert settings.doa_hz == 10.0
     assert settings.motion_hz == 50.0
     assert settings.session_seconds < 300
