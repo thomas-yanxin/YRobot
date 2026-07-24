@@ -84,19 +84,27 @@ class VoiceDetector:
         self._last_voiced_at = -1e9
         self.last_db = SILENT_DB
 
-    def process(self, frame: np.ndarray, now: float) -> bool:
-        """Feed one 20 ms mono float32 frame; returns confirmed ``voiced``."""
+    def process(self, frame: np.ndarray, now: float, floor_frozen: bool = False) -> bool:
+        """Feed one 20 ms mono float32 frame; returns confirmed ``voiced``.
+
+        ``floor_frozen`` must be True whenever the robot is audible: the
+        echo of its own speech is handled by the EchoGuard and must not be
+        learned as ambient noise — on hardware (2026-07-24) the floor
+        climbed to the echo level during a long monologue and the user
+        could no longer barge in at all.
+        """
         rms = float(np.sqrt(np.mean(np.square(frame)))) if len(frame) else 0.0
         self.last_db = 20.0 * math.log10(rms + 1e-9)
         # Asymmetric floor: falls fast in quiet, creeps up under sustained
         # sound — so steady motor noise stops counting as voice within a few
         # seconds, while real speech (which breathes every few hundred ms)
         # keeps pulling the floor back down.
-        if rms < self._floor:
-            self._floor = 0.7 * self._floor + 0.3 * rms
-        else:
-            self._floor = min(self._floor * 1.01, rms)
-        self._floor = max(self._floor, 5e-4)
+        if not floor_frozen:
+            if rms < self._floor:
+                self._floor = 0.7 * self._floor + 0.3 * rms
+            else:
+                self._floor = min(self._floor * 1.01, rms)
+            self._floor = max(self._floor, 5e-4)
         pcm16 = (np.clip(frame, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
         raw = self._vad.is_speech(pcm16, 16_000) and rms > max(
             self.ABS_RMS_MIN, self._floor * self.FLOOR_FACTOR
@@ -130,10 +138,13 @@ class EchoGuard:
     # a -18 dB start plus 1 dB bumps let three false ducks through before
     # converging — start closer and learn in bigger steps. Frame learning
     # only happens on *blocked* frames, so the bump is the main teacher.
+    # Decay must be glacial and never undercut the hardware baseline: at
+    # 0.01 dB/frame the quiet frames of one monologue eroded the learned
+    # offset by several dB and reopened the door for false ducks.
     OFFSET_INIT_DB = -14.0
     OFFSET_RISE_DB = 0.5
-    OFFSET_DECAY_DB = 0.01
-    OFFSET_MIN_DB = -50.0
+    OFFSET_DECAY_DB = 0.002
+    OFFSET_MIN_DB = -14.0
     FALSE_TRIGGER_BUMP_DB = 2.5
 
     def __init__(self) -> None:

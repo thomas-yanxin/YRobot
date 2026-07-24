@@ -133,7 +133,8 @@ class Conversation:
         out = self._mic.read_frames()
         now = time.monotonic()
         for frame in out:
-            voiced = self._detector.process(frame, now)
+            robot_audible = self._speaker.audible(now)
+            voiced = self._detector.process(frame, now, floor_frozen=robot_audible)
             if voiced:
                 self._last_voice_at = now
             verdict = self._verifier.frame(voiced, now)

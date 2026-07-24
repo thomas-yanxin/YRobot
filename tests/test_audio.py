@@ -71,6 +71,26 @@ def test_voice_detector_adapts_noise_floor():
     assert det.process(speech, 10.06) is True
 
 
+def test_voice_detector_frozen_floor_keeps_barge_sensitivity():
+    det = VoiceDetector(vad=FakeVad(True))
+    echo = np.full(FRAME_SAMPLES, 0.05, np.float32)
+    # 10 s of the robot's own monologue echo: the floor must not learn it
+    for i in range(500):
+        det.process(echo, i * 0.02, floor_frozen=True)
+    speech = np.full(FRAME_SAMPLES, 0.05, np.float32)  # user at the same level
+    voiced = False
+    for i in range(3):
+        voiced = det.process(speech, 11.0 + i * 0.02, floor_frozen=True)
+    assert voiced is True  # without the freeze the floor would gate this out
+
+
+def test_echo_guard_decay_never_undercuts_hardware_baseline():
+    guard = EchoGuard()
+    for _ in range(2000):  # 40 s of quiet frames during playback
+        guard.observe(mic_db=-80.0, playout_db=-10.0)
+    assert guard.offset_db == EchoGuard.OFFSET_INIT_DB
+
+
 def test_echo_guard_passes_when_nothing_played():
     assert EchoGuard().observe(mic_db=-40.0, playout_db=-120.0) is True
 
