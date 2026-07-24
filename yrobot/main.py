@@ -147,7 +147,7 @@ class Conversation:
             voiced = self._detector.process(frame, now, floor_frozen=robot_audible)
             if voiced:
                 self._last_voice_at = now
-            verdict = self._verifier.frame(voiced, now)
+            verdict = self._verifier.frame(voiced, now, strong=self._strong_voice(voiced, now))
             if verdict == "commit":
                 self._gate.user_frame(True, True, now)
                 self._speaker.interrupt()
@@ -222,6 +222,16 @@ class Conversation:
         else:
             self._choreo.set_mode(IDLE)
         return out
+
+    def _strong_voice(self, voiced: bool, now: float) -> bool:
+        """Voice whose level cannot be the in-flight echo of what we played
+        (the playout envelope keeps pre-duck blocks in view for 1.6 s)."""
+        if not voiced:
+            return False
+        playout = self._speaker.playout_db(now)
+        if playout <= -90.0:
+            return True
+        return self._detector.last_db >= playout + self._echo_guard.offset_db + 6.0
 
     def _set_tracking(self, weight: float) -> None:
         """Adjust daemon face tracking; weight 0 pauses it cheaply."""

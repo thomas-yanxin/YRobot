@@ -142,15 +142,25 @@ class DuckVerifier:
         self._deadline = now + self.WINDOW_S
         self._hits = 0
 
-    def frame(self, voiced: bool, now: float) -> str | None:
-        """Feed one VAD frame; returns "commit", "resume" or None."""
-        if not self.active or now < self._settle_end:
+    def frame(self, voiced: bool, now: float, strong: bool = False) -> str | None:
+        """Feed one VAD frame; returns "commit", "resume" or None.
+
+        ``strong`` marks a frame whose level clearly exceeds the in-flight
+        echo prediction. Such frames count as evidence even during the
+        settle — a short interjection ("等一下…") often ends before the
+        settle does, and discarding it made the robot pause briefly and
+        then carry on (hardware log 2026-07-24, 8th run). Strong evidence
+        also cuts commit latency for clear barges from 0.6 s+ to ~150 ms.
+        """
+        if not self.active:
             return None
-        if voiced:
+        if voiced and (strong or now >= self._settle_end):
             self._hits += 1
             if self._hits >= self.CONFIRM_HITS:
                 self.active = False
                 return "commit"
+        if now < self._settle_end:
+            return None
         early = self._hits == 0 and now >= self._settle_end + self.EARLY_RESUME_S
         if early or now >= self._deadline:
             self.active = False

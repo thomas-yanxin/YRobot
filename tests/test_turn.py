@@ -140,3 +140,25 @@ def test_verifier_tolerates_flickering_suppressed_speech():
 
 def test_verifier_inactive_returns_none():
     assert DuckVerifier().frame(True, 5.0) is None
+
+
+def test_verifier_strong_voice_commits_during_settle():
+    # A short interjection ends before the settle does — strong frames
+    # (level above the in-flight echo prediction) must count immediately.
+    v = DuckVerifier()
+    v.start(0.0)
+    assert v.frame(True, 0.10, strong=True) is None
+    assert v.frame(True, 0.12, strong=True) == "commit"
+    assert not v.active
+
+
+def test_verifier_weak_settle_voice_still_ignored():
+    v = DuckVerifier()
+    v.start(0.0)
+    assert v.frame(True, 0.10) is None  # in-flight echo level: no evidence
+    t = DuckVerifier.SETTLE_S
+    verdict = None
+    while verdict is None:
+        verdict = v.frame(False, t)
+        t += 0.02
+    assert verdict == "resume"
