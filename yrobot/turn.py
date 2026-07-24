@@ -1,0 +1,99 @@
+"""Barge-in turn gate.
+
+The gateway's ``force_listen`` is advisory: generation does not reliably stop
+and, once the user goes quiet, the model often *resumes* the interrupted
+monologue. Interruption therefore has to be client-owned:
+
+* the instant the user speaks over robot audio, playback is flushed locally
+  and every stale audio delta of that turn is discarded;
+* every uplink chunk carries ``force_listen`` while the user keeps talking,
+  and a rate-limited re-force fires when discarded audio arrives after the
+  user went quiet;
+* the discard latch releases only after **two consecutive clean listens** —
+  a listen with the user quiet for ≥ ``QUIET_S`` that is not merely the ack
+  of a force we sent within ``FORCE_ACK_S``. Stale model audio resets the
+  streak (the resume signature is "listen, then old audio one slice later").
+
+Pure logic over injected timestamps — no I/O, fully unit-testable.
+"""
+
+from __future__ import annotations
+
+QUIET_S = 0.7  # user silence needed for a listen to count as clean
+FORCE_ACK_S = 1.2  # a listen this close to our force is just its ack
+REFORCE_S = 1.0  # min spacing of re-forces triggered by stale audio
+CLEAN_LISTENS = 2  # consecutive clean listens required to unlatch
+LATCH_CAP_S = 12.0  # absolute upper bound on discarding
+
+
+class TurnGate:
+    """Decides, per event, whether to barge, force-listen, or discard audio."""
+
+    def __init__(self) -> None:
+        self._latched = False
+        self._latched_at = 0.0
+        self._clean_streak = 0
+        self._pending_force = False
+        self._last_force_at = -1e9
+        self._last_voice_at = -1e9
+
+    @property
+    def latched(self) -> bool:
+        return self._latched
+
+    def user_frame(self, voiced: bool, robot_audible: bool, now: float) -> bool:
+        """Register one VAD frame. Returns True when a barge-in starts —
+        the caller must flush local playback immediately."""
+        if not voiced:
+            return False
+        self._last_voice_at = now
+        if robot_audible and not self._latched:
+            self._latched = True
+            self._latched_at = now
+            self._clean_streak = 0
+            self._pending_force = True
+            return True
+        if self._latched:
+            self._pending_force = True  # keep forcing while the user talks
+        return False
+
+    def model_audio(self, now: float) -> bool:
+        """Audio delta arrived. Returns True if it may be played."""
+        if not self._latched:
+            return True
+        self._clean_streak = 0  # the monologue is still coming
+        if now - self._last_voice_at >= QUIET_S and now - self._last_force_at >= REFORCE_S:
+            self._pending_force = True  # user is quiet yet audio persists: re-force
+        self._maybe_expire(now)
+        return not self._latched
+
+    def model_listen(self, now: float) -> None:
+        """Listen delta arrived — the only semantic utterance boundary."""
+        if not self._latched:
+            return
+        quiet = now - self._last_voice_at >= QUIET_S
+        genuine = now - self._last_force_at >= FORCE_ACK_S
+        if quiet and genuine:
+            self._clean_streak += 1
+            if self._clean_streak >= CLEAN_LISTENS:
+                self._unlatch()
+        else:
+            self._clean_streak = 0
+        self._maybe_expire(now)
+
+    def chunk_force_listen(self, now: float) -> bool:
+        """Whether the uplink chunk being sent now must carry force_listen."""
+        if self._latched and self._pending_force:
+            self._pending_force = False
+            self._last_force_at = now
+            return True
+        return False
+
+    def _maybe_expire(self, now: float) -> None:
+        if self._latched and now - self._latched_at >= LATCH_CAP_S:
+            self._unlatch()
+
+    def _unlatch(self) -> None:
+        self._latched = False
+        self._pending_force = False
+        self._clean_streak = 0

@@ -1,111 +1,45 @@
-# YRobot 重构计划：不可变 MiniCPM-o 服务端
+# YRobot v3 — 全双工 MiniCPM-o 4.5 × Reachy Mini Wireless
 
-状态：客户端实现与自动验证完成；剩余工作只有 Reachy Mini Wireless 实机验收。
+从零重写。目标：把官方 Realtime API（https://minicpmo45.modelbest.cn/docs/en/realtime-api/overview/）
+的全双工能力完整发挥到 Reachy Mini Wireless 上，四个痛点各有明确对策。
 
-## 1. 硬约束
+## 1. 四个痛点 → 对策
 
-- 应用运行在 Reachy Mini Wireless CM4。
-- 唯一模型入口是
-  `wss://10.0.16.184:8006/v1/realtime?mode=video`。
-- Gateway、Python worker 和 comni C++ backend 均不可修改、重启配置或部署补丁。
-- video session 固定最多 300 秒；单 worker 不能并行预热下一会话。
-- 实测 `session.init → session.created` 为 9.2–15.8 秒。这是服务端固定等待，客户端不把它
-  计入可优化延迟，也不承诺消除。
-- 当前 comni 只能安全使用空 `system_prompt`；YRobot 始终沿用服务端内置 persona。
-- 公开协议输入固定为约一秒、16 kHz mono float32；输出为 24 kHz mono float32。
+| 痛点 | 根因 | 对策 |
+|---|---|---|
+| 端到端延迟高 | 1 s 上行分块 + 播放缓冲过大 | 500 ms 分块（实测回复延迟从 +1.7 s 降到 +1.1~1.3 s；250 ms 会破坏 turn-taking）；`mode=audio`（600 s 上限，仍接受视频帧）；自适应 0.25–0.8 s preroll，设备积压 ≤1.5 s |
+| 打断不及时 / 旧音频复播 | 服务端 `force_listen` 不可靠：生成不会真正停止，且安静后常"续播"旧独白 | 打断完全由客户端兜底：VAD onset → 立即 `clear_player()` + 整轮丢弃 + 每个分块携带 `force_listen`；只有连续 2 个"干净 listen"（用户安静 ≥0.7 s 且不在我方 force 的 1.2 s 内）才解除丢弃，12 s 封顶 |
+| 被自己动作声音误打断 | VAD 只看过零/频谱，电机噪声会触发 | XVF3800 硬件 AEC 之外再加：自适应噪声底 + RMS 门限 + 3 帧（60 ms）连续确认才算人声 |
+| 动作不拟人 | 动作源互相打架、无统一节奏 | 单一 50 Hz 动作 owner（呼吸/扫视/姿态全部临界阻尼合成）；说话嘴动用 SDK 官方 `enable_wobbling()`（daemon 侧与扬声器 PTS 同步）；body yaw 交给 `set_automatic_body_yaw(True)` 跟随头部 |
+| DoA 不灵敏 | 用固件 speech 标志做门控（它在 AEC 之前，机器人自己说话也触发） | 12 Hz 独立线程轮询 `DOA_VALUE_RADIANS`，只在**本地 VAD 判定用户在说话**时采样，1 s 窗口圆均值 + 死区，头相对角换算成世界 yaw 后交给动作 owner 平滑转过去；可叠加 daemon 人脸跟踪细修 |
 
-## 2. 客户端目标
+## 2. 协议要点（来自官方文档 + 实测）
 
-只优化 Reachy 侧可控链路：
+- `wss://…/v1/realtime?mode=audio`：上行 base64 float32 16 kHz mono，下行 24 kHz；
+  `session.queue_done` → `session.init` → `session.created`（~14 s，服务端固定成本）。
+- delta `kind ∈ {listen, text, audio}`；**只有 listen 是语义轮边界**；text/audio 不一一对应。
+- `mode=audio` 仍接受 `video_frames`（base64 JPEG），且会话上限 600 s（video 只有 300 s）。
+- system_prompt 首行必须是训练句 `You are a helpful assistant.`，第二行放简短人设
+  （自由人设会让 Qwen3 底座漂出双工分布、`<think>` 泄漏）。
+- kv 预算 ~8192：视觉 64 tok/帧 是大头 → 机器人独自说话时不发帧；活跃 1 fps、空闲 0.2 fps；
+  时间/kv 双预算到点后，只在安静的 listen 边界轮换会话。
 
-| 路径 | 目标 |
-|---|---:|
-| audio delta → 第一帧 speaker push | p95 ≤ 120 ms |
-| VAD onset → 本地物理静音 | p95 ≤ 100 ms |
-| VAD onset → force-listen control unit 出队 | p95 ≤ 100 ms |
-| 播放帧 cadence | 20 ms，不累积 push 调用耗时 |
-| 动作控制 | 单 owner，50 Hz |
-| 视频采集对音频阻塞 | 0 |
+## 3. 模块（6 文件，单一职责）
 
-服务端首响、300 秒会话上限和重新初始化窗口仅记录，不伪装为客户端改善。
-
-## 3. 架构
-
-```text
-Reachy mic / XVF AEC
-  -> 20 ms VAD + residual echo guard
-  -> bounded one-second uplink
-  -> MiniCPM-o Realtime Gateway
-
-latest-only JPEG --------------------^
-
-24 kHz model audio
-  -> streaming 24k→16k resampler
-  -> epoch playback queue
-  -> absolute 20 ms sample clock
-  -> Reachy local GStreamer player
-
-DoA @ 10 Hz -> latest target -> single motion owner @ 50 Hz
+```
+config.py    环境变量 → 冻结配置（URL 归一化、所有可调参数）
+realtime.py  网关协议客户端（排队/init/收发/关闭）+ ThinkFilter
+turn.py      打断状态机（纯逻辑、单测覆盖）
+audio.py     VoiceDetector(VAD+噪声底) / MicChunker / LinearResampler / Speaker(epoch 播放)
+motion.py    SoundCompass(DoA) + Choreographer(50 Hz 唯一动作 owner)
+main.py      ReachyMiniApp 接线、会话生命周期、CLI
 ```
 
-代码只保留五个运行边界：
+线程：mic 上行（主循环）、ws 收、扬声器、动作 50 Hz、DoA 12 Hz。跨线程只传不可变数据。
 
-- `config.py`：固定服务能力与少量环境配置；
-- `realtime.py`：协议、关闭栅栏、重连和空闲 rollover；
-- `audio.py`：采集、VAD、自声保护、打断、重采样和播放；
-- `motion.py`：DoA 与唯一动作控制器；
-- `main.py`：Dashboard/CLI 生命周期。
+## 4. 验收（实机）
 
-## 4. 插话
-
-1. 对 Reachy AEC 后的 channel 0 运行 20 ms WebRTC VAD。
-2. 两个连续 voiced frame 确认用户 onset。
-3. 原子递增 playback epoch、丢弃旧 response，并请求
-   `mini.media.audio.clear_player()`。
-4. 当前已采集的近端开头补零到 16,000 samples，立即携带 `force_listen=true`。
-5. 高相关的扬声器残余音频同时从本地 VAD 和模型上行中移除。
-6. 收到 `kind=listen` 前拒绝所有晚到旧音频；旧尾音永不恢复。
-
-服务端没有公开 cancel API，所以“机器人先闭嘴”由本地 player flush 保证，服务端确认可以稍后
-到达。
-
-## 5. 播放与动作
-
-- 播放初始 lead 为 40 ms；按绝对 deadline 推送 20 ms frame。
-- 应用、SDK 和设备队列全部有界；过期上行直接丢弃。
-- 回答超过播放容量时保留连续句首并截断本轮，不拼接不连续句尾。
-- DoA USB 读取与动作控制分线程，阻塞 DoA 不影响 50 Hz actuator cadence。
-- 所有姿态经临界阻尼、速度/加速度和机械范围限制。
-- 说话微动作使用 Reachy SDK playback-synchronised wobbling。
-- `set_target` 失败时恢复内部轴状态，重连后不会出现追赶跳变。
-
-## 6. 会话生命周期
-
-- 等 `session.queue_done` 后才发送 `session.init`。
-- 等 `session.created` 后才打开新的麦克风 epoch。
-- 285 秒请求 rollover，只在服务端 listening、用户安静且本地播放排空时关闭。
-- 294 秒为硬关闭边界，给固定 300 秒 watchdog 和 close acknowledgement 留余量。
-- 关闭顺序固定为：本地 invalidate/flush → sender quiescent → `session.close` → 等
-  `session.closed` → 等 Gateway 关闭传输并完成 Worker 回收。
-- 若固定 Gateway 的回收窗口仍返回 `session_failed`/HTTP 403，使用带抖动的有界退避重试，
-  不依赖服务端修改或重启。
-- 新会话重新初始化期间保持 idle 姿态；不播放伪造填充语音，也不复用旧上下文。
-
-## 7. 验证
-
-- 68 项单元与本地集成测试通过。
-- Ruff、format、`git diff --check`、compileall、wheel build 和 `pip check` 通过。
-- Reachy app metadata、entry point 和 `ReachyMiniApp` 类加载通过。
-- 线上三层 health 正常；最近一次 probe：
-  - queue：0.9 ms
-  - init：14987.5 ms
-  - input-to-listen：72.9 ms
-  - backend `wall_clock_ms`：1.159001
-
-## 8. 实机验收
-
-1. 机器人独说 30 次，不发生自我打断。
-2. 双讲插话 30 次，旧音频在 100 ms 内停止且不恢复。
-3. 近场、远场、侧向和机械运动噪声下分别校准 VAD/AEC。
-4. 验证 DoA 朝向、天线、头部和 body yaw 无阶跃。
-5. 连续运行 30 分钟，覆盖至少五次 300 秒 session rollover。
+1. 打断 30 次：物理静音 ≤100 ms，旧音频零复播。
+2. 机器人独白 + 头/身体大幅运动 30 次：零自我打断。
+3. 侧后方说话：1 s 内头转向说话人，无阶跃。
+4. 连续 30 min，≥3 次会话轮换，轮换期间保持 idle 姿态。
