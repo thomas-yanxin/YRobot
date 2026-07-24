@@ -124,6 +124,13 @@ class DuckVerifier:
     CONFIRM_HITS = 2
     EARLY_RESUME_S = 0.25  # pure post-settle silence: don't wait out the window
     COOLDOWN_S = 1.2  # the resumed tail echoes too — block back-to-back ducks
+    # A medium-level short interjection is physically indistinguishable from
+    # echo by one verify (below the envelope prediction, over before the
+    # settle ends) — but a user who was wrongly resumed retries within
+    # seconds. A second qualified candidate right after a resume commits
+    # directly, no second verify. The cooldown still covers the resumed
+    # tail's own onset echo, so the retry window opens after it.
+    RETRY_S = 3.0
 
     def __init__(self) -> None:
         self.active = False
@@ -131,10 +138,16 @@ class DuckVerifier:
         self._deadline = 0.0
         self._hits = 0
         self._cooldown_until = 0.0
+        self._retry_until = 0.0
 
     def ready(self, now: float) -> bool:
         """Whether a new duck may start (not verifying, not cooling down)."""
         return not self.active and now >= self._cooldown_until
+
+    def in_retry(self, now: float) -> bool:
+        """A candidate arriving now is the user insisting after a wrong
+        resume — commit it directly."""
+        return self.ready(now) and now < self._retry_until
 
     def start(self, now: float) -> None:
         self.active = True
@@ -165,5 +178,6 @@ class DuckVerifier:
         if early or now >= self._deadline:
             self.active = False
             self._cooldown_until = now + self.COOLDOWN_S
+            self._retry_until = now + self.RETRY_S
             return "resume"
         return None

@@ -152,6 +152,24 @@ def test_verifier_strong_voice_commits_during_settle():
     assert not v.active
 
 
+def test_verifier_retry_window_opens_after_cooldown():
+    v = DuckVerifier()
+    v.start(0.0)
+    t = DuckVerifier.SETTLE_S
+    verdict = None
+    while verdict is None:  # silence: early resume
+        verdict = v.frame(False, t)
+        t += 0.02
+    assert verdict == "resume"
+    assert not v.in_retry(t + 0.5)  # cooldown covers the resumed tail's echo
+    assert v.in_retry(t + DuckVerifier.COOLDOWN_S + 0.1)  # the user insisting
+    assert not v.in_retry(t + DuckVerifier.RETRY_S + 0.1)  # window closed
+
+
+def test_verifier_no_retry_without_a_prior_resume():
+    assert DuckVerifier().in_retry(5.0) is False
+
+
 def test_verifier_weak_settle_voice_still_ignored():
     v = DuckVerifier()
     v.start(0.0)

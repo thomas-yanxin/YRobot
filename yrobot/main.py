@@ -201,6 +201,18 @@ class Conversation:
                 strong = self._detector.streak >= 5
                 may_duck = self._verifier.ready(now) and not self._speaker.holding
                 if strong and (real_voice or insistent) and may_duck:
+                    if self._verifier.in_retry(now):
+                        # The user is insisting right after a wrong resume:
+                        # two independent candidates within seconds — commit
+                        # without a second verify.
+                        self._gate.user_frame(True, True, now)
+                        self._speaker.interrupt()
+                        self._barge_flush = True
+                        logger.info(
+                            "barge-in (retry after resume): committed (mic %.1f dB)", mic_db
+                        )
+                        now += FRAME_S
+                        continue
                     self._speaker.hold()  # silent within one tick, lossless
                     # Silence every self-noise source for the verify: our
                     # motion freezes and daemon-side face tracking pauses —
