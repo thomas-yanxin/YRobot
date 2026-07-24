@@ -6,12 +6,14 @@ import time
 import numpy as np
 
 from yrobot.motion import (
+    Choreographer,
     GazeSpring,
     SoundCompass,
     circular_mean,
     doa_to_yaw_delta,
     head_yaw_of,
     rpy_pose,
+    weighted_circular_mean,
 )
 
 
@@ -25,6 +27,11 @@ def test_doa_angle_convention():
 def test_circular_mean_handles_wraparound():
     mean = circular_mean([math.pi - 0.1, -math.pi + 0.1])
     assert math.isclose(abs(mean), math.pi, abs_tol=1e-6)
+
+
+def test_weighted_circular_mean_prioritizes_device_confirmed_samples():
+    mean = weighted_circular_mean([(0.0, 2.0), (math.pi / 2, 1.0)])
+    assert 0.0 < mean < math.pi / 4
 
 
 def test_rpy_pose_yaw_roundtrip():
@@ -91,3 +98,19 @@ def test_gaze_spring_freeze_brakes_smoothly_and_holds():
     held = spring.pos
     spring.step(0.02, freeze=1.0)
     assert abs(spring.pos - held) < 1e-3
+
+
+def test_idle_saccade_target_is_trajectory_limited(monkeypatch):
+    class FakeMini:
+        pass
+
+    choreo = Choreographer(FakeMini())
+
+    def upper_bound(low, high):
+        return high
+
+    monkeypatch.setattr("yrobot.motion.random.uniform", upper_bound)
+    pose, _ = choreo._compose(t=0.0, now=1.0, dt=0.02)
+    yaw = head_yaw_of(pose)
+    # The random target is +0.25 rad, but it must not appear in one 20 ms tick.
+    assert 0.0 < yaw < 0.03

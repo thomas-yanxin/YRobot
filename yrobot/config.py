@@ -19,19 +19,22 @@ TRAINED_SYSTEM_LINE = "You are a helpful assistant."
 DEFAULT_PERSONA = "你是 Reachy，一个友好的桌面机器人，用对方的语言简短口语化地回复。"
 
 
-def normalize_url(raw: str) -> str:
+def normalize_url(raw: str, mode: str | None = None) -> str:
     """Normalize a bare host, host:port or ws(s) URL to the realtime endpoint.
 
-    ``mode=audio`` is forced: it is the only full-duplex mode with a 600 s
-    session cap (video allows 300 s) and the gateway still accepts
-    ``video_frames`` in audio mode.
+    An explicit mode in ``raw`` is preserved unless ``mode`` is supplied.
+    Audio is the latency-first default; camera frames are valid only in video
+    mode according to the public gateway contract.
     """
     if "://" not in raw:
         raw = f"wss://{raw}"
     parts = urlsplit(raw)
     path = parts.path if parts.path not in ("", "/") else "/v1/realtime"
     query = {k: v[0] for k, v in parse_qs(parts.query).items()}
-    query["mode"] = "audio"
+    selected_mode = mode or query.get("mode", "audio")
+    if selected_mode not in {"audio", "video"}:
+        raise ValueError("YRobot realtime mode must be 'audio' or 'video'")
+    query["mode"] = selected_mode
     qs = "&".join(f"{k}={v}" for k, v in sorted(query.items()))
     return urlunsplit((parts.scheme, parts.netloc, path, qs, ""))
 
@@ -59,10 +62,9 @@ class Settings:
     # browser-demo cadence; 250 ms makes the model answer mid-utterance.
     chunk_ms: int = 500
 
-    # Camera frames ride along in input.append. Vision costs ~64 kv tokens
-    # per frame, so cadence adapts to conversation activity and frames are
-    # never sent while only the robot is speaking.
-    send_video: bool = True
+    # Audio mode is the latency-first default. Enabling video switches a bare
+    # URL to mode=video; an explicitly contradictory URL is rejected.
+    send_video: bool = False
     frame_period_active_s: float = 1.0
     frame_period_idle_s: float = 5.0
 
@@ -76,18 +78,45 @@ class Settings:
     vad_aggressiveness: int = 2
     head_tracking_weight: float = 0.4
 
+    def __post_init__(self) -> None:
+        if self.chunk_ms < 20 or self.chunk_ms % 20:
+            raise ValueError("YROBOT_CHUNK_MS must be a positive multiple of 20")
+        if self.send_video and self.realtime_mode != "video":
+            raise ValueError("YROBOT_SEND_VIDEO requires realtime mode=video")
+
+    @property
+    def realtime_mode(self) -> str:
+        """Public gateway mode selected in ``url``."""
+        return parse_qs(urlsplit(self.url).query).get("mode", ["audio"])[0]
+
     @classmethod
     def from_env(cls) -> Settings:
         """Build settings from ``YROBOT_*`` environment variables."""
         persona = os.environ.get("YROBOT_PERSONA", DEFAULT_PERSONA).strip()
+        raw_url = os.environ.get("YROBOT_REALTIME_URL", "minicpmo45.modelbest.cn")
+        send_video = _flag("YROBOT_SEND_VIDEO", False)
+        requested_mode = os.environ.get("YROBOT_REALTIME_MODE")
+        if requested_mode is not None:
+            requested_mode = requested_mode.strip().lower()
+        else:
+            raw_query = parse_qs(urlsplit(raw_url if "://" in raw_url else f"wss://{raw_url}").query)
+            # Keep an explicit URL mode authoritative. For legacy deployments
+            # that only set SEND_VIDEO, select the protocol mode that can
+            # actually carry frames.
+            requested_mode = None if "mode" in raw_query else ("video" if send_video else "audio")
+        url = normalize_url(raw_url, requested_mode)
+        actual_mode = parse_qs(urlsplit(url).query).get("mode", ["audio"])[0]
+        if send_video and actual_mode != "video":
+            raise ValueError("YROBOT_SEND_VIDEO requires realtime mode=video")
+        default_session_budget = 280.0 if actual_mode == "video" else 550.0
         return cls(
-            url=normalize_url(os.environ.get("YROBOT_REALTIME_URL", "minicpmo45.modelbest.cn")),
+            url=url,
             tls_verify=_flag("YROBOT_TLS_VERIFY", True),
             system_prompt=f"{TRAINED_SYSTEM_LINE}\n{persona}" if persona else TRAINED_SYSTEM_LINE,
             length_penalty=_num("YROBOT_LENGTH_PENALTY", 1.1),
             chunk_ms=int(_num("YROBOT_CHUNK_MS", 500)),
-            send_video=_flag("YROBOT_SEND_VIDEO", True),
-            session_budget_s=_num("YROBOT_SESSION_BUDGET_S", 550.0),
+            send_video=send_video,
+            session_budget_s=_num("YROBOT_SESSION_BUDGET_S", default_session_budget),
             kv_budget_tokens=_num("YROBOT_KV_BUDGET", 7200.0),
             reconnect_delay_s=_num("YROBOT_RECONNECT_DELAY_S", 2.5),
             vad_aggressiveness=int(_num("YROBOT_VAD_AGGRESSIVENESS", 2)),

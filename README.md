@@ -22,11 +22,11 @@ glances and dances its antennas while it talks. The whole application is ~900 li
 six single-purpose modules — it is meant to be *read*, not just run.
 
 ```
-you ──── voice / camera ──────────► XVF3800 AEC mic ─► VAD ─► 500 ms chunks ─┐
-                                       camera ──────► 1 fps JPEG (adaptive) ─┤
-                                                                             ▼
-                                              wss://…/v1/realtime?mode=audio (MiniCPM-o 4.5)
-                                                                             │
+you ─── voice ─► XVF3800 AEC mic ─► 20 ms VAD/control ─► bounded audio queue ─┐
+      camera ─► independent latest-only JPEG worker ──────────────────────────┤
+                                                                              ▼
+                                wss://…/v1/realtime?mode={audio|video}
+                                                                              │
 ◄── lifelike motion ◄─ 50 Hz choreographer ◄─ DoA compass                    │
 ◄── speech          ◄─ epoch-tagged speaker ◄─ 24 kHz audio deltas ◄─────────┘
 ```
@@ -37,20 +37,21 @@ Everything below is encoded in the source with the reasoning attached; this is t
 
 | Problem | Mechanism | Where |
 |---|---|---|
-| Reply latency | 500 ms uplink chunks (halves perceived latency vs the 1 s browser cadence; 250 ms breaks the model's turn-taking), `mode=audio` (600 s sessions, frames still accepted), adaptive 0.25–0.8 s playback preroll with a hard 1.2 s device backlog cap | `config.py`, `audio.py` |
-| Barge-in | Client-owned: the gateway's `force_listen` neither stops generation nor prevents the model *resuming* an interrupted monologue. On voice onset we flush the player and discard the whole stale turn; only two consecutive clean `listen` boundaries release the discard latch | `turn.py` |
+| Reply latency | Mic/VAD never waits for camera encoding or WebSocket sends. Audio enters a bounded realtime queue; video is latest-only. Adaptive 0.25–0.8 s playback preroll absorbs server jitter | `main.py`, `audio.py` |
+| Barge-in | Response-aware and client-owned: an interrupt atomically invalidates the old `response_id`, advances playback generation, drops stale queued uplink, and starts verification only after physical player-clear acknowledgement. Two clean `listen` boundaries remain only as fallback for old identity-less gateways | `turn.py`, `audio.py`, `main.py` |
 | False triggers from its own echo/motors | The AEC residual tracks the far-end envelope within a syllable, so barge-in is two-staged: an `EchoGuard` predicts the residual from the exact audio we played and gates candidates; a candidate then only *ducks* playback (un-played tail retained) and `DuckVerifier` re-checks with the speaker silent — sustained voice commits the flush, silence resumes losslessly and the guard learns the leakage. Motor noise is separately killed by an asymmetric RMS noise floor plus a 60 ms confirmation streak on top of WebRTC VAD | `audio.py`, `turn.py` |
-| Wooden motion | One 50 Hz thread owns the pose: phase-shifted breathing oscillators, held idle glances, cross-faded listening/speaking postures, a critically damped gaze spring. Speech articulation is the SDK's daemon-side `enable_wobbling()` (PTS-synced to the speaker), body rotation follows via `set_automatic_body_yaw(True)` | `motion.py` |
-| Deaf DoA | The XVF3800 firmware speech flag fires **pre-AEC** — it hears the robot itself, which is why naive DoA feels broken. We sample `DOA_VALUE_RADIANS` only while *our* VAD hears the user, average on the circle over 1 s, and hand the choreographer a dead-banded gaze target | `motion.py` |
+| Wooden motion | One 50 Hz thread owns the pose. Breathing and posture cross-fade; gaze and idle saccades both use velocity-limited second-order trajectories, so a new random glance cannot step the head in one tick | `motion.py` |
+| Deaf DoA | Samples are gated by post-echo confirmed user voice, transformed with the daemon's physical head pose, confidence-weighted with the XVF speech flag, circularly averaged, and dead-banded | `motion.py`, `main.py` |
 | Context rot | Vision costs ~64 kv tokens/frame against an ~8 k budget: frames go up at 1 fps in conversation, 0.2 fps idle, never while only the robot is speaking; sessions rotate at the first quiet moment past the time/kv budget | `main.py` |
 
 ## Protocol in one paragraph
 
-Connect to `wss://HOST/v1/realtime?mode=audio`, wait for `session.queue_done`, send
+Connect to `wss://HOST/v1/realtime?mode=audio` for voice-only or `mode=video` for
+camera input, wait for `session.queue_done`, send
 `session.init` (the system prompt must start with the trained line `You are a helpful
 assistant.` — a free-form persona drifts the model out of its duplex distribution), wait
 ~14 s for `session.created`, then stream `input.append` units: base64 float32 16 kHz mono
-audio, optional base64 JPEG `video_frames`, optional `force_listen`. The server streams
+audio, optional `force_listen`, and—only in video mode—base64 JPEG `video_frames`. The server streams
 `response.output.delta` events with `kind ∈ {listen, text, audio}` (audio is 24 kHz
 float32); **only `listen` is an utterance boundary** — text and audio are independent
 streams. See `realtime.py`.

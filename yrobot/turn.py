@@ -6,13 +6,11 @@ monologue. Interruption therefore has to be client-owned:
 
 * the instant the user speaks over robot audio, playback is flushed locally
   and every stale audio delta of that turn is discarded;
-* every uplink chunk carries ``force_listen`` while the user keeps talking,
-  and a rate-limited re-force fires when discarded audio arrives after the
-  user went quiet;
-* the discard latch releases only after **two consecutive clean listens** —
-  a listen with the user quiet for ≥ ``QUIET_S`` that is not merely the ack
-  of a force we sent within ``FORCE_ACK_S``. Stale model audio resets the
-  streak (the resume signature is "listen, then old audio one slice later").
+* official ``response_id`` values permanently invalidate the interrupted
+  response and immediately admit a different response; this prevents a late
+  old delta from being relabelled as the new playback generation;
+* older self-hosted gateways without response identities retain the defensive
+  two-clean-listen fallback and rate-limited re-force behaviour.
 
 Pure logic over injected timestamps — no I/O, fully unit-testable.
 """
@@ -22,7 +20,7 @@ from __future__ import annotations
 QUIET_S = 0.7  # user silence needed for a listen to count as clean
 FORCE_ACK_S = 1.2  # a listen this close to our force is just its ack
 REFORCE_S = 1.0  # min spacing of re-forces triggered by stale audio
-CLEAN_LISTENS = 2  # consecutive clean listens required to unlatch
+CLEAN_LISTENS = 2  # fallback for old servers that omit response_id
 LATCH_CAP_S = 12.0  # absolute upper bound on discarding
 
 
@@ -36,6 +34,9 @@ class TurnGate:
         self._pending_force = False
         self._last_force_at = -1e9
         self._last_voice_at = -1e9
+        self._active_response_id = ""
+        self._interrupted_response_id = ""
+        self._blocked_response_ids: set[str] = set()
 
     @property
     def latched(self) -> bool:
@@ -52,20 +53,49 @@ class TurnGate:
             self._latched_at = now
             self._clean_streak = 0
             self._pending_force = True
+            self._interrupted_response_id = self._active_response_id
+            if self._interrupted_response_id:
+                self._blocked_response_ids.add(self._interrupted_response_id)
             return True
         if self._latched:
             self._pending_force = True  # keep forcing while the user talks
         return False
 
-    def model_audio(self, now: float) -> bool:
+    def model_audio(self, now: float, response_id: str = "") -> bool:
         """Audio delta arrived. Returns True if it may be played."""
+        if response_id and response_id in self._blocked_response_ids:
+            self._stale_output(now)
+            return False
+        if self._latched and response_id and self._interrupted_response_id:
+            # Official gateway responses are identity-bearing. A different
+            # response is the model's answer to the interrupt, not a resumed
+            # tail, so release immediately without waiting for heuristic
+            # listen streaks.
+            if response_id != self._interrupted_response_id:
+                self._unlatch()
         if not self._latched:
+            if response_id:
+                self._active_response_id = response_id
             return True
-        self._clean_streak = 0  # the monologue is still coming
-        if now - self._last_voice_at >= QUIET_S and now - self._last_force_at >= REFORCE_S:
-            self._pending_force = True  # user is quiet yet audio persists: re-force
-        self._maybe_expire(now)
+        self._stale_output(now)
         return not self._latched
+
+    def model_text(self, now: float, response_id: str = "") -> bool:
+        """Track response identity for captions and the following audio."""
+        if response_id and response_id in self._blocked_response_ids:
+            return False
+        if self._latched and response_id and self._interrupted_response_id:
+            if response_id != self._interrupted_response_id:
+                self._unlatch()
+        if not self._latched and response_id:
+            self._active_response_id = response_id
+        return not self._latched
+
+    def _stale_output(self, now: float) -> None:
+        self._clean_streak = 0
+        if now - self._last_voice_at >= QUIET_S and now - self._last_force_at >= REFORCE_S:
+            self._pending_force = True
+        self._maybe_expire(now)
 
     def model_listen(self, now: float) -> None:
         """Listen delta arrived — the only semantic utterance boundary."""
@@ -97,6 +127,7 @@ class TurnGate:
         self._latched = False
         self._pending_force = False
         self._clean_streak = 0
+        self._interrupted_response_id = ""
 
 
 class DuckVerifier:

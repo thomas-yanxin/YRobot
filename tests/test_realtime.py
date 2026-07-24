@@ -11,7 +11,14 @@ from yrobot.realtime import ThinkFilter, _parse_delta
 def test_normalize_url_variants():
     full = "wss://minicpmo45.modelbest.cn/v1/realtime?mode=audio"
     assert normalize_url("minicpmo45.modelbest.cn") == full
-    assert normalize_url("wss://minicpmo45.modelbest.cn/v1/realtime?mode=video") == full
+    assert (
+        normalize_url("wss://minicpmo45.modelbest.cn/v1/realtime?mode=video")
+        == "wss://minicpmo45.modelbest.cn/v1/realtime?mode=video"
+    )
+    assert (
+        normalize_url("wss://minicpmo45.modelbest.cn/v1/realtime?mode=video", "audio")
+        == full
+    )
     assert (
         normalize_url("wss://10.0.16.184:8006") == "wss://10.0.16.184:8006/v1/realtime?mode=audio"
     )
@@ -23,10 +30,16 @@ def test_parse_audio_delta_roundtrip():
         "type": "response.output.delta",
         "kind": "audio",
         "audio": base64.b64encode(pcm.tobytes()).decode(),
+        "response_id": "resp-1",
+        "input_id": "input-1",
+        "metrics": {"kv_cache_length": 321},
     }
     delta = _parse_delta(event)
     assert delta.kind == "audio"
     assert np.allclose(delta.audio, pcm)
+    assert delta.response_id == "resp-1"
+    assert delta.input_id == "input-1"
+    assert delta.metrics["kv_cache_length"] == 321
 
 
 def test_parse_listen_and_text():

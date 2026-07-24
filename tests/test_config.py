@@ -1,5 +1,7 @@
 """Unit tests for environment-driven settings."""
 
+import pytest
+
 from yrobot.config import TRAINED_SYSTEM_LINE, Settings
 
 
@@ -7,6 +9,8 @@ def test_defaults_target_official_gateway():
     s = Settings()
     assert s.url == "wss://minicpmo45.modelbest.cn/v1/realtime?mode=audio"
     assert s.chunk_ms == 500
+    assert s.send_video is False
+    assert s.realtime_mode == "audio"
     assert s.system_prompt.startswith(TRAINED_SYSTEM_LINE + "\n")
 
 
@@ -26,3 +30,26 @@ def test_from_env_overrides(monkeypatch):
 def test_empty_persona_keeps_trained_line_only(monkeypatch):
     monkeypatch.setenv("YROBOT_PERSONA", "  ")
     assert Settings.from_env().system_prompt == TRAINED_SYSTEM_LINE
+
+
+def test_send_video_selects_video_mode_for_legacy_bare_url(monkeypatch):
+    monkeypatch.setenv("YROBOT_REALTIME_URL", "10.0.16.184:8006")
+    monkeypatch.setenv("YROBOT_SEND_VIDEO", "true")
+    s = Settings.from_env()
+    assert s.realtime_mode == "video"
+    assert s.session_budget_s == 280.0
+
+
+def test_explicit_audio_mode_rejects_video_frames(monkeypatch):
+    monkeypatch.setenv(
+        "YROBOT_REALTIME_URL",
+        "wss://10.0.16.184:8006/v1/realtime?mode=audio",
+    )
+    monkeypatch.setenv("YROBOT_SEND_VIDEO", "true")
+    with pytest.raises(ValueError, match="mode=video"):
+        Settings.from_env()
+
+
+def test_chunk_size_must_align_to_capture_frames():
+    with pytest.raises(ValueError, match="multiple of 20"):
+        Settings(chunk_ms=333)

@@ -2,12 +2,13 @@
 
 Protocol (verified against https://minicpmo45.modelbest.cn/docs/en/realtime-api/):
 
-    connect  ?mode=audio
+    connect  ?mode={audio|video}
       <- session.queued / session.queue_update      (position in line)
       <- session.queue_done                          (worker assigned)
       -> session.init {system_prompt, config}
       <- session.created                             (~14 s: server model reset)
-      -> input.append {audio, video_frames?, force_listen?}   every chunk_ms
+      -> input.append {audio, force_listen?}                  every chunk_ms
+                       + video_frames only in mode=video
       <- response.output.delta kind in {listen,text,audio}
       -> session.close / <- session.closed
 
@@ -46,6 +47,10 @@ class Delta:
     kind: str  # "listen" | "text" | "audio"
     text: str = ""
     audio: np.ndarray = field(default_factory=lambda: np.empty(0, np.float32))
+    response_id: str = ""
+    input_id: str = ""
+    metrics: dict = field(default_factory=dict)
+    received_at: float = field(default_factory=time.monotonic)
 
 
 class ThinkFilter:
@@ -142,6 +147,7 @@ class RealtimeClient:
         payload: dict = {"audio": base64.b64encode(audio_16k.astype("<f4").tobytes()).decode()}
         if jpeg is not None:
             payload["video_frames"] = [base64.b64encode(jpeg).decode()]
+            payload["max_slice_nums"] = 1
         if force_listen:
             payload["force_listen"] = True
         self._send({"type": "input.append", "input": payload})
@@ -205,8 +211,13 @@ class RealtimeClient:
 
 
 def _parse_delta(event: dict) -> Delta:
+    common = {
+        "response_id": event.get("response_id", ""),
+        "input_id": event.get("input_id", ""),
+        "metrics": dict(event.get("metrics") or {}),
+    }
     kind = event.get("kind", "")
     if kind == "audio":
         pcm = np.frombuffer(base64.b64decode(event.get("audio", "")), dtype="<f4")
-        return Delta(kind="audio", audio=pcm)
-    return Delta(kind=kind, text=event.get("text", ""))
+        return Delta(kind="audio", audio=pcm, **common)
+    return Delta(kind=kind, text=event.get("text", ""), **common)

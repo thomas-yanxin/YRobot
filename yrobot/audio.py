@@ -143,13 +143,25 @@ class UplinkGain:
     MAX_GAIN = 8.0
     SPEECH_FLOOR_RMS = 0.006
     SMOOTHING = 0.3
+    PLAYBACK_RELEASE = 0.2
 
     def __init__(self) -> None:
         self.gain = 1.0
 
-    def process(self, chunk: np.ndarray) -> np.ndarray:
+    def process(
+        self,
+        chunk: np.ndarray,
+        *,
+        playback_active: bool = False,
+        confirmed_user_voice: bool = False,
+    ) -> np.ndarray:
         rms = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
-        if rms > self.SPEECH_FLOOR_RMS:
+        if playback_active and not confirmed_user_voice:
+            # Do not preserve a large user-learned gain while only our own
+            # AEC residual is present. It can otherwise make the model hear
+            # and answer the robot itself.
+            self.gain += (1.0 - self.gain) * self.PLAYBACK_RELEASE
+        elif rms > self.SPEECH_FLOOR_RMS:
             target = min(self.MAX_GAIN, max(1.0, self.TARGET_RMS / rms))
             self.gain += (target - self.gain) * self.SMOOTHING
         return np.clip(chunk * self.gain, -1.0, 1.0).astype(np.float32)
@@ -282,31 +294,60 @@ class Speaker(threading.Thread):
         self._tail_ring = np.empty(0, np.float32)  # playback thread only
         self._push_log: deque[tuple[float, float, float]] = deque()
         self._log_lock = threading.Lock()
+        self._command_lock = threading.Lock()
+        self._flush_event = threading.Event()
+        self._hold_ack = threading.Event()
+        self._hold_completed_at = 0.0
+        self._flushed_epoch = 0
+        self._flush_condition = threading.Condition()
         self._halt = threading.Event()
 
     # -- called from other threads ----------------------------------------
 
     @property
     def epoch(self) -> int:
-        return self._epoch
+        with self._command_lock:
+            return self._epoch
 
     @property
     def holding(self) -> bool:
         return self._holding or self._hold_req
 
     def play(self, epoch: int, pcm_24k: np.ndarray) -> None:
-        if epoch == self._epoch:
-            self._q.put((epoch, pcm_24k))
+        with self._command_lock:
+            if epoch == self._epoch:
+                self._q.put((epoch, pcm_24k))
 
     def interrupt(self) -> int:
         """Committed barge-in: advance the epoch and flush everything."""
-        self._epoch += 1
-        self._flush_to = self._epoch
-        return self._epoch
+        with self._command_lock:
+            self._epoch += 1
+            self._flush_to = self._epoch
+            epoch = self._epoch
+            self._hold_ack.clear()
+            self._flush_event.set()
+            return epoch
 
     def hold(self) -> None:
         """Duck: silence the device now, keep the turn resumable."""
+        self._hold_ack.clear()
+        self._hold_completed_at = 0.0
         self._hold_req = True
+
+    def hold_completed_at(self) -> float | None:
+        """Physical clear completion time, or None while a hold is pending."""
+        return self._hold_completed_at if self._hold_ack.is_set() else None
+
+    def wait_flushed(self, epoch: int, timeout: float | None = None) -> bool:
+        """Wait until the playback thread has cleared through ``epoch``."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._flush_condition:
+            while self._flushed_epoch < epoch:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._flush_condition.wait(remaining)
+            return True
 
     def release_hold(self) -> None:
         """The duck was a false alarm: re-inject the held tail and go on."""
@@ -335,6 +376,11 @@ class Speaker(threading.Thread):
         now = time.monotonic() if now is None else now
         return self._pushed_until - now > 0.02 or self.holding
 
+    def playing(self, now: float | None = None) -> bool:
+        """Whether audio is physically scheduled and not currently ducked."""
+        now = time.monotonic() if now is None else now
+        return self._pushed_until - now > 0.02 and not self.holding
+
     def playout_db(self, now: float) -> float:
         """Loudest block scheduled within the envelope lookback window."""
         loudest = SILENT_DB
@@ -348,16 +394,22 @@ class Speaker(threading.Thread):
 
     def close(self) -> None:
         self._halt.set()
+        self._flush_event.set()
 
     # -- playback thread ----------------------------------------------------
 
     def run(self) -> None:
         flushed_at = 0
         while not self._halt.is_set():
-            if self._flush_to > flushed_at:
-                flushed_at = self._flush_to
+            if self._flush_event.is_set():
+                with self._command_lock:
+                    flushed_at = self._flush_to
+                    self._flush_event.clear()
                 self._reset_turn()
                 self._clear_device()
+                with self._flush_condition:
+                    self._flushed_epoch = max(self._flushed_epoch, flushed_at)
+                    self._flush_condition.notify_all()
                 continue
             if self._hold_req:
                 self._hold_req = False
@@ -399,9 +451,11 @@ class Speaker(threading.Thread):
         self._clear_device()
         self._pushed_until = now
         self._truncate_log(now)
+        self._hold_completed_at = time.monotonic()
+        self._hold_ack.set()
 
     def _stream_pending(self) -> None:
-        while self._pending and self._flush_to <= self._epoch and not self._halt.is_set():
+        while self._pending and not self._flush_event.is_set() and not self._halt.is_set():
             now = time.monotonic()
             if self._pushed_until - now > self.BACKLOG_CAP_S:
                 return  # revisit on the next loop tick; keep flushes cheap

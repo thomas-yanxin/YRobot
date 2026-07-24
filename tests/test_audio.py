@@ -1,5 +1,6 @@
 """Unit tests for capture, VAD gating, echo guard, resampling and playback."""
 
+import threading
 import time
 
 import numpy as np
@@ -117,6 +118,22 @@ def test_uplink_gain_never_amplifies_loud_speech_or_clips():
     assert float(np.abs(out).max()) <= 1.0
 
 
+def test_uplink_gain_releases_in_playback_without_confirmed_user():
+    agc = UplinkGain()
+    quiet_speech = np.full(8000, 0.02, np.float32)
+    for _ in range(10):
+        agc.process(quiet_speech)
+    boosted = agc.gain
+    assert boosted > 2.0
+    for _ in range(5):
+        agc.process(
+            quiet_speech,
+            playback_active=True,
+            confirmed_user_voice=False,
+        )
+    assert 1.0 < agc.gain < boosted
+
+
 def test_echo_guard_passes_when_nothing_played():
     assert EchoGuard().observe(mic_db=-40.0, playout_db=-120.0) is True
 
@@ -191,10 +208,12 @@ def test_speaker_duck_then_resume_is_lossless():
         assert media.pushed
 
         speaker.hold()
+        assert speaker.hold_completed_at() is None
         deadline = time.monotonic() + 2.0
         while media.cleared == 0 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert media.cleared == 1
+        assert speaker.hold_completed_at() is not None
         assert speaker.audible()  # the held turn is still live
         assert speaker.playout_db(time.monotonic()) > -120.0  # envelope kept
 
@@ -205,5 +224,35 @@ def test_speaker_duck_then_resume_is_lossless():
         assert len(media.pushed) == 2
         assert 0 < len(media.pushed[1]) <= 16_000  # the un-played tail only
     finally:
+        speaker.close()
+        speaker.join(timeout=2)
+
+
+def test_speaker_reports_clear_completion_not_request_time():
+    clear_allowed = threading.Event()
+
+    class BlockingClearMedia(FakeMedia):
+        def clear_player(self):
+            clear_allowed.wait(2.0)
+            super().clear_player()
+
+    media = BlockingClearMedia()
+    speaker = Speaker(media)
+    speaker.start()
+    try:
+        speaker.hold()
+        time.sleep(0.08)
+        assert speaker.hold_completed_at() is None
+        clear_allowed.set()
+        deadline = time.monotonic() + 2.0
+        while speaker.hold_completed_at() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert speaker.hold_completed_at() is not None
+
+        epoch = speaker.interrupt()
+        assert speaker.wait_flushed(epoch, timeout=2.0)
+        assert media.cleared >= 2
+    finally:
+        clear_allowed.set()
         speaker.close()
         speaker.join(timeout=2)

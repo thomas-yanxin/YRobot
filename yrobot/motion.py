@@ -10,10 +10,9 @@ Design rules that keep motion lifelike:
   (daemon-side, PTS-synced to the actual speaker output) and body rotation
   to ``set_automatic_body_yaw(True)`` — both compose with our target pose;
 * the XVF3800 DoA angle (0 = left, π/2 = front/back-ambiguous, π = right,
-  head-relative) is sampled **only while our own VAD hears the user** —
-  the firmware speech flag fires pre-AEC, i.e. also on the robot's own
-  voice, which is why naive DoA feels deaf. A one-second circular window
-  plus a dead-band turns raw readings into stable gaze targets.
+  head-relative) is sampled only after VAD *and* echo rejection confirm the
+  user. The firmware speech flag supplies confidence rather than the gate,
+  and the physical daemon pose transforms samples into the world frame.
 """
 
 from __future__ import annotations
@@ -63,8 +62,9 @@ def doa_to_yaw_delta(angle: float) -> float:
 class SoundCompass(threading.Thread):
     """Polls DoA at 12 Hz and publishes stable world-frame gaze targets."""
 
+    RATE_HZ = 12
     WINDOW_S = 1.0
-    MIN_SAMPLES = 3
+    MIN_CONFIDENCE = 3.0
     DEADBAND_RAD = 0.12  # ≈7°: don't chase noise around the current gaze
 
     def __init__(
@@ -85,9 +85,9 @@ class SoundCompass(threading.Thread):
         self._halt.set()
 
     def run(self) -> None:
-        samples: list[tuple[float, float]] = []  # (time, world yaw)
+        samples: list[tuple[float, float, float]] = []  # (time, world yaw, confidence)
         failures = 0
-        while not self._halt.wait(1 / 10):
+        while not self._halt.wait(1 / self.RATE_HZ):
             if not self._user_active():
                 samples.clear()
                 continue
@@ -106,18 +106,25 @@ class SoundCompass(threading.Thread):
                 continue
             if reading is None:
                 continue
-            angle, _pre_aec_speech = reading  # flag intentionally unused
+            angle, device_speech = reading
             now = time.monotonic()
             try:
-                yaw = self._head_yaw() + doa_to_yaw_delta(angle)
+                head_yaw = self._head_yaw()
+                yaw = head_yaw + doa_to_yaw_delta(angle)
             except Exception:  # daemon read hiccup: skip this sample
                 continue
-            samples.append((now, yaw))
-            samples = [(t, y) for t, y in samples if now - t <= self.WINDOW_S]
-            if len(samples) < self.MIN_SAMPLES:
+            # The firmware flag is pre-AEC and cannot establish "user", but
+            # once the post-echo application gate is open it is useful as a
+            # confidence boost: two device-confirmed samples react faster,
+            # while three software-confirmed samples still work during
+            # XVF double-talk suppression.
+            confidence = 2.0 if device_speech else 1.0
+            samples.append((now, yaw, confidence))
+            samples = [(t, y, w) for t, y, w in samples if now - t <= self.WINDOW_S]
+            if sum(w for _, _, w in samples) < self.MIN_CONFIDENCE:
                 continue
-            target = circular_mean([y for _, y in samples])
-            if abs(_wrap(target - self._head_yaw())) > self.DEADBAND_RAD:
+            target = weighted_circular_mean([(y, w) for _, y, w in samples])
+            if abs(_wrap(target - head_yaw)) > self.DEADBAND_RAD:
                 self._on_target(target)
 
 
@@ -125,6 +132,17 @@ def circular_mean(angles: list[float]) -> float:
     return math.atan2(
         sum(math.sin(a) for a in angles) / len(angles),
         sum(math.cos(a) for a in angles) / len(angles),
+    )
+
+
+def weighted_circular_mean(samples: list[tuple[float, float]]) -> float:
+    """Circular mean for ``(angle, positive weight)`` samples."""
+    total = sum(weight for _, weight in samples)
+    if total <= 0:
+        raise ValueError("circular weights must sum to a positive value")
+    return math.atan2(
+        sum(math.sin(angle) * weight for angle, weight in samples) / total,
+        sum(math.cos(angle) * weight for angle, weight in samples) / total,
     )
 
 
@@ -174,7 +192,8 @@ class Choreographer(threading.Thread):
         self._mode_blend = {IDLE: 1.0, LISTEN: 0.0, SPEAK: 0.0}
         self._gaze = GazeSpring()
         self._last_voice_at = -1e9
-        self._saccade = (0.0, 0.0)
+        self._saccade_yaw = GazeSpring(omega=10.0, max_vel=1.2)
+        self._saccade_pitch = GazeSpring(omega=10.0, max_vel=0.8)
         self._next_saccade_at = 0.0
         self._antennas = np.array([self.ANTENNA_NEUTRAL, self.ANTENNA_NEUTRAL])
         self._still_until = 0.0
@@ -258,10 +277,15 @@ class Choreographer(threading.Thread):
         roll = 0.012 * amp * math.sin(2 * math.pi * 0.11 * t + 2.1)
 
         # Idle saccades: brief held glances, walked back when engaged.
-        if now >= self._next_saccade_at and self._still < 0.1:
+        if idle > 0.8 and now >= self._next_saccade_at and self._still < 0.1:
             self._next_saccade_at = now + random.uniform(4.0, 9.0)
-            self._saccade = (random.uniform(-0.25, 0.25), random.uniform(-0.10, 0.12))
-        sac_yaw, sac_pitch = (s * idle * calm for s in self._saccade)
+            self._saccade_yaw.target = random.uniform(-0.25, 0.25)
+            self._saccade_pitch.target = random.uniform(-0.10, 0.12)
+        elif idle < 0.5:
+            self._saccade_yaw.target = 0.0
+            self._saccade_pitch.target = 0.0
+        sac_yaw = self._saccade_yaw.step(dt, freeze=self._still) * idle * calm
+        sac_pitch = self._saccade_pitch.step(dt, freeze=self._still) * idle * calm
 
         # Conversation posture.
         pitch += 0.06 * listen - 0.03 * speak  # lean in to listen, lift to speak

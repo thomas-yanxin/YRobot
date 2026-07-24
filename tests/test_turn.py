@@ -34,6 +34,26 @@ def test_stale_audio_discarded_while_latched():
     assert gate.model_audio(2.0) is False
 
 
+def test_response_identity_releases_new_reply_but_never_old_tail():
+    gate = TurnGate()
+    assert gate.model_audio(0.5, "response-old") is True
+    assert barge(gate, 1.0) is True
+    assert gate.model_audio(1.1, "response-old") is False
+    assert gate.model_audio(1.2, "response-new") is True
+    assert not gate.latched
+    # The old identity stays invalid even after the new response starts.
+    assert gate.model_audio(1.3, "response-old") is False
+
+
+def test_text_identity_tracks_response_before_first_audio():
+    gate = TurnGate()
+    assert gate.model_text(0.5, "response-old") is True
+    assert barge(gate, 1.0) is True
+    assert gate.model_text(1.1, "response-old") is False
+    assert gate.model_text(1.2, "response-new") is True
+    assert gate.model_audio(1.3, "response-new") is True
+
+
 def test_force_listen_rides_chunks_while_user_talks():
     gate = TurnGate()
     barge(gate, 1.0)
