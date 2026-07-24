@@ -195,6 +195,7 @@ class RealtimeClient:
 
     def _receiver(self) -> None:
         reason = "connection_lost"
+        queued_since: float | None = None
         try:
             assert self._ws is not None
             for raw in self._ws:
@@ -203,11 +204,22 @@ class RealtimeClient:
                 if etype == "response.output.delta":
                     self._on_delta(_parse_delta(event))
                 elif etype in ("session.queued", "session.queue_update"):
+                    now = time.monotonic()
+                    queued_since = queued_since or now
                     logger.info(
                         "queued: position %s, ~%ss wait",
                         event.get("position"),
                         event.get("estimated_wait_s"),
                     )
+                    if now - queued_since > 15.0:
+                        queued_since = float("inf")  # warn once per connection
+                        logger.warning(
+                            "still queued after 15 s: the gateway worker is held by "
+                            "another client — check for a second yrobot instance "
+                            "(pgrep -af yrobot; dashboard-launched app?), another "
+                            "machine/browser demo on this gateway, or a wedged "
+                            "session that needs a gateway restart"
+                        )
                 elif etype == "session.queue_done":
                     self._queue_done.set()
                 elif etype == "session.created":
