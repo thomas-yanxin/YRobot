@@ -12,7 +12,6 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -160,9 +159,12 @@ class _Lifecycle:
         websocket: ClientConnection,
         event: dict[str, Any],
         after_send: Callable[[], None] | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> None:
-        serialized = serialize_client_event(event)  # type: ignore[arg-type]
         async with self.send_lock:
+            if before_send is not None:
+                before_send()
+            serialized = serialize_client_event(event)  # type: ignore[arg-type]
             async with self.state_lock:
                 next_state = transition_client(self.state, event)  # type: ignore[arg-type]
                 # Commit before the write. A send failure terminates this
@@ -672,15 +674,32 @@ class RealtimeClient:
                 force_listen=snapshot.force_listen,
                 max_slice_nums=1,
             )
-            after_send = (
-                partial(self.coordinator.force_listen_sent, snapshot.epoch)
-                if snapshot.force_listen
-                else None
-            )
+            if snapshot.force_listen:
+                force_epoch = snapshot.epoch
+                force_claimed = [False]
+
+                def before_send(
+                    event_to_send: dict[str, Any] = event,
+                    epoch_to_claim: int = force_epoch,
+                    claimed: list[bool] = force_claimed,
+                ) -> None:
+                    claimed[0] = self._claim_force_listen(event_to_send, epoch_to_claim)
+
+                def after_send(
+                    epoch_to_commit: int = force_epoch,
+                    claimed: list[bool] = force_claimed,
+                ) -> None:
+                    if claimed[0]:
+                        self.coordinator.force_listen_sent(epoch_to_commit)
+
+            else:
+                before_send = None
+                after_send = None
             await self._send_input(
                 websocket,
                 lifecycle,
                 event,
+                before_send,
                 after_send,
             )
             sent_at = time.monotonic()
@@ -703,10 +722,16 @@ class RealtimeClient:
         websocket: ClientConnection,
         lifecycle: _Lifecycle,
         event: dict[str, Any],
+        before_send: Callable[[], None] | None,
         after_send: Callable[[], None] | None,
     ) -> None:
         sending = asyncio.create_task(
-            lifecycle.send_then(websocket, event, after_send),
+            lifecycle.send_then(
+                websocket,
+                event,
+                after_send=after_send,
+                before_send=before_send,
+            ),
             name="minicpmo-input-send",
         )
         try:
@@ -748,6 +773,15 @@ class RealtimeClient:
         if not sending.done():
             sending.cancel()
         await asyncio.gather(sending, return_exceptions=True)
+
+    def _claim_force_listen(self, event: dict[str, Any], epoch: int) -> bool:
+        claimed = self.coordinator.force_listen_started(epoch)
+        if claimed:
+            return True
+        payload = event.get("input")
+        if isinstance(payload, dict):
+            payload["force_listen"] = False
+        return False
 
     async def _next_input(
         self,

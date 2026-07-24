@@ -95,6 +95,126 @@ def test_slow_uplink_write_does_not_block_downlink_lifecycle() -> None:
     asyncio.run(scenario())
 
 
+def test_listen_during_force_uplink_accepts_following_audio_without_waiting() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        encoded = base64.b64encode(np.zeros(240, dtype="<f4").tobytes()).decode("ascii")
+
+        class BlockingWebSocket:
+            def __init__(self) -> None:
+                self.events = [
+                    json.dumps(
+                        {
+                            "type": "response.output.delta",
+                            "kind": "listen",
+                            "session_id": "sess-1",
+                            "metrics": {},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "response.output.delta",
+                            "kind": "audio",
+                            "session_id": "sess-1",
+                            "response_id": "response-1",
+                            "audio": encoded,
+                            "metrics": {},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "session.closed",
+                            "session_id": "sess-1",
+                            "reason": "test",
+                        }
+                    ),
+                ]
+
+            async def recv(self) -> str:
+                await asyncio.sleep(0)
+                return self.events.pop(0)
+
+            async def send(self, _raw: str) -> None:
+                started.set()
+                await release.wait()
+
+        turns = TurnCoordinator()
+        epoch = turns.new_session()
+        assert turns.accept_audio("response-1") == epoch
+        interrupted_epoch = turns.interrupt()
+        assert interrupted_epoch == epoch + 1
+        listens: list[int] = []
+        received: list[tuple[int, str | None]] = []
+        client = make_client(
+            turns,
+            on_listen=listens.append,
+            on_audio=lambda _samples, audio_epoch, response_id, _received_at: received.append(
+                (audio_epoch, response_id)
+            ),
+        )
+        lifecycle = _Lifecycle()
+        lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+        websocket = BlockingWebSocket()
+        sending = asyncio.create_task(
+            client._send_input(
+                websocket,  # type: ignore[arg-type]
+                lifecycle,
+                input_append(
+                    np.zeros(16_000, dtype="<f4").tobytes(),
+                    force_listen=True,
+                ),
+                lambda: turns.force_listen_started(interrupted_epoch),
+                lambda: turns.force_listen_sent(interrupted_epoch),
+            )
+        )
+
+        await started.wait()
+        await client._receiver(  # type: ignore[arg-type]
+            websocket,
+            lifecycle,
+            asyncio.Event(),
+        )
+        assert listens == [interrupted_epoch]
+        assert received == [(interrupted_epoch, "response-1")]
+        assert turns.snapshot().phase is InteractionPhase.SPEAKING
+
+        release.set()
+        await sending
+        assert client.metrics.listen_deltas == 1
+
+    asyncio.run(scenario())
+
+
+def test_stale_force_snapshot_is_downgraded_before_wire_serialization() -> None:
+    turns = TurnCoordinator()
+    epoch = turns.new_session()
+    assert turns.accept_audio("response-1") == epoch
+    interrupted_epoch = turns.interrupt()
+    assert interrupted_epoch == epoch + 1
+    event = input_append(
+        np.zeros(16_000, dtype="<f4").tobytes(),
+        force_listen=True,
+    )
+
+    assert turns.force_listen_sent(interrupted_epoch)
+    assert turns.model_listening() == interrupted_epoch
+    client = make_client(turns)
+    websocket = FakeWebSocket()
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.CREATED, "sess-1")
+
+    asyncio.run(
+        lifecycle.send_then(
+            websocket,  # type: ignore[arg-type]
+            event,
+            before_send=lambda: client._claim_force_listen(event, interrupted_epoch),
+        )
+    )
+
+    assert websocket.sent[0]["input"]["force_listen"] is False
+
+
 def test_session_close_is_skipped_when_server_closes_during_send_race() -> None:
     async def scenario() -> None:
         websocket = FakeWebSocket()
@@ -776,7 +896,7 @@ def test_interrupted_audio_is_dropped_until_listen_boundary() -> None:
                 "type": "response.output.delta",
                 "kind": "audio",
                 "session_id": "sess-1",
-                "response_id": "new",
+                "response_id": "old",
                 "audio": encoded,
                 "metrics": {},
             },
@@ -812,10 +932,66 @@ def test_interrupted_audio_is_dropped_until_listen_boundary() -> None:
         )
     )
 
-    assert received == [(interrupted_epoch, "new")]
+    assert received == [(interrupted_epoch, "old")]
     assert listens == [interrupted_epoch]
     assert turns.snapshot().phase is InteractionPhase.SPEAKING
     assert lifecycle.state.phase is Phase.CLOSED
+
+
+def test_anonymous_audio_resumes_only_after_forced_listen_boundary() -> None:
+    encoded = base64.b64encode(np.zeros(240, dtype="<f4").tobytes()).decode("ascii")
+    websocket = FakeWebSocket(
+        [
+            {
+                "type": "response.output.delta",
+                "kind": "audio",
+                "session_id": "sess-1",
+                "audio": encoded,
+                "metrics": {},
+            },
+            {
+                "type": "response.output.delta",
+                "kind": "listen",
+                "session_id": "sess-1",
+                "metrics": {},
+            },
+            {
+                "type": "response.output.delta",
+                "kind": "audio",
+                "session_id": "sess-1",
+                "audio": encoded,
+                "metrics": {},
+            },
+            {
+                "type": "session.closed",
+                "session_id": "sess-1",
+                "reason": "test",
+            },
+        ]
+    )
+    turns = TurnCoordinator()
+    turns.new_session()
+    turns.accept_audio(None)
+    interrupted_epoch = turns.interrupt()
+    assert interrupted_epoch is not None
+    assert turns.force_listen_sent(interrupted_epoch)
+    received: list[tuple[int, str | None]] = []
+    client = make_client(
+        turns,
+        on_audio=lambda _samples, epoch, response, _received_at: received.append((epoch, response)),
+    )
+    lifecycle = _Lifecycle()
+    lifecycle.state = ProtocolState(Phase.STREAMING, "sess-1")
+
+    asyncio.run(
+        client._receiver(  # type: ignore[arg-type]
+            websocket,
+            lifecycle,
+            asyncio.Event(),
+        )
+    )
+
+    assert received == [(interrupted_epoch, None)]
 
 
 def test_audio_callback_receives_raw_timestamp_before_packet_diagnostics() -> None:

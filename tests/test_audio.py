@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,10 +16,13 @@ from yrobot.audio import (
     FrameSplitter,
     NearEndDetector,
     PlaybackEngine,
+    PlaybackGate,
     PlaybackPacket,
     StreamingResampler,
+    VoiceDecision,
     mono_capture,
 )
+from yrobot.state import InteractionPhase, TurnCoordinator
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
@@ -269,6 +273,275 @@ def test_human_double_talk_is_not_swallowed_by_echo_guard() -> None:
     assert decisions[-1].barge_in
 
 
+def test_preplay_speech_rearms_on_first_push_with_fresh_80_ms() -> None:
+    detector = NearEndDetector(
+        min_rms=0.001,
+        vad=AlwaysSpeech(),
+    )
+    speech = np.full(320, 0.08, dtype=np.float32)
+    disarmed = PlaybackGate()
+
+    preplay = [
+        detector.process(
+            speech,
+            output_active=False,
+            playback_gate=disarmed,
+            capture_block_id=index,
+            timestamp=index * 0.02,
+        )
+        for index in range(6)
+    ]
+    assert preplay[-1].near_end
+    assert not any(decision.barge_in for decision in preplay)
+
+    armed = PlaybackGate(
+        generation=1,
+        epoch=7,
+        response_id="response-1",
+        armed=True,
+        armed_at=0.12,
+        audible=True,
+        echo_guard_active=True,
+    )
+    crossing_block = [
+        detector.process(
+            speech,
+            output_active=True,
+            playback_gate=armed,
+            capture_block_id=100,
+            timestamp=0.14,
+        )
+        for _ in range(6)
+    ]
+    assert crossing_block[-1].near_end
+    assert not any(decision.barge_in for decision in crossing_block)
+
+    fresh = [
+        detector.process(
+            speech,
+            output_active=True,
+            playback_gate=armed,
+            capture_block_id=101 + index,
+            timestamp=0.16 + index * 0.02,
+        )
+        for index in range(4)
+    ]
+    assert not any(decision.barge_in for decision in fresh[:3])
+    assert fresh[3].barge_in
+    assert fresh[3].fresh_attack_ms == 80
+    assert fresh[3].playback_epoch == 7
+    assert fresh[3].playback_response_id == "response-1"
+    assert fresh[3].speaker_started_age_ms == pytest.approx(100.0)
+
+
+def test_first_observed_armed_gate_blocks_its_entire_capture_block() -> None:
+    detector = NearEndDetector(
+        min_rms=0.001,
+        vad=AlwaysSpeech(),
+    )
+    speech = np.full(320, 0.08, dtype=np.float32)
+    armed = PlaybackGate(
+        generation=1,
+        epoch=1,
+        response_id="response-1",
+        armed=True,
+        armed_at=0.0,
+        audible=True,
+        echo_guard_active=True,
+    )
+
+    first_block = [
+        detector.process(
+            speech,
+            output_active=True,
+            playback_gate=armed,
+            capture_block_id=1,
+            timestamp=0.0,
+        )
+        for _ in range(6)
+    ]
+    assert not any(decision.barge_in for decision in first_block)
+
+    fresh = [
+        detector.process(
+            speech,
+            output_active=True,
+            playback_gate=armed,
+            capture_block_id=2 + index,
+            timestamp=0.02 + index * 0.02,
+        )
+        for index in range(4)
+    ]
+    assert not any(decision.barge_in for decision in fresh[:3])
+    assert fresh[-1].barge_in
+
+
+def test_near_end_hold_survives_rearm_without_triggering_barge_in() -> None:
+    detector = NearEndDetector(
+        min_rms=0.001,
+        vad=AlwaysSpeech(),
+    )
+    speech = np.full(320, 0.08, dtype=np.float32)
+    silence = np.zeros(320, dtype=np.float32)
+    for index in range(6):
+        decision = detector.process(
+            speech,
+            output_active=False,
+            playback_gate=PlaybackGate(),
+            capture_block_id=index,
+            timestamp=index * 0.02,
+        )
+    assert decision.near_end
+
+    armed = PlaybackGate(
+        generation=1,
+        epoch=3,
+        response_id="response-1",
+        armed=True,
+        armed_at=0.12,
+        audible=True,
+        echo_guard_active=True,
+    )
+    held = detector.process(
+        silence,
+        output_active=True,
+        playback_gate=armed,
+        capture_block_id=20,
+        timestamp=0.14,
+    )
+    assert held.near_end
+    assert held.barge_armed
+    assert not held.barge_in
+
+    later = [
+        detector.process(
+            silence,
+            output_active=True,
+            playback_gate=armed,
+            capture_block_id=21 + index,
+            timestamp=0.16 + index * 0.02,
+        )
+        for index in range(6)
+    ]
+    assert not any(item.barge_in for item in later)
+
+
+def test_new_playback_generation_cannot_inherit_old_barge_evidence() -> None:
+    detector = NearEndDetector(
+        min_rms=0.001,
+        vad=AlwaysSpeech(),
+    )
+    speech = np.full(320, 0.08, dtype=np.float32)
+    first = PlaybackGate(
+        generation=1,
+        epoch=1,
+        response_id="response-1",
+        armed=True,
+        audible=True,
+        echo_guard_active=True,
+    )
+    for index in range(3):
+        decision = detector.process(
+            speech,
+            output_active=True,
+            playback_gate=first,
+            capture_block_id=index,
+            timestamp=index * 0.02,
+        )
+        assert not decision.barge_in
+
+    second = PlaybackGate(
+        generation=2,
+        epoch=1,
+        response_id="response-2",
+        armed=True,
+        armed_at=0.06,
+        audible=True,
+        echo_guard_active=True,
+    )
+    for _ in range(5):
+        transition = detector.process(
+            speech,
+            output_active=True,
+            playback_gate=second,
+            capture_block_id=10,
+            timestamp=0.08,
+        )
+        assert not transition.barge_in
+
+    fresh = [
+        detector.process(
+            speech,
+            output_active=True,
+            playback_gate=second,
+            capture_block_id=11 + index,
+            timestamp=0.10 + index * 0.02,
+        )
+        for index in range(4)
+    ]
+    assert not any(item.barge_in for item in fresh[:3])
+    assert fresh[-1].barge_in
+
+
+def test_playback_gate_suppresses_echo_but_preserves_double_talk() -> None:
+    rng = np.random.default_rng(117)
+    played = rng.normal(0.0, 0.08, 16_000).astype(np.float32)
+    echo = played[4_000:5_600] * np.float32(0.2)
+    human = (
+        np.random.default_rng(118).normal(0.0, float(np.std(echo)), echo.size).astype(np.float32)
+    )
+    gate = PlaybackGate(
+        generation=1,
+        epoch=1,
+        response_id="response-1",
+        armed=True,
+        armed_at=0.02,
+        audible=True,
+        echo_guard_active=True,
+    )
+
+    def decisions_for(signal: np.ndarray) -> list[VoiceDecision]:
+        reference = EchoReference()
+        reference.append_played(played)
+        detector = NearEndDetector(
+            min_rms=0.001,
+            echo_reference=reference,
+            vad=AlwaysSpeech(),
+        )
+        detector.process(
+            np.zeros(320, dtype=np.float32),
+            output_active=False,
+            playback_gate=PlaybackGate(),
+            capture_block_id=0,
+            timestamp=0.0,
+        )
+        detector.process(
+            signal[:320],
+            output_active=True,
+            playback_gate=gate,
+            capture_block_id=1,
+            timestamp=0.02,
+        )
+        return [
+            detector.process(
+                signal[start : start + 320],
+                output_active=True,
+                playback_gate=gate,
+                capture_block_id=2 + index,
+                timestamp=0.04 + index * 0.02,
+            )
+            for index, start in enumerate(range(320, 1_600, 320))
+        ]
+
+    echo_decisions = decisions_for(echo)
+    assert echo_decisions[-1].echo_like
+    assert not any(decision.barge_in for decision in echo_decisions)
+
+    double_talk = decisions_for(echo + human)
+    assert not double_talk[-1].echo_like
+    assert double_talk[-1].barge_in
+
+
 def test_playback_resamples_mono_and_rejects_stale_epoch_after_flush() -> None:
     media = FakeMedia()
     epoch = [4]
@@ -299,6 +572,192 @@ def test_playback_resamples_mono_and_rejects_stale_epoch_after_flush() -> None:
     assert engine.echo_guard_active()
     assert not engine.enqueue(packet)
     assert reference.similarity(media.pushed[0][:320]) > 0.7
+    assert engine.stop(flush=False)
+
+
+def test_playback_gate_arms_on_successful_push_and_survives_an_underrun() -> None:
+    now = [1.0]
+    media = FakeMedia()
+    engine = PlaybackEngine(
+        media,
+        lambda: 1,
+        EchoReference(),
+        input_sample_rate=16_000,
+        output_sample_rate=16_000,
+        clock=lambda: now[0],
+    )
+    engine.start()
+    assert not engine.gate_snapshot().armed
+
+    assert engine.enqueue(
+        PlaybackPacket(
+            1,
+            np.ones(320, dtype=np.float32),
+            "response-1",
+        )
+    )
+    wait_for(lambda: len(media.pushed) == 1)
+    active = engine.gate_snapshot()
+    assert active.armed
+    assert active.audible
+    assert active.epoch == 1
+    assert active.response_id == "response-1"
+    assert active.armed_at == 1.0
+
+    now[0] = 2.0
+    underrun = engine.gate_snapshot()
+    assert underrun.armed
+    assert not underrun.audible
+
+    engine.mark_response_boundary()
+    assert not engine.gate_snapshot().armed
+
+    assert engine.enqueue(
+        PlaybackPacket(
+            1,
+            np.ones(320, dtype=np.float32),
+            "response-1",
+        )
+    )
+    wait_for(lambda: len(media.pushed) == 2)
+    next_response = engine.gate_snapshot()
+    assert next_response.armed
+    assert next_response.generation > active.generation
+    assert not engine.gate_is_current(
+        active.generation,
+        active.epoch or 0,
+        active.response_id,
+    )
+    assert engine.gate_is_current(
+        next_response.generation,
+        next_response.epoch or 0,
+        next_response.response_id,
+    )
+
+    engine.mark_response_boundary()
+    assert engine.gate_snapshot().armed
+    now[0] = 3.0
+    assert not engine.gate_snapshot().armed
+    assert engine.stop(flush=False)
+
+
+def test_failed_media_push_never_arms_barge_in() -> None:
+    class FailingMedia(FakeMedia):
+        def push_audio_sample(self, samples: np.ndarray) -> None:
+            del samples
+            raise RuntimeError("speaker unavailable")
+
+    media = FailingMedia()
+    engine = PlaybackEngine(
+        media,
+        lambda: 1,
+        EchoReference(),
+        input_sample_rate=16_000,
+        output_sample_rate=16_000,
+    )
+    engine.start()
+    assert engine.enqueue(PlaybackPacket(1, np.ones(320, dtype=np.float32), "response-1"))
+    wait_for(lambda: engine.stats().errors == 1)
+    assert not engine.gate_snapshot().armed
+    assert engine.stop(flush=False)
+
+
+def test_gate_validation_and_turn_commit_are_atomic_against_listen_boundary() -> None:
+    now = [1.0]
+    media = FakeMedia()
+    engine = PlaybackEngine(
+        media,
+        lambda: 1,
+        EchoReference(),
+        input_sample_rate=16_000,
+        output_sample_rate=16_000,
+        clock=lambda: now[0],
+    )
+    engine.start()
+    assert engine.enqueue(PlaybackPacket(1, np.ones(320, dtype=np.float32), "response-1"))
+    wait_for(lambda: len(media.pushed) == 1)
+    gate = engine.gate_snapshot()
+
+    now[0] = 2.0
+    commit_started = threading.Event()
+    release_commit = threading.Event()
+    boundary_done = threading.Event()
+    result: list[int | None] = []
+    audible_at_commit: list[bool] = []
+
+    def commit(playback_audible: bool) -> int:
+        audible_at_commit.append(playback_audible)
+        commit_started.set()
+        assert release_commit.wait(1.0)
+        return 2
+
+    transaction = threading.Thread(
+        target=lambda: result.append(
+            engine.commit_if_gate_current(
+                gate.generation,
+                gate.epoch or 0,
+                gate.response_id,
+                commit,
+            )
+        )
+    )
+    transaction.start()
+    assert commit_started.wait(1.0)
+
+    def close_boundary() -> None:
+        engine.mark_response_boundary()
+        boundary_done.set()
+
+    boundary = threading.Thread(target=close_boundary)
+    boundary.start()
+    assert not boundary_done.wait(0.05)
+    release_commit.set()
+    transaction.join(1.0)
+    boundary.join(1.0)
+
+    assert not transaction.is_alive()
+    assert not boundary.is_alive()
+    assert result == [2]
+    assert audible_at_commit == [False]
+    assert boundary_done.is_set()
+    assert not engine.gate_snapshot().armed
+    assert engine.stop(flush=False)
+
+
+def test_silent_gate_commit_is_rejected_after_turn_enters_listening() -> None:
+    now = [1.0]
+    turns = TurnCoordinator()
+    epoch = turns.new_session()
+    assert turns.accept_audio("response-1") == epoch
+    media = FakeMedia()
+    engine = PlaybackEngine(
+        media,
+        lambda: turns.snapshot().epoch,
+        EchoReference(),
+        input_sample_rate=16_000,
+        output_sample_rate=16_000,
+        clock=lambda: now[0],
+    )
+    engine.start()
+    assert engine.enqueue(PlaybackPacket(epoch, np.ones(320, dtype=np.float32), "response-1"))
+    wait_for(lambda: len(media.pushed) == 1)
+    gate = engine.gate_snapshot()
+
+    assert turns.model_listening() == epoch
+    now[0] = 2.0
+    assert (
+        engine.commit_if_gate_current(
+            gate.generation,
+            epoch,
+            gate.response_id,
+            lambda audible: turns.interrupt_if_epoch(
+                epoch,
+                playback_audible=audible,
+            ),
+        )
+        is None
+    )
+    assert turns.snapshot().phase is InteractionPhase.LISTENING
     assert engine.stop(flush=False)
 
 
@@ -527,3 +986,260 @@ def test_capture_worker_emits_units_and_frames_without_owning_media_lifecycle() 
     assert worker.stop()
     assert len(units) == 1
     assert len(voices) == 50
+
+
+def test_capture_worker_reads_one_atomic_playback_gate_per_audio_block() -> None:
+    class CaptureMedia:
+        def __init__(self) -> None:
+            self.chunks: list[np.ndarray | None] = [
+                np.zeros((960, 2), dtype=np.float32),
+            ]
+
+        def get_audio_sample(self) -> np.ndarray | None:
+            return self.chunks.pop(0) if self.chunks else None
+
+    class RecordingDetector:
+        def __init__(self) -> None:
+            self.seen: list[tuple[int, int | None]] = []
+            self.ready = threading.Event()
+
+        def process(self, _frame: np.ndarray, **kwargs: object) -> SimpleNamespace:
+            gate = kwargs["playback_gate"]
+            assert isinstance(gate, PlaybackGate)
+            block_id = kwargs["capture_block_id"]
+            assert isinstance(block_id, int)
+            self.seen.append((gate.generation, block_id))
+            if len(self.seen) == 3:
+                self.ready.set()
+            return SimpleNamespace(barge_in=False)
+
+    gate_reads = 0
+    detector = RecordingDetector()
+
+    def gate_snapshot() -> PlaybackGate:
+        nonlocal gate_reads
+        gate_reads += 1
+        return PlaybackGate(generation=9, armed=True)
+
+    worker = AudioCaptureWorker(
+        CaptureMedia(),
+        channel=0,
+        detector=detector,  # type: ignore[arg-type]
+        output_active=lambda: (_ for _ in ()).throw(AssertionError("non-atomic read")),
+        playback_gate=gate_snapshot,
+        on_unit=lambda _unit: None,
+    )
+    worker.start()
+    assert detector.ready.wait(1.0)
+    assert worker.stop()
+    assert gate_reads == 1
+    assert detector.seen == [(9, 1), (9, 1), (9, 1)]
+
+
+def test_capture_worker_drops_crossing_block_pending_from_fresh_barge_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("yrobot.audio.time.monotonic", lambda: clock[0])
+
+    class CaptureMedia:
+        def __init__(self) -> None:
+            self.chunks = [
+                (0.0, np.full(959, 0.08, dtype=np.float32)),
+                (0.06, np.full(961, 0.08, dtype=np.float32)),
+            ]
+
+        def get_audio_sample(self) -> np.ndarray | None:
+            if not self.chunks:
+                return None
+            clock[0], samples = self.chunks.pop(0)
+            return samples
+
+    gate = PlaybackGate(
+        generation=1,
+        epoch=1,
+        response_id="response-1",
+        armed=True,
+        armed_at=0.0,
+        audible=True,
+    )
+    decisions: list[VoiceDecision] = []
+    complete = threading.Event()
+
+    def on_voice(decision: VoiceDecision) -> None:
+        decisions.append(decision)
+        if len(decisions) == 5:
+            complete.set()
+
+    worker = AudioCaptureWorker(
+        CaptureMedia(),
+        channel=0,
+        detector=NearEndDetector(min_rms=0.001, vad=AlwaysSpeech()),
+        output_active=lambda: True,
+        playback_gate=lambda: gate,
+        on_unit=lambda _unit: None,
+        on_voice=on_voice,
+    )
+    worker.start()
+    assert complete.wait(1.0)
+    assert worker.stop()
+
+    assert decisions[1].near_end
+    assert not any(decision.barge_in for decision in decisions)
+
+
+def test_capture_worker_requires_80_ms_wall_freshness_for_batched_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("yrobot.audio.time.monotonic", lambda: clock[0])
+
+    class CaptureMedia:
+        def __init__(self) -> None:
+            self.chunks = [
+                (0.0, np.full(640, 0.08, dtype=np.float32)),
+                (0.06, np.full(1_280, 0.08, dtype=np.float32)),
+                (0.08, np.full(320, 0.08, dtype=np.float32)),
+            ]
+
+        def get_audio_sample(self) -> np.ndarray | None:
+            if not self.chunks:
+                return None
+            clock[0], samples = self.chunks.pop(0)
+            return samples
+
+    gate = PlaybackGate(
+        generation=1,
+        epoch=1,
+        response_id="response-1",
+        armed=True,
+        armed_at=0.0,
+        audible=True,
+    )
+    decisions: list[VoiceDecision] = []
+    complete = threading.Event()
+
+    def on_voice(decision: VoiceDecision) -> None:
+        decisions.append(decision)
+        if len(decisions) == 7:
+            complete.set()
+
+    worker = AudioCaptureWorker(
+        CaptureMedia(),
+        channel=0,
+        detector=NearEndDetector(min_rms=0.001, vad=AlwaysSpeech()),
+        output_active=lambda: True,
+        playback_gate=lambda: gate,
+        on_unit=lambda _unit: None,
+        on_voice=on_voice,
+    )
+    worker.start()
+    assert complete.wait(1.0)
+    assert worker.stop()
+
+    assert not any(decision.barge_in for decision in decisions[:6])
+    assert decisions[-1].barge_in
+    assert decisions[-1].fresh_attack_ms == 80
+
+
+def test_subframe_capture_blocks_continue_after_playback_arms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("yrobot.audio.time.monotonic", lambda: clock[0])
+
+    class CaptureMedia:
+        def __init__(self) -> None:
+            self.chunks = [
+                (timestamp, np.full(160, 0.08, dtype=np.float32))
+                for timestamp in np.arange(0.0, 0.121, 0.01)
+            ]
+            self.drained = threading.Event()
+
+        def get_audio_sample(self) -> np.ndarray | None:
+            if not self.chunks:
+                self.drained.set()
+                return None
+            clock[0], samples = self.chunks.pop(0)
+            return samples
+
+    media = CaptureMedia()
+    armed = PlaybackGate(
+        generation=1,
+        epoch=1,
+        response_id="response-1",
+        armed=True,
+        armed_at=0.02,
+        audible=True,
+    )
+    decisions: list[VoiceDecision] = []
+
+    worker = AudioCaptureWorker(
+        media,
+        channel=0,
+        detector=NearEndDetector(min_rms=0.001, vad=AlwaysSpeech()),
+        output_active=lambda: True,
+        playback_gate=lambda: armed if clock[0] >= 0.02 else PlaybackGate(),
+        on_unit=lambda _unit: None,
+        on_voice=decisions.append,
+    )
+    worker.start()
+    assert media.drained.wait(1.0)
+    assert worker.stop()
+
+    assert len(decisions) == 6
+    assert decisions[1].near_end
+    assert not any(decision.barge_in for decision in decisions[:-1])
+    assert decisions[-1].barge_in
+
+
+def test_first_detector_frame_after_arm_cannot_leak_its_pending_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr("yrobot.audio.time.monotonic", lambda: clock[0])
+
+    class CaptureMedia:
+        def __init__(self) -> None:
+            self.chunks = [
+                (0.00, np.zeros(320, dtype=np.float32)),
+                (0.01, np.full(304, 0.1, dtype=np.float32)),
+                (0.02, np.full(304, 0.2, dtype=np.float32)),
+                (0.03, np.full(304, 0.3, dtype=np.float32)),
+                (0.04, np.full(32, 0.4, dtype=np.float32)),
+                (0.05, np.full(288, 0.4, dtype=np.float32)),
+            ]
+            self.drained = threading.Event()
+
+        def get_audio_sample(self) -> np.ndarray | None:
+            if not self.chunks:
+                self.drained.set()
+                return None
+            clock[0], samples = self.chunks.pop(0)
+            return samples
+
+    class RecordingDetector:
+        def __init__(self) -> None:
+            self.frames: list[np.ndarray] = []
+
+        def process(self, frame: np.ndarray, **_kwargs: object) -> SimpleNamespace:
+            self.frames.append(frame.copy())
+            return SimpleNamespace(barge_in=False)
+
+    media = CaptureMedia()
+    detector = RecordingDetector()
+    armed = PlaybackGate(generation=1, epoch=1, armed=True, armed_at=0.01)
+    worker = AudioCaptureWorker(
+        media,
+        channel=0,
+        detector=detector,  # type: ignore[arg-type]
+        output_active=lambda: True,
+        playback_gate=lambda: armed if clock[0] >= 0.01 else PlaybackGate(),
+        on_unit=lambda _unit: None,
+    )
+    worker.start()
+    assert media.drained.wait(1.0)
+    assert worker.stop()
+
+    assert len(detector.frames) == 3
+    np.testing.assert_array_equal(detector.frames[-1], np.full(320, 0.4, dtype=np.float32))

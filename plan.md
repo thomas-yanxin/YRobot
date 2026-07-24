@@ -1,6 +1,6 @@
 # YRobot blank-slate rebuild plan
 
-Status: implemented and locally verified on 2026-07-23. Physical Wireless acceptance
+Status: implemented and locally verified on 2026-07-24. Physical Wireless acceptance
 remains intentionally separate because this workstation has no connected Reachy Mini.
 
 ## Product target
@@ -35,6 +35,14 @@ remains intentionally separate because this workstation has no connected Reachy 
   `clear_output_buffer()`.
 - Use AEC output plus WebRTC VAD, adaptive energy gating, and recent playback correlation
   to distinguish near-end speech from the robot's own voice.
+- Keep DoA near-end state independent from barge evidence. Arm a new barge generation only
+  after the first successful hardware speaker push, discard the crossing capture block and
+  its partial VAD frame, and require both fresh 80 ms speech and wall time before clearing
+  playback. Commit the playback token and turn epoch fence atomically; use the ordered
+  `listen` event as the response-segment boundary instead of assuming `response_id` uniqueness.
+  Accept an ordered boundary once the force-listen write is in flight, downgrade a stale force
+  snapshot before wire serialization, and reject a stale interrupt once the model is listening
+  and the old speaker gate is physically silent.
 - Poll hardware DoA independently, circularly smooth it, and accept a bearing when either
   XVF3800 speech detection or the local near-end detector is active. The linear array's
   documented front/back ambiguity remains a hardware limitation.
