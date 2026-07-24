@@ -20,6 +20,11 @@ from dotenv import load_dotenv
 from reachy_mini.apps.app import ReachyMiniApp
 from reachy_mini.reachy_mini import ReachyMini
 
+try:  # optional: shrinks camera frames before upload (weak networks)
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
+
 from yrobot.audio import EchoGuard, Microphone, Speaker, UplinkGain, VoiceDetector
 from yrobot.config import Settings
 from yrobot.motion import IDLE, LISTEN, SPEAK, Choreographer, SoundCompass
@@ -40,6 +45,23 @@ KV_PER_S_IDLE, KV_PER_S_BUSY, KV_PER_FRAME = 13.0, 28.0, 64.0
 # near-silence the model's own duplex turn-taking handles user speech.
 BARGE_PLAYOUT_MIN_DB = -40.0
 STRONG_VOICE_MIN_DB = -35.0  # absolute floor for fast settle-window commits
+# The model reads frames at max_slice_nums=1 (~448 px): a full-resolution
+# JPEG is pure uplink waste and stalls audio on weak wifi.
+FRAME_MAX_DIM = 448
+FRAME_JPEG_QUALITY = 80
+
+
+def shrink_jpeg(bgr_frame: np.ndarray | None) -> bytes | None:
+    """Encode a camera frame at the model's native vision scale."""
+    if bgr_frame is None or cv2 is None:
+        return None
+    height, width = bgr_frame.shape[:2]
+    scale = FRAME_MAX_DIM / max(height, width)
+    if scale < 1.0:
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        bgr_frame = cv2.resize(bgr_frame, size, interpolation=cv2.INTER_AREA)
+    ok, encoded = cv2.imencode(".jpg", bgr_frame, [cv2.IMWRITE_JPEG_QUALITY, FRAME_JPEG_QUALITY])
+    return encoded.tobytes() if ok else None
 
 
 class Conversation:
@@ -71,6 +93,7 @@ class Conversation:
         self._last_block_log = -1e9
         self._voiced_run = 0
         self._frames_paused_until = -1e9
+        self._frame_pause_s = 10.0
 
     def run(self) -> None:
         self._mini.media.start_recording()
@@ -138,8 +161,17 @@ class Conversation:
             if sent_in > 0.3:
                 # Weak network: frames serialize behind audio on the same
                 # websocket and a single JPEG can stall the uplink cadence.
-                self._frames_paused_until = now + 10.0
-                logger.info("slow uplink (%.2f s send): pausing camera frames", sent_in)
+                # The pause backs off exponentially — a fixed 10 s retried a
+                # doomed frame every 10 s for as long as the wifi stayed bad.
+                self._frames_paused_until = now + self._frame_pause_s
+                logger.info(
+                    "slow uplink (%.2f s send): pausing camera frames %.0f s",
+                    sent_in,
+                    self._frame_pause_s,
+                )
+                self._frame_pause_s = min(self._frame_pause_s * 2, 120.0)
+            elif jpeg is not None:
+                self._frame_pause_s = 10.0  # a frame went through cleanly
             busy = self._speaker.audible(now) or self._detector.active(now)
             kv_est += (KV_PER_S_BUSY if busy else KV_PER_S_IDLE) * self._s.chunk_ms / 1000
             kv_est += KV_PER_FRAME if jpeg is not None else 0.0
@@ -292,7 +324,10 @@ class Conversation:
         period = self._s.frame_period_active_s if active else self._s.frame_period_idle_s
         if now - self._last_frame_at < period:
             return None
-        jpeg = self._mini.media.get_frame_jpeg()
+        if cv2 is not None:
+            jpeg = shrink_jpeg(self._mini.media.get_frame())
+        else:
+            jpeg = self._mini.media.get_frame_jpeg()
         if jpeg:
             self._last_frame_at = now
         return jpeg
