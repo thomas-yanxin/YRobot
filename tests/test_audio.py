@@ -1,529 +1,231 @@
-from __future__ import annotations
+"""Unit tests for capture, VAD gating, resampling and playback."""
 
-import logging
-import threading
 import time
-from collections.abc import Callable
 
 import numpy as np
-import pytest
 
 from yrobot.audio import (
-    AudioCaptureWorker,
-    AudioUnitizer,
-    EchoReference,
-    FrameSplitter,
-    NearEndDetector,
-    PlaybackEngine,
-    PlaybackPacket,
-    StreamingResampler,
-    mono_capture,
+    AUDIO_STARTUP_CONFIG,
+    FRAME_SAMPLES,
+    Microphone,
+    PlaybackEchoMatcher,
+    Speaker,
+    StreamResampler,
+    UplinkGain,
+    VoiceDetector,
+    apply_audio_startup_config,
 )
 
 
-def wait_for(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.002)
-    raise AssertionError("condition was not reached before timeout")
+class FakeVad:
+    def __init__(self, result=True):
+        self.result = result
 
-
-class AlwaysSpeech:
-    def is_speech(self, frame: np.ndarray, sample_rate: int) -> bool:
-        return True
-
-
-class NeverSpeech:
-    def is_speech(self, frame: np.ndarray, sample_rate: int) -> bool:
-        return False
-
-
-class FakeAudioBackend:
-    def __init__(self, operations: list[str] | None = None) -> None:
-        self.max_buffers: int | None = None
-        self.clears = 0
-        self.operations = operations
-
-    def set_max_output_buffers(self, value: int) -> None:
-        self.max_buffers = value
-
-    def clear_player(self) -> None:
-        self.clears += 1
-        if self.operations is not None:
-            self.operations.append("clear")
+    def is_speech(self, pcm, rate):
+        return self.result
 
 
 class FakeMedia:
-    def __init__(self) -> None:
-        self.audio = FakeAudioBackend()
-        self.pushed: list[np.ndarray] = []
+    def __init__(self):
+        self.pushed = []
+        self.cleared = 0
+        self.samples = []
+        self.audio = self
 
-    def push_audio_sample(self, samples: np.ndarray) -> None:
-        self.pushed.append(samples.copy())
+    def get_audio_sample(self):
+        return self.samples.pop(0) if self.samples else None
 
+    def push_audio_sample(self, data):
+        self.pushed.append(np.asarray(data))
 
-class BlockingMedia:
-    def __init__(self) -> None:
-        self.operations: list[str] = []
-        self.audio = FakeAudioBackend(self.operations)
-        self.push_started = threading.Event()
-        self.release_push = threading.Event()
-
-    def push_audio_sample(self, samples: np.ndarray) -> None:
-        self.operations.append("push-start")
-        self.push_started.set()
-        assert self.release_push.wait(1.0)
-        self.operations.append("push-end")
+    def clear_player(self):
+        self.cleared += 1
 
 
-def test_capture_normalization_splitter_and_exact_f32le_unit() -> None:
-    channels_last = np.column_stack(
-        (
-            np.linspace(-0.5, 0.5, 16_000, dtype=np.float32),
-            np.ones(16_000, dtype=np.float32),
-        )
-    )
-    channel_zero = mono_capture(channels_last, channel=0)
-    channels_first = mono_capture(channels_last.T, channel=-1)
+def test_duplex_audio_profile_uses_verified_sdk_config():
+    class ConfigurableAudio:
+        def __init__(self):
+            self.calls = []
 
-    assert channel_zero.shape == (16_000,)
-    np.testing.assert_allclose(channels_first, channels_last.mean(axis=1))
+        def apply_audio_config(self, config, *, verify, write_settle_seconds):
+            self.calls.append((config, verify, write_settle_seconds))
+            return True
 
-    splitter = FrameSplitter()
-    assert splitter.push(channel_zero[:319]) == []
-    frames = splitter.push(channel_zero[319:961])
-    assert [frame.shape for frame in frames] == [(320,), (320,), (320,)]
-    assert splitter.pending_samples == 1
-
-    unitizer = AudioUnitizer()
-    assert unitizer.push(channel_zero[:7_999], captured_at=1.0) == []
-    units = unitizer.push(channel_zero[7_999:], captured_at=2.0)
-    assert len(units) == 1
-    assert units[0].sequence == 0
-    assert units[0].captured_at == 2.0
-    assert units[0].samples.shape == (16_000,)
-    assert len(units[0].f32le) == 16_000 * 4
-    np.testing.assert_array_equal(np.frombuffer(units[0].f32le, dtype="<f4"), channel_zero)
-
-
-def test_echo_is_suppressed_and_barge_in_requires_80_ms_near_end() -> None:
-    rng = np.random.default_rng(9)
-    played = rng.normal(0.0, 0.08, 16_000).astype(np.float32)
-    echo_frames = [
-        played[start : start + 320] * np.float32(0.2) for start in range(4_000, 5_600, 320)
-    ]
-    human_frame = rng.normal(0.0, 0.08, 320).astype(np.float32)
-    reference = EchoReference()
-    reference.append_played(played)
-    detector = NearEndDetector(
-        min_rms=0.001,
-        echo_correlation=0.7,
-        echo_reference=reference,
-        vad=AlwaysSpeech(),
-    )
-
-    echo_decisions = [
-        detector.process(
-            echo_frame,
-            output_active=True,
-            timestamp=index * 0.02,
-        )
-        for index, echo_frame in enumerate(echo_frames)
-    ]
-    assert all(decision.echo_like for decision in echo_decisions)
-    assert not any(decision.near_end for decision in echo_decisions)
-    assert not any(decision.barge_in for decision in echo_decisions)
-
-    detector.reset()
-    human_decisions = [
-        detector.process(
-            human_frame,
-            output_active=True,
-            timestamp=0.1 + index * 0.02,
-        )
-        for index in range(6)
-    ]
-    assert not any(decision.current_near_end for decision in human_decisions[:3])
-    assert human_decisions[3].current_near_end
-    assert human_decisions[3].near_end
-    assert not any(decision.barge_in for decision in human_decisions[:3])
-    assert human_decisions[3].barge_in
-    assert not any(decision.barge_in for decision in human_decisions[4:])
-    held = detector.process(
-        np.zeros(320, dtype=np.float32),
-        output_active=True,
-        timestamp=0.24,
-    )
-    assert held.current_near_end is False
-    assert held.near_end is True
-
-
-def test_echo_tail_filters_reference_without_triggering_barge_in() -> None:
-    detector = NearEndDetector(
-        min_rms=0.001,
-        vad=AlwaysSpeech(),
-    )
-    human_frame = np.full(320, 0.08, dtype=np.float32)
-
-    decisions = [
-        detector.process(
-            human_frame,
-            output_active=False,
-            echo_guard_active=True,
-            timestamp=index * 0.02,
-        )
-        for index in range(6)
-    ]
-
-    assert decisions[-1].current_near_end is True
-    assert decisions[-1].echo_guard_active is True
-    assert not any(decision.barge_in for decision in decisions)
-
-
-def test_filtered_residual_echo_near_point_five_does_not_cut_off_playback() -> None:
-    rng = np.random.default_rng(22)
-    played = rng.normal(0.0, 0.08, 16_000).astype(np.float32)
-    segment = played[4_000:5_280]
-    room_filter = np.array(
-        [
-            0.085,
-            0.122,
-            0.102,
-            0.093,
-            0.102,
-            0.052,
-            -0.020,
-            -0.023,
-            -0.072,
-            -0.084,
-            -0.163,
-            -0.082,
-        ],
-        dtype=np.float32,
-    )
-    filtered = np.convolve(
-        segment,
-        room_filter,
-        mode="full",
-    )[:1_280].astype(np.float32)
-    residual_echo = filtered * np.float32(0.3)
-    reference = EchoReference()
-    reference.append_played(played)
-    detector = NearEndDetector(
-        min_rms=0.001,
-        echo_reference=reference,
-        vad=AlwaysSpeech(),
-    )
-
-    decisions = [
-        detector.process(
-            residual_echo[start : start + 320],
-            output_active=True,
-            timestamp=index * 0.02,
-        )
-        for index, start in enumerate(range(0, 1_280, 320))
-    ]
-
-    assert 0.48 <= decisions[-1].echo_similarity <= 0.55
-    assert decisions[-1].echo_fit >= 0.82
-    assert decisions[-1].echo_like
-    assert not any(decision.barge_in for decision in decisions)
-
-
-def test_human_double_talk_is_not_swallowed_by_echo_guard() -> None:
-    rng = np.random.default_rng(99)
-    played = rng.normal(0.0, 0.08, 16_000).astype(np.float32)
-    echo = played[4_000:5_280] * np.float32(0.2)
-    human = (
-        np.random.default_rng(100)
-        .normal(
-            0.0,
-            float(np.std(echo)),
-            echo.size,
-        )
-        .astype(np.float32)
-    )
-    mixed = echo + human
-    reference = EchoReference()
-    reference.append_played(played)
-    detector = NearEndDetector(
-        min_rms=0.001,
-        echo_reference=reference,
-        vad=AlwaysSpeech(),
-    )
-
-    decisions = [
-        detector.process(
-            mixed[start : start + 320],
-            output_active=True,
-            timestamp=index * 0.02,
-        )
-        for index, start in enumerate(range(0, 1_280, 320))
-    ]
-
-    assert decisions[-1].echo_similarity >= 0.65
-    assert decisions[-1].echo_fit < 0.82
-    assert not decisions[-1].echo_like
-    assert decisions[-1].barge_in
-
-
-def test_playback_resamples_mono_and_rejects_stale_epoch_after_flush() -> None:
     media = FakeMedia()
-    epoch = [4]
-    reference = EchoReference()
-    engine = PlaybackEngine(
-        media,
-        lambda: epoch[0],
-        reference,
-        preroll_ms=0,
-        output_chunk_ms=1_000,
-        max_ahead_ms=1_000,
-    )
-    engine.start()
-    assert media.audio.max_buffers == 0
+    media.audio = ConfigurableAudio()
 
-    packet = PlaybackPacket(4, np.linspace(-0.2, 0.2, 2_400, dtype=np.float32))
-    assert engine.enqueue(packet)
-    wait_for(lambda: len(media.pushed) == 1)
-    assert media.pushed[0].shape == (1_600,)
-    assert media.pushed[0].ndim == 1
-    assert media.pushed[0].dtype == np.float32
-    assert engine.output_active()
-
-    epoch[0] = 5
-    assert engine.interrupt(5)
-    assert media.audio.clears == 1
-    assert not engine.output_active()
-    assert engine.echo_guard_active()
-    assert not engine.enqueue(packet)
-    assert reference.similarity(media.pushed[0][:320]) > 0.7
-    assert engine.stop(flush=False)
+    assert apply_audio_startup_config(media, write_settle_seconds=0) is True
+    assert media.audio.calls == [(AUDIO_STARTUP_CONFIG, True, 0)]
 
 
-def test_streaming_resampler_is_continuous_across_server_delta_boundaries() -> None:
-    samples = np.sin(2 * np.pi * 1_000 * np.arange(7_201, dtype=np.float32) / 24_000).astype(
-        np.float32
-    )
-    whole = StreamingResampler(24_000, 16_000).process(samples)
-    split_resampler = StreamingResampler(24_000, 16_000)
-    split = np.concatenate(
-        [
-            split_resampler.process(samples[:997]),
-            split_resampler.process(samples[997:3_511]),
-            split_resampler.process(samples[3_511:]),
-        ]
-    )
-
-    np.testing.assert_allclose(split, whole, atol=1e-6)
-
-
-def test_playback_logs_receive_to_first_push_once(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    now = [5.0]
+def test_duplex_audio_profile_is_best_effort_without_sdk_api():
     media = FakeMedia()
-    engine = PlaybackEngine(
-        media,
-        lambda: 1,
-        EchoReference(),
-        input_sample_rate=16_000,
-        output_sample_rate=16_000,
-        clock=lambda: now[0],
-    )
-    caplog.set_level(logging.INFO, logger="yrobot.audio")
-    engine.start()
-
-    packet = PlaybackPacket(
-        1,
-        np.ones(320, dtype=np.float32),
-        "response-1",
-        received_at=4.975,
-    )
-    assert engine.enqueue(packet)
-    assert engine.enqueue(packet)
-    wait_for(lambda: len(media.pushed) == 2)
-    assert engine.stop(flush=False)
-
-    logs = [
-        record.getMessage()
-        for record in caplog.records
-        if record.getMessage().startswith("Reachy first audio push:")
-    ]
-    assert len(logs) == 1
-    assert "raw_to_enqueue_ms=25.0" in logs[0]
-    assert "enqueue_to_push_ms=0.0" in logs[0]
+    media.audio = object()
+    assert apply_audio_startup_config(media) is False
 
 
-def test_preroll_is_applied_again_after_each_listen_boundary() -> None:
-    now = [1.0]
+def test_microphone_reframes_arbitrary_stereo_blocks():
     media = FakeMedia()
-    engine = PlaybackEngine(
-        media,
-        lambda: 1,
-        EchoReference(),
-        input_sample_rate=1_000,
-        output_sample_rate=1_000,
-        preroll_ms=100,
-        output_chunk_ms=100,
-        max_ahead_ms=100,
-        clock=lambda: now[0],
-    )
-    engine.start()
-
-    first = PlaybackPacket(1, np.ones(50, dtype=np.float32), "response-1")
-    assert engine.enqueue(first)
-    time.sleep(0.02)
-    assert media.pushed == []
-    now[0] = 1.1
-    wait_for(lambda: len(media.pushed) == 1)
-
-    engine.mark_response_boundary()
-    second = PlaybackPacket(1, np.ones(50, dtype=np.float32), "response-2")
-    assert engine.enqueue(second)
-    time.sleep(0.02)
-    assert len(media.pushed) == 1
-    now[0] = 1.201
-    wait_for(lambda: len(media.pushed) == 2)
-    assert engine.stop(flush=False)
+    media.samples = [np.zeros((450, 2), np.float32), np.zeros((200, 2), np.float32)]
+    mic = Microphone(media)
+    assert [len(f) for f in mic.read_frames()] == [FRAME_SAMPLES]
+    assert [len(f) for f in mic.read_frames()] == [FRAME_SAMPLES]  # 130 carried over
 
 
-def test_playback_resampler_resets_at_response_and_listen_boundaries() -> None:
+def test_voice_detector_needs_streak_and_energy():
+    det = VoiceDetector(vad=FakeVad(True))
+    loud = np.full(FRAME_SAMPLES, 0.1, np.float32)
+    quiet = np.full(FRAME_SAMPLES, 1e-4, np.float32)
+    assert det.process(quiet, 0.00) is False  # energy below floor gate
+    assert det.process(loud, 0.02) is False  # streak 1
+    assert det.process(loud, 0.04) is False  # streak 2
+    assert det.process(loud, 0.06) is True  # confirmed at 3
+    assert det.active(0.30) is True
+    assert det.active(0.40) is False
+
+
+def test_voice_detector_adapts_noise_floor():
+    det = VoiceDetector(vad=FakeVad(True))
+    hum = np.full(FRAME_SAMPLES, 0.02, np.float32)  # steady motor noise
+    for i in range(400):
+        det.process(hum, i * 0.02)
+    assert det.process(hum, 9.0) is False  # floor swallowed the hum
+    speech = np.full(FRAME_SAMPLES, 0.3, np.float32)
+    for i in range(3):
+        det.process(speech, 10.0 + i * 0.02)
+    assert det.process(speech, 10.06) is True
+
+
+def test_voice_detector_frozen_floor_keeps_barge_sensitivity():
+    det = VoiceDetector(vad=FakeVad(True))
+    echo = np.full(FRAME_SAMPLES, 0.05, np.float32)
+    # 10 s of the robot's own monologue echo: the floor must not learn it
+    for i in range(500):
+        det.process(echo, i * 0.02, floor_frozen=True)
+    speech = np.full(FRAME_SAMPLES, 0.05, np.float32)  # user at the same level
+    voiced = False
+    for i in range(3):
+        voiced = det.process(speech, 11.0 + i * 0.02, floor_frozen=True)
+    assert voiced is True  # without the freeze the floor would gate this out
+
+
+def _speech_like_pcm(samples: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    excitation = rng.normal(size=samples + 4)
+    colored = np.convolve(excitation, [0.03, 0.12, 0.35, 0.12, 0.03], mode="valid")
+    envelope = np.repeat(
+        np.clip(rng.normal(0.6, 0.25, samples // 160 + 1), 0.05, 1.0),
+        160,
+    )[:samples]
+    return (colored * envelope * 0.2).astype(np.float32)
+
+
+def test_playback_echo_matcher_finds_delayed_filtered_echo():
+    matcher = PlaybackEchoMatcher()
+    playout = _speech_like_pcm(32_000, seed=1)
+    matcher.record(8.0, playout)
+
+    source = playout[24_000:27_200]
+    filtered = np.convolve(source, [0.2, 0.6, 0.2], mode="same")
+    mic = (filtered * 0.12).astype(np.float32)
+    match = matcher.match(mic, now=10.0)
+
+    assert match.similarity > 0.9
+    assert match.unexplained_db < -42.0
+    assert 250.0 < match.lag_ms < 750.0
+
+
+def test_playback_echo_matcher_leaves_unrelated_near_end_energy():
+    matcher = PlaybackEchoMatcher()
+    matcher.record(8.0, _speech_like_pcm(32_000, seed=2))
+    user = _speech_like_pcm(3_200, seed=3) * 0.25
+
+    match = matcher.match(user, now=10.0)
+
+    assert match.similarity < 0.5
+    assert match.unexplained_db > -42.0
+
+
+def test_uplink_gain_boosts_quiet_speech_not_noise():
+    agc = UplinkGain()
+    speech = np.full(8000, 0.03, np.float32)  # −30 dB: typical XVF capture
+    first = agc.process(speech)
+    assert float(np.abs(first).max()) > 0.03  # boosting immediately
+    frozen = agc.gain
+    agc.process(np.full(8000, 0.001, np.float32))  # room noise: no update
+    assert agc.gain == frozen
+    for _ in range(20):
+        out = agc.process(speech)
+    assert abs(float(np.sqrt(np.mean(np.square(out)))) - UplinkGain.TARGET_RMS) < 0.02
+
+
+def test_uplink_gain_never_amplifies_loud_speech_or_clips():
+    agc = UplinkGain()
+    loud = np.full(8000, 0.5, np.float32)
+    for _ in range(10):
+        out = agc.process(loud)
+    assert agc.gain == 1.0
+    assert float(np.abs(out).max()) <= 1.0
+
+
+def test_uplink_gain_releases_in_playback_without_confirmed_user():
+    agc = UplinkGain()
+    quiet_speech = np.full(8000, 0.02, np.float32)
+    for _ in range(10):
+        agc.process(quiet_speech)
+    boosted = agc.gain
+    assert boosted > 2.0
+    for _ in range(5):
+        agc.process(
+            quiet_speech,
+            playback_active=True,
+            confirmed_user_voice=False,
+        )
+    assert 1.0 < agc.gain < boosted
+
+
+def test_resampler_ratio_and_continuity():
+    rs = StreamResampler(24_000, 16_000)
+    ramp = np.linspace(0.0, 1.0, 24_000, dtype=np.float32)
+    out = np.concatenate([rs.process(chunk) for chunk in np.array_split(ramp, 13)])
+    assert abs(len(out) - 16_000) <= 2
+    assert np.all(np.diff(out) >= 0)  # no seams between chunks
+
+
+def test_speaker_plays_after_boundary_and_flushes_on_interrupt():
     media = FakeMedia()
-    engine = PlaybackEngine(
-        media,
-        lambda: 1,
-        EchoReference(),
-        preroll_ms=0,
-        output_chunk_ms=1_000,
-        max_ahead_ms=1_000,
-    )
-    first = np.full(2_400, 0.25, dtype=np.float32)
-    second = np.linspace(-0.2, 0.2, 2_400, dtype=np.float32)
-    expected = StreamingResampler(24_000, 16_000).process(second)
+    speaker = Speaker(media)
+    speaker.start()
+    try:
+        speaker.play(speaker.epoch, np.ones(2400, np.float32))  # 100 ms < preroll
+        speaker.utterance_end()  # boundary flushes the short reply out
+        deadline = time.monotonic() + 2.0
+        while not media.pushed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert media.pushed and len(media.pushed[0]) == 1600
 
-    engine.start()
-    assert engine.enqueue(PlaybackPacket(1, first, "response-1"))
-    wait_for(lambda: len(media.pushed) == 1)
-    assert engine.enqueue(PlaybackPacket(1, second, "response-2"))
-    wait_for(lambda: len(media.pushed) == 2)
-    np.testing.assert_allclose(media.pushed[1], expected, atol=1e-6)
-
-    engine.mark_response_boundary()
-    assert engine.enqueue(PlaybackPacket(1, second, "response-2"))
-    wait_for(lambda: len(media.pushed) == 3)
-    np.testing.assert_allclose(media.pushed[2], expected, atol=1e-6)
-    assert engine.stop(flush=False)
+        stale_epoch = speaker.epoch
+        speaker.interrupt()
+        speaker.play(stale_epoch, np.ones(24_000, np.float32))  # late, old turn
+        deadline = time.monotonic() + 2.0
+        while media.cleared == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert media.cleared == 1
+        time.sleep(0.2)
+        assert len(media.pushed) == 1  # stale audio never reached the device
+    finally:
+        speaker.close()
+        speaker.join(timeout=2)
 
 
-def test_playback_fifo_preserves_every_server_delta_in_order() -> None:
+def test_speaker_reports_hard_interrupt_clear_completion():
     media = FakeMedia()
-    reference = EchoReference()
-    engine = PlaybackEngine(
-        media,
-        lambda: 1,
-        reference,
-        input_sample_rate=1_000,
-        output_sample_rate=1_000,
-        preroll_ms=0,
-        output_chunk_ms=1_000,
-        max_ahead_ms=10_000,
-    )
-    values = (0.1, 0.2, 0.3, 0.4, 0.5)
-    for value in values:
-        assert engine.enqueue(PlaybackPacket(1, np.full(1_000, value, dtype=np.float32)))
-
-    assert engine.stats().dropped == 0
-    engine.start()
-    wait_for(lambda: len(media.pushed) == len(values))
-    assert media.audio.max_buffers == 0
-    assert [round(float(chunk.mean()), 1) for chunk in media.pushed] == list(values)
-    assert engine.stats().dropped == 0
-    assert engine.stop(flush=False)
-
-
-def test_default_playout_pacing_preserves_every_sample() -> None:
-    media = FakeMedia()
-    engine = PlaybackEngine(
-        media,
-        lambda: 1,
-        EchoReference(sample_rate=1_000),
-        input_sample_rate=1_000,
-        output_sample_rate=1_000,
-    )
-    expected = np.concatenate(
-        [
-            np.full(100, 0.1, dtype=np.float32),
-            np.full(100, 0.2, dtype=np.float32),
-            np.full(100, 0.3, dtype=np.float32),
-        ]
-    )
-    for packet in np.split(expected, 3):
-        assert engine.enqueue(PlaybackPacket(1, packet))
-
-    engine.start()
-    wait_for(lambda: sum(chunk.size for chunk in media.pushed) == expected.size)
-    np.testing.assert_array_equal(np.concatenate(media.pushed), expected)
-    assert engine.stats().dropped == 0
-    assert engine.stop(flush=False)
-
-
-def test_interrupt_is_ordered_after_inflight_push_and_old_audio_cannot_revive() -> None:
-    media = BlockingMedia()
-    epoch = [7]
-    engine = PlaybackEngine(
-        media,
-        lambda: epoch[0],
-        EchoReference(),
-        input_sample_rate=16_000,
-        output_sample_rate=16_000,
-        preroll_ms=0,
-    )
-    engine.start()
-    assert engine.enqueue(PlaybackPacket(7, np.ones(320, dtype=np.float32)))
-    assert media.push_started.wait(1.0)
-
-    epoch[0] = 8
-    interrupt = threading.Thread(target=engine.interrupt, args=(8,))
-    interrupt.start()
-    time.sleep(0.01)
-    assert "clear" not in media.operations
-    media.release_push.set()
-    interrupt.join(1.0)
-    assert not interrupt.is_alive()
-    assert media.operations == ["push-start", "push-end", "clear"]
-    assert not engine.enqueue(PlaybackPacket(7, np.ones(320, dtype=np.float32)))
-    assert engine.stop(flush=False)
-
-
-def test_capture_worker_emits_units_and_frames_without_owning_media_lifecycle() -> None:
-    class CaptureMedia:
-        def __init__(self) -> None:
-            half = np.zeros((8_000, 2), dtype=np.float32)
-            self.chunks: list[np.ndarray | None] = [half, half]
-
-        def get_audio_sample(self) -> np.ndarray | None:
-            return self.chunks.pop(0) if self.chunks else None
-
-    units = []
-    voices = []
-    got_unit = threading.Event()
-
-    def on_unit(unit: object) -> None:
-        units.append(unit)
-        got_unit.set()
-
-    worker = AudioCaptureWorker(
-        CaptureMedia(),
-        channel=0,
-        detector=NearEndDetector(vad=NeverSpeech()),
-        output_active=lambda: False,
-        on_unit=on_unit,
-        on_voice=voices.append,
-    )
-    worker.start()
-    assert got_unit.wait(1.0)
-    assert worker.stop()
-    assert len(units) == 1
-    assert len(voices) == 50
+    speaker = Speaker(media)
+    speaker.start()
+    try:
+        epoch = speaker.interrupt()
+        assert speaker.wait_flushed(epoch, timeout=2.0)
+        assert media.cleared == 1
+    finally:
+        speaker.close()
+        speaker.join(timeout=2)

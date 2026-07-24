@@ -1,254 +1,375 @@
-from __future__ import annotations
+"""Unit tests for app-level helpers (no hardware, no network)."""
 
-import asyncio
-import logging
+import queue
 import threading
-from logging.handlers import QueueHandler
-from typing import Any
+import time
 
 import numpy as np
+import pytest
 
+import yrobot.main as main_module
+from yrobot.audio import EchoMatch
 from yrobot.config import Settings
-from yrobot.main import Yrobot, cli, configure_logging, shutdown_logging
-from yrobot.perception import LatestFrame
-from yrobot.runtime import YRobotRuntime, _VisionUplink
+from yrobot.main import FRAME_MAX_DIM, Conversation, LatestCamera, UplinkPacket, shrink_jpeg
+from yrobot.realtime import Delta
+from yrobot.turn import QUIET_S
 
 
-class FakeAudioBackend:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.max_buffers = 0
-
-    def set_max_output_buffers(self, value: int) -> None:
-        self.max_buffers = value
-        self.events.append("audio.buffers")
-
-    def clear_player(self) -> None:
-        self.events.append("audio.clear")
-
-    def apply_audio_config(
-        self,
-        _config: object,
-        *,
-        verify: bool,
-        write_settle_seconds: float,
-    ) -> bool:
-        assert verify is True
-        assert write_settle_seconds == 0.1
-        self.events.append("audio.config")
-        return True
+def test_shrink_jpeg_downscales_to_model_vision_size():
+    cv2 = pytest.importorskip("cv2")
+    frame = np.random.default_rng(0).integers(0, 255, (720, 1280, 3), dtype=np.uint8)
+    jpeg = shrink_jpeg(frame)
+    assert jpeg is not None
+    decoded = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    assert max(decoded.shape[:2]) == FRAME_MAX_DIM
+    full = cv2.imencode(".jpg", frame)[1].tobytes()
+    assert len(jpeg) < len(full) / 3  # meaningfully lighter on the uplink
 
 
-class FakeMedia:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.audio = FakeAudioBackend(events)
-
-    def start_playing(self) -> None:
-        self.events.append("media.play")
-
-    def start_recording(self) -> None:
-        self.events.append("media.record")
-
-    def stop_playing(self) -> None:
-        self.events.append("media.stop_play")
-
-    def stop_recording(self) -> None:
-        self.events.append("media.stop_record")
-
-    def get_audio_sample(self) -> None:
-        return None
-
-    def push_audio_sample(self, _samples: np.ndarray) -> None: ...
-
-    def get_frame(self) -> None:
-        return None
-
-    def get_DoA(self) -> None:  # noqa: N802
-        return None
+def test_shrink_jpeg_keeps_small_frames():
+    cv2 = pytest.importorskip("cv2")
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    decoded = cv2.imdecode(np.frombuffer(shrink_jpeg(frame), np.uint8), cv2.IMREAD_COLOR)
+    assert decoded.shape[:2] == (240, 320)
 
 
-class FakeMini:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-        self.media = FakeMedia(events)
-        self.client = type("Client", (), {"host": "127.0.0.1", "port": 8000})()
-
-    def enable_motors(self) -> None:
-        self.events.append("motors.enable")
-
-    def enable_wobbling(self) -> None:
-        self.events.append("wobble.enable")
-
-    def disable_wobbling(self) -> None:
-        self.events.append("wobble.disable")
-
-    def get_current_head_pose(self) -> np.ndarray:
-        return np.eye(4)
-
-    def get_present_antenna_joint_positions(self) -> list[float]:
-        return [0.0, 0.0]
-
-    def set_target(self, **_kwargs: Any) -> None:
-        self.events.append("motion.target")
+def test_shrink_jpeg_none_frame():
+    assert shrink_jpeg(None) is None
 
 
-def test_runtime_owns_media_once_and_stops_in_dependency_order(
-    monkeypatch: Any,
-) -> None:
-    events: list[str] = []
+def test_urgent_uplink_discards_stale_backlog():
+    packets: queue.Queue[UplinkPacket] = queue.Queue(maxsize=4)
+    old = np.zeros(16_000, np.float32)
+    for captured_at in (1.0, 2.0, 3.0):
+        packets.put(
+            UplinkPacket(
+                old,
+                force_listen=False,
+                captured_at=captured_at,
+                input_id=f"old-{captured_at}",
+            )
+        )
+    urgent = UplinkPacket(
+        np.ones(16_000, np.float32),
+        force_listen=True,
+        captured_at=4.0,
+        input_id="forced",
+    )
+    Conversation._enqueue_packet(packets, urgent, flush_backlog=True)
+    assert packets.qsize() == 1
+    assert packets.get_nowait() is urgent
 
-    class Client:
-        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-            self.metrics = {"sessions": 1}
 
-        async def run(self, stop_event: threading.Event) -> None:
-            events.append("client.run")
-            stop_event.set()
-            await asyncio.sleep(0)
+def test_latest_camera_keeps_only_newest_frame(monkeypatch):
+    monkeypatch.setattr(main_module, "cv2", None)
 
-        def submit_audio(self, *_args: Any, **_kwargs: Any) -> None: ...
+    class FakeCameraMedia:
+        def __init__(self):
+            self.count = 0
 
-    class DoA:
-        def __init__(self, source: str, *_args: Any, **_kwargs: Any) -> None:
-            assert source == "http://127.0.0.1:8000/api/state/doa"
+        def get_frame_jpeg(self):
+            self.count += 1
+            return f"frame-{self.count}".encode()
 
-        def start(self) -> None:
-            events.append("doa.start")
+    camera = LatestCamera(
+        FakeCameraMedia(),
+        active=lambda now: True,
+        robot_audible=lambda now: False,
+        active_period_s=0.02,
+        idle_period_s=0.02,
+    )
+    camera.start()
+    try:
+        time.sleep(0.09)
+        latest = camera.take_latest()
+        assert latest is not None
+        assert camera.take_latest() is None
+        time.sleep(0.05)
+        assert camera.take_latest() != latest
+    finally:
+        camera.close()
+        camera.join(timeout=2)
 
-        def stop(self, timeout: float = 2.0) -> bool:
-            del timeout
-            events.append("doa.stop")
-            return True
 
-    monkeypatch.setattr("yrobot.runtime.RealtimeClient", Client)
-    monkeypatch.setattr("yrobot.runtime.DoAWorker", DoA)
-    runtime = YRobotRuntime(
-        FakeMini(events),
-        Settings(realtime_url="ws://brain.local/v1/realtime?mode=video"),
+def test_slow_websocket_sender_does_not_block_packet_producer():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowClient:
+        def send_chunk(self, audio, jpeg, force_listen, input_id):
+            entered.set()
+            release.wait(2.0)
+
+    conversation = object.__new__(Conversation)
+    conversation._session_dead = threading.Event()
+    conversation._video_kv_est = 0.0
+    conversation._turn_lock = threading.Lock()
+    conversation._gate = main_module.TurnGate()
+    packets: queue.Queue[UplinkPacket] = queue.Queue(maxsize=4)
+    halt = threading.Event()
+    packets.put(
+        UplinkPacket(
+            np.zeros(16_000, np.float32),
+            False,
+            time.monotonic(),
+            "normal-1",
+        )
+    )
+    sender = threading.Thread(
+        target=conversation._send_loop,
+        args=(SlowClient(), packets, halt, None),
+    )
+    sender.start()
+    try:
+        assert entered.wait(1.0)
+        started = time.monotonic()
+        Conversation._enqueue_packet(
+            packets,
+            UplinkPacket(
+                np.ones(16_000, np.float32),
+                False,
+                time.monotonic(),
+                "normal-2",
+            ),
+        )
+        assert time.monotonic() - started < 0.05
+    finally:
+        halt.set()
+        release.set()
+        sender.join(timeout=2)
+
+
+def _conversation_without_hardware() -> Conversation:
+    class FakeMedia:
+        pass
+
+    class FakeMini:
+        media = FakeMedia()
+
+    return Conversation(
+        Settings(head_tracking_weight=0.0),
+        FakeMini(),
         threading.Event(),
     )
-    runtime.run()
-
-    assert events.index("motors.enable") < events.index("media.play")
-    assert events.index("media.play") < events.index("media.record")
-    assert events.index("media.record") < events.index("audio.config")
-    assert events.index("audio.config") < events.index("client.run")
-    assert events.index("media.record") < events.index("client.run")
-    assert events.index("client.run") < events.index("media.stop_play")
-    assert events.index("wobble.disable") < events.index("media.stop_play")
-    assert events[-2:] == ["media.stop_play", "media.stop_record"]
-    assert events.count("media.play") == 1
-    assert events.count("media.record") == 1
-    assert "audio.clear" in events
 
 
-def test_reachy_app_requests_the_wireless_local_media_backend() -> None:
-    assert Yrobot.request_media_backend == "local"
-    assert Yrobot.dont_start_webserver is True
-    assert Yrobot.custom_app_url is None
+def test_barge_candidate_hard_stops_and_latches_force():
+    conversation = _conversation_without_hardware()
+    started = time.monotonic()
+    old_epoch = conversation._speaker.epoch
+
+    conversation._begin_barge(started)
+
+    assert conversation._speaker.epoch == old_epoch + 1
+    assert conversation._speaker._flush_event.is_set()
+    assert conversation._gate.latched
+    with conversation._turn_lock:
+        assert conversation._gate.chunk_force_listen(started + 0.01)
 
 
-def test_logging_queue_covers_sdk_and_yrobot_loggers() -> None:
-    root = logging.getLogger()
-    package = logging.getLogger("yrobot")
-    original_root_level = root.level
-    original_handlers = tuple(root.handlers)
-    original_package_state = (
-        package.level,
-        tuple(package.handlers),
-        package.propagate,
+def _install_barge_fakes(
+    conversation: Conversation,
+    match: EchoMatch | list[EchoMatch],
+    vad_pattern: list[bool] | None = None,
+) -> object:
+    matches = list(match) if isinstance(match, list) else [match]
+    frame_count = (
+        main_module.BARGE_MATCH_FRAMES + (len(matches) - 1) * main_module.BARGE_RECHECK_FRAMES
     )
+    if vad_pattern is not None:
+        frame_count = len(vad_pattern)
+    frames = [np.full(320, 0.01, np.float32) for _ in range(frame_count)]
 
-    configure_logging("INFO")
-    try:
-        assert len(root.handlers) == 1
-        assert isinstance(root.handlers[0], QueueHandler)
-        assert logging.getLogger("reachy_mini.media.audio_gstreamer").propagate
-        assert logging.getLogger("yrobot.realtime").propagate
-    finally:
-        shutdown_logging()
+    class FakeMic:
+        def read_frames(self):
+            return frames
 
-    assert tuple(root.handlers) == original_handlers
-    assert root.level == original_root_level
-    assert (
-        package.level,
-        tuple(package.handlers),
-        package.propagate,
-    ) == original_package_state
+    class FakeDetector:
+        streak = 0
+        last_db = -40.0
+        frame_index = 0
 
+        def process(self, frame, now, floor_frozen=False):
+            raw = True if vad_pattern is None else vad_pattern[self.frame_index]
+            self.frame_index += 1
+            self.streak = self.streak + 1 if raw else 0
+            return self.streak >= 3
 
-def test_vision_uplink_sends_only_new_frames_at_model_cadence() -> None:
-    now = [1.0]
-    latest = LatestFrame()
-    uplink = _VisionUplink(latest, 2.0, clock=lambda: now[0])
+    class FakeSpeaker:
+        epoch = 0
+        interrupted = 0
+        match_index = 0
 
-    latest.publish(b"first", captured_at=now[0])
-    assert uplink.next_jpeg() == b"first"
-    assert uplink.next_jpeg() is None
-
-    now[0] = 2.0
-    latest.publish(b"second", captured_at=now[0])
-    assert uplink.next_jpeg() is None
-
-    now[0] = 2.999
-    assert uplink.next_jpeg() == b"second"
-    assert uplink.next_jpeg() is None
-
-    uplink.reset()
-    assert uplink.next_jpeg() == b"second"
-
-
-def test_runtime_pre_stopped_run_closes_doa_without_starting_hardware(
-    monkeypatch: Any,
-) -> None:
-    events: list[str] = []
-
-    class DoA:
-        def __init__(self, *_args: Any, **_kwargs: Any) -> None: ...
-
-        def stop(self, timeout: float = 2.0) -> bool:
-            del timeout
-            events.append("doa.stop")
+        def sounding(self, now):
             return True
 
-    monkeypatch.setattr("yrobot.runtime.DoAWorker", DoA)
-    stop = threading.Event()
-    stop.set()
-    runtime = YRobotRuntime(
-        FakeMini(events),
-        Settings(realtime_url="ws://brain.local/v1/realtime?mode=video"),
-        stop,
+        def audible(self, now):
+            return True
+
+        def playing(self, now):
+            return self.interrupted == 0
+
+        def echo_match(self, candidate, now):
+            result = matches[min(self.match_index, len(matches) - 1)]
+            self.match_index += 1
+            return result
+
+        def interrupt(self):
+            self.interrupted += 1
+            self.epoch += 1
+            return self.epoch
+
+    class FakeChoreo:
+        def set_mode(self, mode):
+            self.mode = mode
+
+    speaker = FakeSpeaker()
+    conversation._mic = FakeMic()
+    conversation._detector = FakeDetector()
+    conversation._speaker = speaker
+    conversation._choreo = FakeChoreo()
+    return speaker
+
+
+def _sustained(match: EchoMatch) -> list[EchoMatch]:
+    # First decision covers 200 ms; three 100 ms rechecks reach 500 ms.
+    return [match] * 4
+
+
+def test_short_unexplained_sound_does_not_interrupt_playback():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        EchoMatch(similarity=0.2, unexplained_db=-40.0, lag_ms=400.0),
     )
 
-    runtime.run()
+    conversation._process_mic()
 
-    assert events == ["doa.stop"]
+    assert speaker.interrupted == 0
+    assert not conversation._gate.latched
 
 
-def test_cli_connects_locally_with_automatic_body_yaw(monkeypatch: Any) -> None:
-    seen: dict[str, Any] = {}
-    settings = Settings(realtime_url="ws://brain.local/v1/realtime?mode=video")
-
-    class MiniContext:
-        def __init__(self, **kwargs: Any) -> None:
-            seen.update(kwargs)
-
-        def __enter__(self) -> object:
-            return object()
-
-        def __exit__(self, *_args: Any) -> None: ...
-
-    monkeypatch.setattr("yrobot.main.ReachyMini", MiniContext)
-    monkeypatch.setattr("yrobot.main.Settings.from_env", lambda: settings)
-    monkeypatch.setattr(
-        "yrobot.main.run_conversation",
-        lambda _mini, selected, _stop: seen.update(settings=selected),
+def test_sustained_unexplained_local_voice_interrupts_playback():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        _sustained(EchoMatch(similarity=0.2, unexplained_db=-40.0, lag_ms=400.0)),
     )
 
-    cli(["--url", "ws://other.local/v1/realtime?mode=video"])
+    conversation._process_mic()
 
-    assert seen["connection_mode"] == "localhost_only"
-    assert seen["media_backend"] == "local"
-    assert seen["automatic_body_yaw"] is True
-    assert seen["settings"].realtime_url == "ws://other.local/v1/realtime?mode=video"
+    assert speaker.interrupted == 1
+    assert conversation._gate.latched
+    assert conversation._gate.force_pending
+
+
+def test_playback_echo_does_not_interrupt_or_clear_player():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        EchoMatch(similarity=0.94, unexplained_db=-49.0, lag_ms=520.0),
+    )
+
+    conversation._process_mic()
+
+    assert speaker.interrupted == 0
+    assert not conversation._gate.latched
+
+
+def test_weak_double_talk_interrupts_despite_far_end_similarity():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        _sustained(EchoMatch(similarity=0.88, unexplained_db=-40.0, lag_ms=520.0)),
+    )
+
+    conversation._process_mic()
+
+    assert speaker.interrupted == 1
+    assert conversation._gate.latched
+
+
+def test_user_entering_continuous_echo_is_detected_on_recheck():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        [
+            EchoMatch(similarity=0.95, unexplained_db=-50.0, lag_ms=520.0),
+            *_sustained(EchoMatch(similarity=0.82, unexplained_db=-39.0, lag_ms=500.0)),
+        ],
+    )
+
+    conversation._process_mic()
+
+    assert speaker.match_index == 5
+    assert speaker.interrupted == 1
+    assert conversation._gate.latched
+
+
+def test_head_bump_is_cancelled_when_next_window_returns_to_echo():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        [
+            EchoMatch(similarity=0.20, unexplained_db=-26.5, lag_ms=141.0),
+            EchoMatch(similarity=0.94, unexplained_db=-49.0, lag_ms=241.0),
+        ],
+    )
+
+    conversation._process_mic()
+
+    assert speaker.match_index == 2
+    assert speaker.interrupted == 0
+    assert not conversation._gate.latched
+    assert conversation._near_end_started_at is None
+
+
+def test_short_xvf_suppression_gap_does_not_lose_real_barge():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        _sustained(EchoMatch(similarity=0.3, unexplained_db=-39.0, lag_ms=480.0)),
+        vad_pattern=[True] * 5 + [False] + [True] * 24,
+    )
+
+    conversation._process_mic()
+
+    assert speaker.interrupted == 1
+    assert conversation._gate.latched
+
+
+def test_interrupted_multi_branch_output_waits_for_force_listen_boundary():
+    conversation = _conversation_without_hardware()
+    pcm = np.ones(2400, np.float32)
+    conversation._on_delta(Delta(kind="audio", audio=pcm, response_id="old"))
+    conversation._speaker._q.get_nowait()
+
+    started = time.monotonic()
+    conversation._begin_barge(started)
+    conversation._on_delta(
+        Delta(kind="audio", audio=pcm, response_id="old-branch-2", received_at=started + 0.04)
+    )
+    conversation._on_delta(
+        Delta(kind="audio", audio=pcm, response_id="old-branch-3", received_at=started + 0.06)
+    )
+    assert conversation._speaker._q.empty()
+
+    with conversation._turn_lock:
+        assert conversation._gate.chunk_force_listen(started + 0.08)
+        conversation._gate.force_sent("forced-input", started + 0.08)
+    conversation._on_delta(Delta(kind="listen", input_id="wrong-input", received_at=started + 0.09))
+    assert conversation._gate.latched
+    conversation._on_delta(
+        Delta(kind="listen", input_id="forced-input", received_at=started + 0.10)
+    )
+    conversation._on_delta(
+        Delta(
+            kind="audio",
+            audio=pcm,
+            response_id="new-answer",
+            received_at=started + QUIET_S + 0.10,
+        )
+    )
+    epoch, queued = conversation._speaker._q.get_nowait()
+    assert epoch == conversation._speaker.epoch
+    assert queued is pcm

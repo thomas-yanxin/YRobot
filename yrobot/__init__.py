@@ -1,3 +1,3 @@
-"""YRobot: realtime voice, vision, direction, and motion for Reachy Mini."""
+"""YRobot — full-duplex MiniCPM-o 4.5 conversation for Reachy Mini Wireless."""
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"

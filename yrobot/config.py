@@ -1,167 +1,143 @@
-"""Validated configuration for the Wireless CM4 realtime runtime."""
+"""Runtime configuration.
+
+All tunables live in one frozen dataclass built from ``YROBOT_*`` environment
+variables (a ``.env`` file is honoured), so no other module reads the
+environment. Defaults encode gateway behaviour verified against the official
+MiniCPM-o 4.5 realtime API (https://minicpmo45.modelbest.cn/docs/en/realtime-api/overview/).
+"""
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
-from dotenv import load_dotenv
-
-from .protocol import validate_video_url
-
-OFFICIAL_REALTIME_URL = "wss://minicpmo45.modelbest.cn/v1/realtime?mode=video"
-
-DEFAULT_SYSTEM_PROMPT = """\
-你是 Reachy Mini，一个自然、敏捷、友善的双语机器人。
-持续结合用户语音和当前画面理解现场；回答简洁自然，不复述问题。
-你可以边听边说。用户插话时立刻停止当前内容，先听清新问题再回答。
-不要描述内部协议、推理过程或不存在的机器人能力。"""
+# The duplex template was trained with this exact first line; a free-form
+# persona in its place drifts the model out of its full-duplex distribution
+# and leaks <think> blocks into speech. Keep the persona to one short line.
+TRAINED_SYSTEM_LINE = "You are a helpful assistant."
+DEFAULT_PERSONA = "你是 Reachy，一个友好的桌面机器人，用对方的语言简短口语化地回复。"
 
 
-def _bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean")
+def normalize_url(raw: str, mode: str | None = None) -> str:
+    """Normalize a bare host, host:port or ws(s) URL to the realtime endpoint.
+
+    An explicit mode in ``raw`` is preserved unless ``mode`` is supplied.
+    Audio is the latency-first default; camera frames are valid only in video
+    mode according to the public gateway contract.
+    """
+    if "://" not in raw:
+        raw = f"wss://{raw}"
+    parts = urlsplit(raw)
+    path = parts.path if parts.path not in ("", "/") else "/v1/realtime"
+    query = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    selected_mode = mode or query.get("mode", "audio")
+    if selected_mode not in {"audio", "video"}:
+        raise ValueError("YRobot realtime mode must be 'audio' or 'video'")
+    query["mode"] = selected_mode
+    qs = "&".join(f"{k}={v}" for k, v in sorted(query.items()))
+    return urlunsplit((parts.scheme, parts.netloc, path, qs, ""))
 
 
-def _int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    return default if raw is None else int(raw)
+def _flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _float(name: str, default: float) -> float:
-    raw = os.getenv(name)
+def _num(name: str, default: float) -> float:
+    raw = os.environ.get(name)
     return default if raw is None else float(raw)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Settings:
-    realtime_url: str = OFFICIAL_REALTIME_URL
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    """Immutable application settings."""
+
+    url: str = normalize_url("minicpmo45.modelbest.cn")
     tls_verify: bool = True
+    system_prompt: str = f"{TRAINED_SYSTEM_LINE}\n{DEFAULT_PERSONA}"
     length_penalty: float = 1.1
-    session_seconds: float = 285.0
-    reconnect_max_seconds: float = 8.0
 
-    input_sample_rate: int = 16_000
-    output_sample_rate: int = 24_000
-    input_unit_ms: int = 1_000
-    local_frame_ms: int = 20
-    mic_channel: int = 0
-    playback_preroll_ms: int = 0
+    # MiniCPM-o 4.5 advances its duplex timeline in fixed one-second audio
+    # units. Sub-second input.append calls can return a synthetic listen
+    # without applying force_listen because no inference logits were produced.
+    chunk_ms: int = 1000
 
-    vad_mode: int = 2
-    vad_min_rms: float = 0.006
-    vad_noise_ratio: float = 2.2
-    barge_attack_ms: int = 80
-    barge_debounce_ms: int = 350
-    near_end_hold_ms: int = 300
-    echo_correlation: float = 0.72
+    # Audio mode is the latency-first default. Enabling video switches a bare
+    # URL to mode=video; an explicitly contradictory URL is rejected.
+    send_video: bool = False
+    frame_period_active_s: float = 1.0
+    frame_period_idle_s: float = 5.0
 
-    camera_width: int = 640
-    camera_jpeg_quality: int = 72
-    camera_fps: float = 1.0
-    vision_send_interval_seconds: float = 1.0
-    doa_hz: float = 10.0
-    doa_hold_seconds: float = 3.0
-    motion_hz: float = 50.0
+    # Session rotation: rotate before the 600 s server cap or before the
+    # ~8192-token kv budget degrades replies, whichever comes first — and
+    # only at a quiet listen boundary.
+    session_budget_s: float = 550.0
+    kv_budget_tokens: float = 7200.0
+    reconnect_delay_s: float = 2.5
 
-    log_level: str = "INFO"
+    vad_aggressiveness: int = 2
+    # A candidate is treated as self-echo only when it both matches recent
+    # playout and leaves less than this much unexplained near-end energy.
+    barge_echo_similarity: float = 0.75
+    barge_unexplained_db: float = -42.0
+    # Head bumps are loud but brief. Do not destroy playback until unexplained
+    # near-end evidence spans this long (including the initial 200 ms window).
+    barge_confirm_ms: int = 500
+    head_tracking_weight: float = 0.4
+
+    def __post_init__(self) -> None:
+        if self.chunk_ms != 1000:
+            raise ValueError("YROBOT_CHUNK_MS must be 1000 for MiniCPM-o 4.5 duplex")
+        if self.send_video and self.realtime_mode != "video":
+            raise ValueError("YROBOT_SEND_VIDEO requires realtime mode=video")
+        if not 0.0 <= self.barge_echo_similarity <= 1.0:
+            raise ValueError("YROBOT_BARGE_ECHO_SIMILARITY must be between 0 and 1")
+        if not -120.0 <= self.barge_unexplained_db <= 0.0:
+            raise ValueError("YROBOT_BARGE_UNEXPLAINED_DB must be between -120 and 0")
+        if not 200 <= self.barge_confirm_ms <= 2000:
+            raise ValueError("YROBOT_BARGE_CONFIRM_MS must be between 200 and 2000")
+
+    @property
+    def realtime_mode(self) -> str:
+        """Public gateway mode selected in ``url``."""
+        return parse_qs(urlsplit(self.url).query).get("mode", ["audio"])[0]
 
     @classmethod
     def from_env(cls) -> Settings:
-        load_dotenv()
-        settings = cls(
-            realtime_url=os.getenv(
-                "YROBOT_REALTIME_URL",
-                os.getenv("MINICPM_REALTIME_URL", OFFICIAL_REALTIME_URL),
-            ),
-            system_prompt=os.getenv("YROBOT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
-            tls_verify=_bool("YROBOT_TLS_VERIFY", True),
-            length_penalty=_float("YROBOT_LENGTH_PENALTY", 1.1),
-            session_seconds=_float("YROBOT_SESSION_SECONDS", 285.0),
-            reconnect_max_seconds=_float("YROBOT_RECONNECT_MAX_SECONDS", 8.0),
-            playback_preroll_ms=_int("YROBOT_PLAYBACK_PREROLL_MS", 0),
-            mic_channel=_int("YROBOT_MIC_CHANNEL", 0),
-            vad_mode=_int("YROBOT_VAD_MODE", 2),
-            vad_min_rms=_float("YROBOT_VAD_MIN_RMS", 0.006),
-            vad_noise_ratio=_float("YROBOT_VAD_NOISE_RATIO", 2.2),
-            barge_attack_ms=_int("YROBOT_BARGE_ATTACK_MS", 80),
-            barge_debounce_ms=_int("YROBOT_BARGE_DEBOUNCE_MS", 350),
-            near_end_hold_ms=_int("YROBOT_NEAR_END_HOLD_MS", 300),
-            echo_correlation=_float("YROBOT_ECHO_CORRELATION", 0.72),
-            camera_width=_int("YROBOT_CAMERA_WIDTH", 640),
-            camera_jpeg_quality=_int("YROBOT_CAMERA_JPEG_QUALITY", 72),
-            camera_fps=_float("YROBOT_CAMERA_FPS", 1.0),
-            vision_send_interval_seconds=_float(
-                "YROBOT_VISION_SEND_INTERVAL_SECONDS",
-                1.0,
-            ),
-            doa_hz=_float("YROBOT_DOA_HZ", 10.0),
-            doa_hold_seconds=_float("YROBOT_DOA_HOLD_SECONDS", 3.0),
-            motion_hz=_float("YROBOT_MOTION_HZ", 50.0),
-            log_level=os.getenv("YROBOT_LOG_LEVEL", "INFO").upper(),
+        """Build settings from ``YROBOT_*`` environment variables."""
+        persona = os.environ.get("YROBOT_PERSONA", DEFAULT_PERSONA).strip()
+        raw_url = os.environ.get("YROBOT_REALTIME_URL", "minicpmo45.modelbest.cn")
+        send_video = _flag("YROBOT_SEND_VIDEO", False)
+        requested_mode = os.environ.get("YROBOT_REALTIME_MODE")
+        if requested_mode is not None:
+            requested_mode = requested_mode.strip().lower()
+        else:
+            raw_query = parse_qs(
+                urlsplit(raw_url if "://" in raw_url else f"wss://{raw_url}").query
+            )
+            # Keep an explicit URL mode authoritative. For legacy deployments
+            # that only set SEND_VIDEO, select the protocol mode that can
+            # actually carry frames.
+            requested_mode = None if "mode" in raw_query else ("video" if send_video else "audio")
+        url = normalize_url(raw_url, requested_mode)
+        actual_mode = parse_qs(urlsplit(url).query).get("mode", ["audio"])[0]
+        if send_video and actual_mode != "video":
+            raise ValueError("YROBOT_SEND_VIDEO requires realtime mode=video")
+        default_session_budget = 280.0 if actual_mode == "video" else 550.0
+        return cls(
+            url=url,
+            tls_verify=_flag("YROBOT_TLS_VERIFY", True),
+            system_prompt=f"{TRAINED_SYSTEM_LINE}\n{persona}" if persona else TRAINED_SYSTEM_LINE,
+            length_penalty=_num("YROBOT_LENGTH_PENALTY", 1.1),
+            chunk_ms=int(_num("YROBOT_CHUNK_MS", 1000)),
+            send_video=send_video,
+            session_budget_s=_num("YROBOT_SESSION_BUDGET_S", default_session_budget),
+            kv_budget_tokens=_num("YROBOT_KV_BUDGET", 7200.0),
+            reconnect_delay_s=_num("YROBOT_RECONNECT_DELAY_S", 2.5),
+            vad_aggressiveness=int(_num("YROBOT_VAD_AGGRESSIVENESS", 2)),
+            barge_echo_similarity=_num("YROBOT_BARGE_ECHO_SIMILARITY", 0.75),
+            barge_unexplained_db=_num("YROBOT_BARGE_UNEXPLAINED_DB", -42.0),
+            barge_confirm_ms=int(_num("YROBOT_BARGE_CONFIRM_MS", 500)),
+            head_tracking_weight=_num("YROBOT_HEAD_TRACKING_WEIGHT", 0.4),
         )
-        settings.validate()
-        return settings
-
-    def validate(self) -> None:
-        validate_video_url(self.realtime_url)
-        if not self.system_prompt.strip():
-            raise ValueError("YROBOT_SYSTEM_PROMPT must not be empty")
-        if not math.isfinite(self.length_penalty) or self.length_penalty <= 0:
-            raise ValueError("YROBOT_LENGTH_PENALTY must be a positive finite number")
-        if self.input_sample_rate != 16_000 or self.output_sample_rate != 24_000:
-            raise ValueError("MiniCPM-o realtime rates are fixed at 16 kHz in / 24 kHz out")
-        if self.input_unit_ms != 1_000:
-            raise ValueError("MiniCPM-o full-duplex units must remain at 1000 ms")
-        if not 30 <= self.session_seconds < 300:
-            raise ValueError("video session duration must be in [30, 300) seconds")
-        if not math.isfinite(self.reconnect_max_seconds) or self.reconnect_max_seconds <= 0:
-            raise ValueError("YROBOT_RECONNECT_MAX_SECONDS must be positive")
-        if self.local_frame_ms not in {10, 20, 30}:
-            raise ValueError("WebRTC VAD frame size must be 10, 20, or 30 ms")
-        if self.mic_channel not in {-1, 0, 1}:
-            raise ValueError("YROBOT_MIC_CHANNEL must be -1 (mean), 0, or 1")
-        if not 0 <= self.playback_preroll_ms <= 250:
-            raise ValueError("YROBOT_PLAYBACK_PREROLL_MS must be 0..250")
-        if self.vad_mode not in range(4):
-            raise ValueError("YROBOT_VAD_MODE must be 0..3")
-        if (
-            not math.isfinite(self.vad_min_rms)
-            or not math.isfinite(self.vad_noise_ratio)
-            or self.vad_min_rms <= 0
-            or self.vad_noise_ratio <= 1
-        ):
-            raise ValueError("VAD RMS must be positive and noise ratio must be >1")
-        if self.barge_attack_ms < self.local_frame_ms:
-            raise ValueError("YROBOT_BARGE_ATTACK_MS must cover at least one VAD frame")
-        if self.barge_attack_ms % self.local_frame_ms:
-            raise ValueError("YROBOT_BARGE_ATTACK_MS must align to VAD frames")
-        if self.barge_debounce_ms < 0 or self.near_end_hold_ms < 0:
-            raise ValueError("barge debounce and near-end hold must be non-negative")
-        if not 0.0 < self.echo_correlation < 1.0:
-            raise ValueError("YROBOT_ECHO_CORRELATION must be between 0 and 1")
-        if self.camera_width != 640:
-            raise ValueError("MiniCPM-o video frames must remain 640 px wide")
-        if not 1 <= self.camera_jpeg_quality <= 95:
-            raise ValueError("YROBOT_CAMERA_JPEG_QUALITY must be 1..95")
-        if not 0 < self.camera_fps <= 1:
-            raise ValueError("MiniCPM-o video cadence must not exceed 1 fps")
-        if not 1 <= self.vision_send_interval_seconds <= 10:
-            raise ValueError("YROBOT_VISION_SEND_INTERVAL_SECONDS must be between 1 and 10")
-        if not 10 <= self.doa_hz <= 20:
-            raise ValueError("YROBOT_DOA_HZ must be between 10 and 20")
-        if not math.isfinite(self.doa_hold_seconds) or self.doa_hold_seconds < 0:
-            raise ValueError("YROBOT_DOA_HOLD_SECONDS must be non-negative")
-        if self.motion_hz != 50:
-            raise ValueError("Reachy Mini Wireless motion loop must remain at 50 Hz")
-        if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-            raise ValueError("YROBOT_LOG_LEVEL is invalid")

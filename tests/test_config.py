@@ -1,89 +1,80 @@
-from __future__ import annotations
-
-from dataclasses import replace
+"""Unit tests for environment-driven settings."""
 
 import pytest
 
-from yrobot.config import OFFICIAL_REALTIME_URL, Settings
+from yrobot.config import TRAINED_SYSTEM_LINE, Settings
 
 
-def test_official_realtime_defaults_are_fixed_to_video_duplex() -> None:
-    settings = Settings()
-    settings.validate()
-
-    assert settings.realtime_url == OFFICIAL_REALTIME_URL
-    assert settings.input_sample_rate == 16_000
-    assert settings.output_sample_rate == 24_000
-    assert settings.input_unit_ms == 1_000
-    assert settings.camera_width == 640
-    assert settings.camera_fps == 1.0
-    assert settings.vision_send_interval_seconds == 1.0
-    assert settings.playback_preroll_ms == 0
-    assert settings.barge_attack_ms == 80
-    assert settings.echo_correlation == 0.72
-    assert settings.doa_hz == 10.0
-    assert settings.motion_hz == 50.0
-    assert settings.session_seconds < 300
+def test_defaults_target_official_gateway():
+    s = Settings()
+    assert s.url == "wss://minicpmo45.modelbest.cn/v1/realtime?mode=audio"
+    assert s.chunk_ms == 1000
+    assert s.send_video is False
+    assert s.realtime_mode == "audio"
+    assert s.system_prompt.startswith(TRAINED_SYSTEM_LINE + "\n")
 
 
-def test_environment_only_exposes_operational_tuning(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("yrobot.config.load_dotenv", lambda: None)
+def test_from_env_overrides(monkeypatch):
+    monkeypatch.setenv("YROBOT_REALTIME_URL", "10.0.16.184:8006")
+    monkeypatch.setenv("YROBOT_TLS_VERIFY", "0")
+    monkeypatch.setenv("YROBOT_CHUNK_MS", "1000")
+    monkeypatch.setenv("YROBOT_PERSONA", "只说中文。")
+    monkeypatch.setenv("YROBOT_SEND_VIDEO", "false")
+    monkeypatch.setenv("YROBOT_BARGE_ECHO_SIMILARITY", "0.8")
+    monkeypatch.setenv("YROBOT_BARGE_UNEXPLAINED_DB", "-44")
+    monkeypatch.setenv("YROBOT_BARGE_CONFIRM_MS", "600")
+    s = Settings.from_env()
+    assert s.url == "wss://10.0.16.184:8006/v1/realtime?mode=audio"
+    assert s.tls_verify is False
+    assert s.send_video is False
+    assert s.barge_echo_similarity == 0.8
+    assert s.barge_unexplained_db == -44.0
+    assert s.barge_confirm_ms == 600
+    assert s.system_prompt == f"{TRAINED_SYSTEM_LINE}\n只说中文。"
+
+
+def test_empty_persona_keeps_trained_line_only(monkeypatch):
+    monkeypatch.setenv("YROBOT_PERSONA", "  ")
+    assert Settings.from_env().system_prompt == TRAINED_SYSTEM_LINE
+
+
+def test_send_video_selects_video_mode_for_legacy_bare_url(monkeypatch):
+    monkeypatch.setenv("YROBOT_REALTIME_URL", "10.0.16.184:8006")
+    monkeypatch.setenv("YROBOT_SEND_VIDEO", "true")
+    s = Settings.from_env()
+    assert s.realtime_mode == "video"
+    assert s.session_budget_s == 280.0
+
+
+def test_explicit_audio_mode_rejects_video_frames(monkeypatch):
     monkeypatch.setenv(
         "YROBOT_REALTIME_URL",
-        "wss://brain.local:8006/v1/realtime?mode=video",
+        "wss://10.0.16.184:8006/v1/realtime?mode=audio",
     )
-    monkeypatch.setenv("YROBOT_TLS_VERIFY", "false")
-    monkeypatch.setenv("YROBOT_VAD_MODE", "3")
-    monkeypatch.setenv("YROBOT_BARGE_ATTACK_MS", "60")
-    monkeypatch.setenv("YROBOT_VISION_SEND_INTERVAL_SECONDS", "4")
-    monkeypatch.setenv("YROBOT_DOA_HZ", "15")
-
-    settings = Settings.from_env()
-
-    assert settings.realtime_url == ("wss://brain.local:8006/v1/realtime?mode=video")
-    assert settings.tls_verify is False
-    assert settings.vad_mode == 3
-    assert settings.barge_attack_ms == 60
-    assert settings.vision_send_interval_seconds == 4
-    assert settings.doa_hz == 15
-
-
-@pytest.mark.parametrize(
-    "settings",
-    [
-        replace(Settings(), realtime_url="https://example/v1/realtime?mode=video"),
-        replace(Settings(), realtime_url="wss://example/v1/realtime?mode=audio"),
-        replace(Settings(), realtime_url="wss://example/v1/realtime?mode=video&x=1"),
-        replace(Settings(), input_unit_ms=500),
-        replace(Settings(), input_sample_rate=24_000),
-        replace(Settings(), output_sample_rate=16_000),
-        replace(Settings(), session_seconds=300),
-        replace(Settings(), reconnect_max_seconds=float("nan")),
-        replace(Settings(), vad_min_rms=float("nan")),
-        replace(Settings(), vad_noise_ratio=float("nan")),
-        replace(Settings(), vad_noise_ratio=1),
-        replace(Settings(), camera_width=800),
-        replace(Settings(), camera_fps=2),
-        replace(Settings(), vision_send_interval_seconds=0.5),
-        replace(Settings(), vision_send_interval_seconds=11),
-        replace(Settings(), motion_hz=40),
-        replace(Settings(), barge_attack_ms=90),
-        replace(Settings(), echo_correlation=1),
-        replace(Settings(), doa_hold_seconds=float("nan")),
-    ],
-)
-def test_invalid_protocol_or_control_tuning_is_rejected(settings: Settings) -> None:
-    with pytest.raises(ValueError):
-        settings.validate()
-
-
-def test_invalid_boolean_has_actionable_name(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("yrobot.config.load_dotenv", lambda: None)
-    monkeypatch.setenv("YROBOT_TLS_VERIFY", "sometimes")
-
-    with pytest.raises(ValueError, match="YROBOT_TLS_VERIFY"):
+    monkeypatch.setenv("YROBOT_SEND_VIDEO", "true")
+    with pytest.raises(ValueError, match="mode=video"):
         Settings.from_env()
+
+
+@pytest.mark.parametrize("chunk_ms", [20, 500, 2000])
+def test_chunk_size_must_match_model_inference_unit(chunk_ms):
+    with pytest.raises(ValueError, match="must be 1000"):
+        Settings(chunk_ms=chunk_ms)
+
+
+@pytest.mark.parametrize("similarity", [-0.1, 1.1])
+def test_echo_similarity_must_be_normalized(similarity):
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        Settings(barge_echo_similarity=similarity)
+
+
+@pytest.mark.parametrize("unexplained_db", [-121.0, 0.1])
+def test_unexplained_energy_threshold_must_be_decibels(unexplained_db):
+    with pytest.raises(ValueError, match="between -120 and 0"):
+        Settings(barge_unexplained_db=unexplained_db)
+
+
+@pytest.mark.parametrize("confirm_ms", [199, 2001])
+def test_barge_confirmation_window_is_bounded(confirm_ms):
+    with pytest.raises(ValueError, match="between 200 and 2000"):
+        Settings(barge_confirm_ms=confirm_ms)

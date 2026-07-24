@@ -1,959 +1,541 @@
-"""Low-latency capture, near-end detection, and fenced audio playback."""
+"""Audio capture, voice detection and interruptible playback.
+
+Reachy Mini Wireless routes the microphone through the XVF3800 hardware
+front end.  The board defaults are not suitable for far-field double-talk,
+so startup applies the same verified AGC/AEC/noise-suppression profile as
+Pollen's conversation app before local VAD starts. Residual speech-shaped
+echo is rejected against the exact scheduled playout waveform rather than a
+static level threshold, preserving weak near-end double-talk.
+
+Playback is epoch-tagged: a barge-in bumps the epoch, and everything queued
+under an older epoch is dropped while the GStreamer pipeline is flushed via
+``clear_player()`` — always from the playback thread, the only thread allowed
+to touch the pipeline.  Remote ``force_listen`` is handled separately by the
+turn controller; local silence never waits for a network acknowledgement.
+"""
 
 from __future__ import annotations
 
 import logging
 import math
+import queue
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
 
 import numpy as np
-import numpy.typing as npt
 import webrtcvad
-from scipy.signal import butter, sosfilt
 
-FloatAudio = npt.NDArray[np.float32]
+logger = logging.getLogger(__name__)
 
+FRAME_MS = 20
+FRAME_SAMPLES = 16_000 * FRAME_MS // 1000  # 320
+SILENT_DB = -120.0
+WRITE_SETTLE_SECONDS = 0.1
 
-@dataclass(frozen=True, slots=True)
-class AudioUnit:
-    """One exact MiniCPM-o input unit: 16 kHz, one second, mono F32LE."""
-
-    sequence: int
-    samples: FloatAudio
-    captured_at: float
-
-    @property
-    def f32le(self) -> bytes:
-        return np.asarray(self.samples, dtype="<f4").tobytes(order="C")
-
-
-@dataclass(frozen=True, slots=True)
-class PlaybackPacket:
-    """One server audio delta guarded by its interaction epoch."""
-
-    epoch: int
-    samples: FloatAudio
-    response_id: str | None = None
-    stream_generation: int = 0
-    received_at: float | None = None
-    enqueued_at: float | None = None
+# Pollen's Reachy Mini conversation app applies this exact profile before
+# starting its realtime record/play loops.  In particular the hardware AGC
+# and double-talk settings operate before our software VAD; outbound AGC is
+# too late to recover a quiet interjection that VAD has already rejected.
+AUDIO_STARTUP_CONFIG: tuple[tuple[str, tuple[float | int, ...]], ...] = (
+    ("PP_AGCMAXGAIN", (10.0,)),
+    ("PP_MIN_NS", (0.8,)),
+    ("PP_MIN_NN", (0.8,)),
+    ("PP_GAMMA_E", (0.5,)),
+    ("PP_GAMMA_ETAIL", (0.5,)),
+    ("PP_NLATTENONOFF", (0,)),
+    ("PP_MGSCALE", (4.0, 1.0, 1.0)),
+)
 
 
-@dataclass(frozen=True, slots=True)
-class VoiceDecision:
-    timestamp: float
-    rms: float
-    noise_floor: float
-    energy_threshold: float
-    vad_speech: bool
-    current_near_end: bool
-    near_end: bool
-    output_active: bool
-    echo_guard_active: bool
-    echo_similarity: float
-    echo_fit: float
-    echo_like: bool
-    barge_in: bool
-
-
-@dataclass(frozen=True, slots=True)
-class PlaybackStats:
-    enqueued: int
-    dropped: int
-    stale: int
-    pushed: int
-    clears: int
-    errors: int
-
-
-class SpeechDetector(Protocol):
-    def is_speech(self, frame: FloatAudio, sample_rate: int) -> bool: ...
-
-
-class CapturePort(Protocol):
-    def get_audio_sample(self) -> npt.NDArray[np.generic] | None: ...
-
-
-class PlaybackPort(Protocol):
-    audio: object
-
-    def push_audio_sample(self, data: FloatAudio) -> None: ...
-
-
-def mono_capture(samples: npt.ArrayLike, channel: int = 0) -> FloatAudio:
-    """Normalize mono, channels-last, channels-first, or higher-rank capture."""
-
-    data = np.asarray(samples)
-    if data.ndim == 0:
-        raise ValueError("audio capture must have at least one dimension")
-    if data.size == 0:
-        return np.empty(0, dtype=np.float32)
-
-    data = np.asarray(data, dtype=np.float32)
-    if data.ndim == 1:
-        mono = data
+def apply_audio_startup_config(
+    media,
+    *,
+    verify: bool = True,
+    write_settle_seconds: float = WRITE_SETTLE_SECONDS,
+) -> bool:
+    """Best-effort application of the wireless XVF3800 duplex profile."""
+    audio = getattr(media, "audio", None)
+    apply_config = getattr(audio, "apply_audio_config", None)
+    if not callable(apply_config):
+        logger.warning("Reachy audio config API unavailable; continuing with board defaults")
+        return False
+    try:
+        applied = bool(
+            apply_config(
+                AUDIO_STARTUP_CONFIG,
+                verify=verify,
+                write_settle_seconds=write_settle_seconds,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — audio startup remains best effort
+        logger.warning("Reachy duplex audio config failed: %s", exc)
+        return False
+    if applied:
+        logger.info("Applied Reachy XVF3800 duplex audio profile")
     else:
-        if data.ndim == 2 and data.shape[0] <= 8 and data.shape[1] > 8:
-            data = data.T
-        elif data.ndim > 2:
-            sample_axis = int(np.argmax(data.shape))
-            data = np.moveaxis(data, sample_axis, 0)
-        channels = data.reshape(data.shape[0], -1)
-        if channels.shape[1] == 1:
-            mono = channels[:, 0]
-        elif channel == -1:
-            mono = channels.mean(axis=1, dtype=np.float32)
-        elif 0 <= channel < channels.shape[1]:
-            mono = channels[:, channel]
-        else:
-            raise ValueError(f"capture has {channels.shape[1]} channels; cannot select {channel}")
-
-    mono = np.nan_to_num(mono, nan=0.0, posinf=1.0, neginf=-1.0)
-    return np.ascontiguousarray(np.clip(mono, -1.0, 1.0), dtype=np.float32)
+        logger.warning("Reachy XVF3800 duplex audio profile was not applied")
+    return applied
 
 
-def _mono_float32(samples: npt.ArrayLike) -> FloatAudio:
-    data = np.asarray(samples, dtype=np.float32)
-    if data.ndim != 1:
-        raise ValueError("expected one-dimensional mono audio")
-    return np.ascontiguousarray(data)
+class Microphone:
+    """Yields fixed 20 ms mono float32 frames from the robot microphone."""
 
+    def __init__(self, media) -> None:
+        self._media = media
+        self._buf = np.empty(0, np.float32)
 
-class StreamingResampler:
-    """Stateful mono downsampler without per-delta filter resets."""
-
-    def __init__(self, input_rate: int, output_rate: int) -> None:
-        if input_rate <= 0 or output_rate <= 0:
-            raise ValueError("resampler rates must be positive")
-        self.input_rate = input_rate
-        self.output_rate = output_rate
-        cutoff = min(0.95, 0.9 * output_rate / input_rate)
-        self._sos = butter(6, cutoff, output="sos") if output_rate < input_rate else None
-        self._filter_state = (
-            np.zeros((self._sos.shape[0], 2), dtype=np.float64) if self._sos is not None else None
-        )
-        self._buffer = np.empty(0, dtype=np.float32)
-        self._buffer_start = 0
-        self._next_numerator = 0
-
-    def reset(self) -> None:
-        if self._filter_state is not None:
-            self._filter_state.fill(0.0)
-        self._buffer = np.empty(0, dtype=np.float32)
-        self._buffer_start = 0
-        self._next_numerator = 0
-
-    def process(self, samples: npt.ArrayLike) -> FloatAudio:
-        data = _mono_float32(samples)
-        if data.size == 0:
-            return data
-        if self.input_rate == self.output_rate:
-            return data.copy()
-        if self._sos is not None:
-            filtered, self._filter_state = sosfilt(
-                self._sos,
-                data,
-                zi=self._filter_state,
-            )
-            data = np.asarray(filtered, dtype=np.float32)
-
-        self._buffer = data if self._buffer.size == 0 else np.concatenate((self._buffer, data))
-        end_index = self._buffer_start + self._buffer.size - 1
-        available_numerator = end_index * self.output_rate - self._next_numerator
-        if available_numerator < 0:
-            return np.empty(0, dtype=np.float32)
-        count = available_numerator // self.input_rate + 1
-        numerators = self._next_numerator + self.input_rate * np.arange(count, dtype=np.int64)
-        low, remainder = np.divmod(numerators, self.output_rate)
-        offsets = low - self._buffer_start
-        fractions = remainder.astype(np.float32) / self.output_rate
-        upper_offsets = offsets + (remainder != 0)
-        output = self._buffer[offsets] * (1.0 - fractions) + self._buffer[upper_offsets] * fractions
-        self._next_numerator += int(count) * self.input_rate
-
-        next_low = self._next_numerator // self.output_rate
-        discard = min(
-            self._buffer.size,
-            max(0, next_low - self._buffer_start),
-        )
-        if discard:
-            self._buffer = np.ascontiguousarray(
-                self._buffer[discard:],
-                dtype=np.float32,
-            )
-            self._buffer_start += discard
-        return np.ascontiguousarray(output, dtype=np.float32)
-
-
-class FrameSplitter:
-    """Split an arbitrary stream into exact WebRTC-VAD frames."""
-
-    def __init__(self, sample_rate: int = 16_000, frame_ms: int = 20) -> None:
-        if frame_ms not in {10, 20, 30}:
-            raise ValueError("WebRTC VAD supports only 10, 20, or 30 ms frames")
-        self.frame_samples = sample_rate * frame_ms // 1_000
-        self._pending = np.empty(0, dtype=np.float32)
-
-    @property
-    def pending_samples(self) -> int:
-        return int(self._pending.size)
-
-    def push(self, samples: npt.ArrayLike) -> list[FloatAudio]:
-        data = _mono_float32(samples)
-        if data.size == 0:
+    def read_frames(self) -> list[np.ndarray]:
+        """Drain the device and return all complete 20 ms frames."""
+        sample = self._media.get_audio_sample()
+        if sample is None or len(sample) == 0:
+            time.sleep(0.005)
             return []
-        joined = data if self._pending.size == 0 else np.concatenate((self._pending, data))
-        count = joined.size // self.frame_samples
-        frames = [
-            np.ascontiguousarray(joined[index : index + self.frame_samples], dtype=np.float32)
-            for index in range(0, count * self.frame_samples, self.frame_samples)
-        ]
-        self._pending = np.ascontiguousarray(joined[count * self.frame_samples :], dtype=np.float32)
+        mono = sample[:, 0] if sample.ndim == 2 else sample
+        self._buf = np.concatenate([self._buf, mono.astype(np.float32)])
+        n = len(self._buf) // FRAME_SAMPLES
+        frames = [self._buf[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES] for i in range(n)]
+        self._buf = self._buf[n * FRAME_SAMPLES :]
         return frames
 
-    def reset(self) -> None:
-        self._pending = np.empty(0, dtype=np.float32)
 
+class VoiceDetector:
+    """Motor-noise-resistant user speech detector over 20 ms frames.
 
-class AudioUnitizer:
-    """Packetize capture into monotonically numbered one-second units."""
+    ``voiced``  — instantaneous, streak-confirmed; drives barge-in and the
+                  turn gate (no hangover, so silence is detected promptly).
+    ``active``  — voiced within the last 300 ms; gates DoA sampling and the
+                  camera frame cadence.
+    ``last_db`` — level of the most recent frame, used in interruption logs.
+    """
 
-    def __init__(self, sample_rate: int = 16_000, unit_ms: int = 1_000) -> None:
-        self.unit_samples = sample_rate * unit_ms // 1_000
-        if self.unit_samples <= 0:
-            raise ValueError("audio unit must contain samples")
-        self._pending = np.empty(0, dtype=np.float32)
-        self._sequence = 0
+    CONFIRM_FRAMES = 3
+    HANGOVER_S = 0.3
+    ABS_RMS_MIN = 0.004
+    FLOOR_FACTOR = 3.0
+
+    def __init__(self, aggressiveness: int = 2, vad=None) -> None:
+        self._vad = vad if vad is not None else webrtcvad.Vad(aggressiveness)
+        self._floor = 0.002
+        self._streak = 0
+        self._last_voiced_at = -1e9
+        self.last_db = SILENT_DB
 
     @property
-    def pending_samples(self) -> int:
-        return int(self._pending.size)
+    def streak(self) -> int:
+        """Consecutive raw-voiced frames — longer streaks reject impulsive
+        servo knocks (the head motors sit centimetres from the mic array)."""
+        return self._streak
 
-    def push(
-        self,
-        samples: npt.ArrayLike,
-        *,
-        captured_at: float | None = None,
-    ) -> list[AudioUnit]:
-        data = _mono_float32(samples)
-        if data.size == 0:
-            return []
-        joined = data if self._pending.size == 0 else np.concatenate((self._pending, data))
-        now = time.monotonic() if captured_at is None else captured_at
-        count = joined.size // self.unit_samples
-        units: list[AudioUnit] = []
-        for index in range(count):
-            start = index * self.unit_samples
-            unit = np.ascontiguousarray(joined[start : start + self.unit_samples], dtype="<f4")
-            units.append(AudioUnit(self._sequence, unit, now))
-            self._sequence += 1
-        self._pending = np.ascontiguousarray(joined[count * self.unit_samples :], dtype=np.float32)
-        return units
+    def process(self, frame: np.ndarray, now: float, floor_frozen: bool = False) -> bool:
+        """Feed one 20 ms mono float32 frame; returns confirmed ``voiced``.
 
-    def reset(self, *, reset_sequence: bool = False) -> None:
-        self._pending = np.empty(0, dtype=np.float32)
-        if reset_sequence:
-            self._sequence = 0
+        ``floor_frozen`` must be True whenever the robot is audible. Its
+        post-AEC residual is not ambient noise: learning it raised the floor
+        during long replies until real double-talk could no longer pass.
+        """
+        rms = float(np.sqrt(np.mean(np.square(frame)))) if len(frame) else 0.0
+        self.last_db = 20.0 * math.log10(rms + 1e-9)
+        # Asymmetric floor: falls fast in quiet, creeps up under sustained
+        # sound — so steady motor noise stops counting as voice within a few
+        # seconds, while real speech (which breathes every few hundred ms)
+        # keeps pulling the floor back down.
+        if not floor_frozen:
+            if rms < self._floor:
+                self._floor = 0.7 * self._floor + 0.3 * rms
+            else:
+                self._floor = min(self._floor * 1.01, rms)
+            self._floor = max(self._floor, 5e-4)
+        pcm16 = (np.clip(frame, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        raw = self._vad.is_speech(pcm16, 16_000) and rms > max(
+            self.ABS_RMS_MIN, self._floor * self.FLOOR_FACTOR
+        )
+        if raw:
+            self._streak += 1
+        else:
+            self._streak = 0
+        voiced = self._streak >= self.CONFIRM_FRAMES
+        if voiced:
+            self._last_voiced_at = now
+        return voiced
 
-
-class WebRtcSpeechDetector:
-    """Float32 adapter around WebRTC VAD's signed 16-bit PCM interface."""
-
-    def __init__(self, mode: int = 2) -> None:
-        if mode not in range(4):
-            raise ValueError("WebRTC VAD mode must be 0..3")
-        self._vad = webrtcvad.Vad(mode)
-
-    def is_speech(self, frame: FloatAudio, sample_rate: int) -> bool:
-        pcm = np.rint(np.clip(frame, -1.0, 1.0) * 32_767.0).astype("<i2")
-        return bool(self._vad.is_speech(pcm.tobytes(order="C"), sample_rate))
+    def active(self, now: float) -> bool:
+        return now - self._last_voiced_at < self.HANGOVER_S
 
 
-class EchoReference:
-    """Bounded reference of audio successfully handed to the local speaker."""
+@dataclass(frozen=True)
+class EchoMatch:
+    """How much a microphone window can be explained by recent playout."""
 
-    def __init__(
-        self,
-        sample_rate: int = 16_000,
-        history_seconds: float = 1.5,
-        downsample: int = 4,
-    ) -> None:
-        if history_seconds <= 0 or downsample <= 0:
-            raise ValueError("echo history and downsample must be positive")
-        self._max_samples = max(1, round(sample_rate * history_seconds / downsample))
-        self._downsample = downsample
-        self._samples = np.empty(0, dtype=np.float32)
+    similarity: float = 0.0
+    unexplained_db: float = SILENT_DB
+    lag_ms: float = 0.0
+
+
+class PlaybackEchoMatcher:
+    """Match a voiced microphone window against exact recent speaker PCM.
+
+    XVF3800 AEC removes most far-end energy, but the remaining waveform still
+    follows the exact audio sent to the speaker. A normalized correlation is
+    searched over the whole capture/pipeline latency range instead of assuming
+    one fixed delay. The best linear match also estimates how much microphone
+    energy remains unexplained; genuine double-talk retains near-end energy
+    even when some far-end correlation is present.
+
+    Matching is decimated to 2 kHz after box filtering. This retains enough
+    speech structure for echo identification while keeping the 20 ms capture
+    loop bounded on the Reachy Mini CM4.
+    """
+
+    SAMPLE_RATE = 16_000
+    HISTORY_S = 2.0
+    DECIMATION = 8
+    MIN_REFERENCE_RMS = 1e-4
+
+    def __init__(self) -> None:
+        self._blocks: deque[tuple[float, np.ndarray]] = deque()
         self._lock = threading.Lock()
 
-    def append_played(self, samples: npt.ArrayLike) -> None:
-        data = _mono_float32(samples)
-        usable = data.size // self._downsample * self._downsample
-        if usable == 0:
+    def record(self, start: float, pcm_16k: np.ndarray) -> None:
+        """Record one block at its scheduled physical playout time."""
+        pcm = np.asarray(pcm_16k, dtype=np.float32).reshape(-1).copy()
+        if len(pcm) == 0:
             return
-        reduced = data[:usable].reshape(-1, self._downsample).mean(axis=1, dtype=np.float32)
+        cutoff = start - self.HISTORY_S - 0.5
         with self._lock:
-            combined = (
-                reduced if self._samples.size == 0 else np.concatenate((self._samples, reduced))
-            )
-            self._samples = np.ascontiguousarray(combined[-self._max_samples :], dtype=np.float32)
+            self._blocks.append((start, pcm))
+            while self._blocks:
+                block_start, block = self._blocks[0]
+                block_end = block_start + len(block) / self.SAMPLE_RATE
+                if block_end >= cutoff:
+                    break
+                self._blocks.popleft()
 
-    def similarity(self, captured_frame: npt.ArrayLike) -> float:
-        similarity, _ = self._match(captured_frame, filtered=False)
-        return similarity
+    def match(self, mic_16k: np.ndarray, now: float) -> EchoMatch:
+        """Return the strongest delayed far-end match for ``mic_16k``."""
+        mic = np.asarray(mic_16k, dtype=np.float32).reshape(-1)
+        if len(mic) < FRAME_SAMPLES:
+            return EchoMatch()
 
-    def match(self, captured_frame: npt.ArrayLike) -> tuple[float, float]:
-        """Return direct correlation and a short-FIR echo explanation score."""
+        origin = now - self.HISTORY_S
+        reference = np.zeros(round(self.HISTORY_S * self.SAMPLE_RATE), np.float32)
+        with self._lock:
+            blocks = tuple(self._blocks)
+        for start, block in blocks:
+            dst_start = round((start - origin) * self.SAMPLE_RATE)
+            src_start = max(0, -dst_start)
+            dst_start = max(0, dst_start)
+            count = min(len(block) - src_start, len(reference) - dst_start)
+            if count > 0:
+                reference[dst_start : dst_start + count] = block[src_start : src_start + count]
 
-        return self._match(captured_frame, filtered=True)
+        ref = self._prepare(reference)
+        probe = self._prepare(mic)
+        if len(probe) == 0 or len(ref) < len(probe):
+            return EchoMatch()
+        probe_energy = float(np.dot(probe, probe))
+        if probe_energy <= 1e-12:
+            return EchoMatch()
 
-    def _match(
-        self,
-        captured_frame: npt.ArrayLike,
-        *,
-        filtered: bool,
-    ) -> tuple[float, float]:
-        frame = _mono_float32(captured_frame)
-        usable = frame.size // self._downsample * self._downsample
+        # np.correlate is implemented in C; after 8x decimation this is a
+        # small bounded search (~1M multiply-adds for a 200 ms candidate).
+        correlation = np.correlate(ref, probe, mode="valid")
+        squared = np.square(ref, dtype=np.float64)
+        cumulative = np.concatenate(([0.0], np.cumsum(squared)))
+        window_energy = cumulative[len(probe) :] - cumulative[: -len(probe)]
+        minimum_energy = (self.MIN_REFERENCE_RMS**2) * len(probe)
+        denominator = np.sqrt(np.maximum(window_energy, minimum_energy) * probe_energy)
+        scores = np.divide(
+            np.abs(correlation),
+            denominator,
+            out=np.zeros_like(correlation, dtype=np.float64),
+            where=window_energy >= minimum_energy,
+        )
+        best_index = int(np.argmax(scores))
+        similarity = min(1.0, float(scores[best_index]))
+
+        mic_rms = float(np.sqrt(np.mean(np.square(mic, dtype=np.float64))))
+        unexplained_rms = mic_rms * math.sqrt(max(0.0, 1.0 - similarity * similarity))
+        unexplained_db = 20.0 * math.log10(unexplained_rms + 1e-9)
+        matched_end = origin + ((best_index + len(probe)) * self.DECIMATION / self.SAMPLE_RATE)
+        return EchoMatch(
+            similarity=similarity,
+            unexplained_db=unexplained_db,
+            lag_ms=max(0.0, (now - matched_end) * 1000.0),
+        )
+
+    @classmethod
+    def _prepare(cls, pcm: np.ndarray) -> np.ndarray:
+        """Low-pass, decimate and high-pass one correlation vector."""
+        usable = len(pcm) // cls.DECIMATION * cls.DECIMATION
         if usable == 0:
-            return 0.0, 0.0
-        probe = frame[:usable].reshape(-1, self._downsample).mean(axis=1, dtype=np.float32)
-        probe = probe - float(probe.mean())
-        probe_norm = float(np.linalg.norm(probe))
-        if probe_norm < 1e-8:
-            return 0.0, 0.0
-        with self._lock:
-            reference = self._samples.copy()
-        if reference.size < probe.size:
-            return 0.0, 0.0
-        reference = reference - float(reference.mean())
-        dots = np.correlate(reference, probe, mode="valid")
-        squared = np.square(reference, dtype=np.float32)
-        cumulative = np.concatenate(
-            (np.zeros(1, dtype=np.float64), np.cumsum(squared, dtype=np.float64))
-        )
-        window_energy = cumulative[probe.size :] - cumulative[: -probe.size]
-        denominator = np.sqrt(np.maximum(window_energy, 1e-16)) * probe_norm
-        correlations = np.abs(dots) / denominator
-        best_index = int(np.argmax(correlations))
-        similarity = float(np.clip(correlations[best_index], 0.0, 1.0))
-        if not filtered or probe.size < 32:
-            return similarity, similarity
-
-        half_taps = 6
-        columns = []
-        for offset in range(-half_taps, half_taps + 1):
-            start = best_index + offset
-            if 0 <= start and start + probe.size <= reference.size:
-                column = reference[start : start + probe.size].copy()
-                column -= float(column.mean())
-                columns.append(column)
-        if len(columns) < 3:
-            return similarity, similarity
-        design = np.stack(columns, axis=1)
-        coefficients, *_ = np.linalg.lstsq(design, probe, rcond=None)
-        residual = probe - design @ coefficients
-        residual_ratio = float(np.dot(residual, residual)) / max(
-            float(np.dot(probe, probe)),
-            1e-16,
-        )
-        filtered_similarity = math.sqrt(max(0.0, 1.0 - residual_ratio))
-        return similarity, float(np.clip(filtered_similarity, 0.0, 1.0))
-
-    def clear(self) -> None:
-        with self._lock:
-            self._samples = np.empty(0, dtype=np.float32)
+            return np.empty(0, np.float32)
+        downsampled = pcm[:usable].reshape(-1, cls.DECIMATION).mean(axis=1)
+        prepared = np.diff(downsampled, prepend=downsampled[0])
+        prepared -= float(np.mean(prepared))
+        return prepared.astype(np.float32, copy=False)
 
 
-class NearEndDetector:
-    """Combine WebRTC VAD, an adaptive noise gate, and echo correlation."""
+class UplinkGain:
+    """Automatic gain control for microphone audio sent to the model.
 
-    def __init__(
-        self,
-        *,
-        sample_rate: int = 16_000,
-        frame_ms: int = 20,
-        vad_mode: int = 2,
-        min_rms: float = 0.006,
-        noise_ratio: float = 2.2,
-        barge_attack_ms: int = 80,
-        barge_debounce_ms: int = 350,
-        near_end_hold_ms: int = 300,
-        echo_correlation: float = 0.72,
-        echo_reference: EchoReference | None = None,
-        vad: SpeechDetector | None = None,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        if frame_ms not in {10, 20, 30}:
-            raise ValueError("frame_ms must be 10, 20, or 30")
-        if min_rms <= 0 or noise_ratio <= 1:
-            raise ValueError("noise gate parameters are invalid")
-        if not 0 < echo_correlation < 1:
-            raise ValueError("echo correlation must be between zero and one")
-        self.sample_rate = sample_rate
-        self.frame_samples = sample_rate * frame_ms // 1_000
-        self._vad = vad or WebRtcSpeechDetector(vad_mode)
-        self._echo = echo_reference
-        self._clock = clock
-        self._min_rms = min_rms
-        self._noise_ratio = noise_ratio
-        self._echo_correlation = echo_correlation
-        self._attack_frames = max(1, math.ceil(barge_attack_ms / frame_ms))
-        self._near_frames = max(1, math.ceil(40 / frame_ms))
-        self._debounce = barge_debounce_ms / 1_000
-        self._hold = near_end_hold_ms / 1_000
-        self._noise_floor = max(1e-5, min_rms / noise_ratio)
-        self._candidate_frames = 0
-        self._last_near = -math.inf
-        self._last_barge = -math.inf
-        self._barge_latched = False
-        self._echo_frames: deque[FloatAudio] = deque(maxlen=self._attack_frames)
-        self._guard_candidates: deque[bool] = deque(maxlen=self._attack_frames)
+    XVF3800 capture runs far below full scale (user speech measures
+    −33…−22 dB RMS on hardware, further suppressed during double-talk),
+    and the duplex model's server-side listen decisions miss faint audio —
+    after a barge-in it would resume its monologue as if the user had said
+    nothing. Gain moves smoothly toward TARGET_RMS/rms, is only updated on
+    speech-level chunks (never pumping up room noise), and is capped.
+    """
+
+    TARGET_RMS = 0.12
+    MAX_GAIN = 8.0
+    SPEECH_FLOOR_RMS = 0.006
+    SMOOTHING = 0.3
+    PLAYBACK_RELEASE = 0.2
+
+    def __init__(self) -> None:
+        self.gain = 1.0
 
     def process(
         self,
-        frame: npt.ArrayLike,
+        chunk: np.ndarray,
         *,
-        output_active: bool,
-        echo_guard_active: bool | None = None,
-        timestamp: float | None = None,
-    ) -> VoiceDecision:
-        data = _mono_float32(frame)
-        if data.size != self.frame_samples:
-            raise ValueError(f"expected {self.frame_samples} samples, received {data.size}")
-        now = self._clock() if timestamp is None else timestamp
-        rms = float(np.sqrt(np.mean(np.square(data, dtype=np.float64))))
-        threshold = max(self._min_rms, self._noise_floor * self._noise_ratio)
-        vad_speech = self._vad.is_speech(data, self.sample_rate)
-        guard_active = output_active if echo_guard_active is None else echo_guard_active
-        raw_candidate = vad_speech and rms >= threshold
-        probe_ready = True
-        if guard_active and self._echo is not None:
-            self._echo_frames.append(data.copy())
-            self._guard_candidates.append(raw_candidate)
-            probe = np.concatenate(tuple(self._echo_frames))
-            probe_ready = len(self._echo_frames) >= self._attack_frames
-            if probe_ready:
-                similarity, echo_fit = self._echo.match(probe)
-            else:
-                similarity = self._echo.similarity(probe)
-                echo_fit = similarity
-            # Correlation preserves double-talk; the short-FIR score catches
-            # room-filtered robot echo that direct correlation misses.
-            echo_like = (
-                echo_fit >= max(self._echo_correlation, 0.82)
-                if probe_ready
-                else similarity >= self._echo_correlation
-            )
-            if probe_ready and echo_like:
-                for index in range(len(self._guard_candidates)):
-                    self._guard_candidates[index] = False
-                self._candidate_frames = 0
-            elif probe_ready:
-                self._candidate_frames = 0
-                for is_candidate in reversed(self._guard_candidates):
-                    if not is_candidate:
-                        break
-                    self._candidate_frames += 1
-            elif raw_candidate:
-                self._candidate_frames += 1
-            else:
-                self._candidate_frames = 0
-        else:
-            self._echo_frames.clear()
-            self._guard_candidates.clear()
-            similarity = 0.0
-            echo_fit = 0.0
-            echo_like = False
-            self._candidate_frames = self._candidate_frames + 1 if raw_candidate else 0
+        playback_active: bool = False,
+        confirmed_user_voice: bool = False,
+    ) -> np.ndarray:
+        rms = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
+        if playback_active and not confirmed_user_voice:
+            # Do not preserve a large user-learned gain while only our own
+            # AEC residual is present. It can otherwise make the model hear
+            # and answer the robot itself.
+            self.gain += (1.0 - self.gain) * self.PLAYBACK_RELEASE
+        elif rms > self.SPEECH_FLOOR_RMS:
+            target = min(self.MAX_GAIN, max(1.0, self.TARGET_RMS / rms))
+            self.gain += (target - self.gain) * self.SMOOTHING
+        return np.clip(chunk * self.gain, -1.0, 1.0).astype(np.float32)
 
-        candidate = raw_candidate and not echo_like and probe_ready
-        if not candidate:
-            self._barge_latched = False
 
-        if candidate and self._candidate_frames >= self._near_frames:
-            self._last_near = now
-        near_end = now - self._last_near <= self._hold
+class StreamResampler:
+    """Stateful linear resampler (24 kHz → 16 kHz) with phase continuity.
 
-        barge_in = False
-        if (
-            output_active
-            and self._candidate_frames >= self._attack_frames
-            and not self._barge_latched
-            and now - self._last_barge >= self._debounce
-        ):
-            barge_in = True
-            self._barge_latched = True
-            self._last_barge = now
+    Linear interpolation is transparent for 24→16 k speech and adds zero
+    latency and zero dependencies — deliberately chosen over polyphase.
+    """
 
-        if not vad_speech and not echo_like:
-            alpha = 0.08 if rms < self._noise_floor else 0.02
-            self._noise_floor += alpha * (max(rms, 1e-5) - self._noise_floor)
-
-        return VoiceDecision(
-            timestamp=now,
-            rms=rms,
-            noise_floor=self._noise_floor,
-            energy_threshold=threshold,
-            vad_speech=vad_speech,
-            current_near_end=candidate,
-            near_end=near_end,
-            output_active=output_active,
-            echo_guard_active=guard_active,
-            echo_similarity=similarity,
-            echo_fit=echo_fit,
-            echo_like=echo_like,
-            barge_in=barge_in,
-        )
+    def __init__(self, rate_in: int = 24_000, rate_out: int = 16_000) -> None:
+        self._step = rate_in / rate_out
+        self.reset()
 
     def reset(self) -> None:
-        self._candidate_frames = 0
-        self._last_near = -math.inf
-        self._last_barge = -math.inf
-        self._barge_latched = False
-        self._echo_frames.clear()
-        self._guard_candidates.clear()
+        self._tail = np.empty(0, np.float32)
+        self._phase = 0.0
+
+    def process(self, pcm: np.ndarray) -> np.ndarray:
+        if len(pcm) == 0:
+            return pcm.astype(np.float32)
+        buf = np.concatenate([self._tail, pcm.astype(np.float32)])
+        positions = np.arange(self._phase, len(buf) - 1, self._step)
+        out = np.interp(positions, np.arange(len(buf)), buf).astype(np.float32)
+        consumed = positions[-1] + self._step if len(positions) else self._phase
+        keep = int(np.floor(consumed))
+        self._phase = consumed - keep
+        self._tail = buf[keep:]
+        return out
 
 
-class PlaybackEngine:
-    """Lossless paced playback with a small device queue and an epoch fence."""
+class Speaker(threading.Thread):
+    """Paced, epoch-interruptible playback of 24 kHz model audio.
 
-    def __init__(
-        self,
-        media: PlaybackPort,
-        epoch_supplier: Callable[[], int],
-        echo_reference: EchoReference,
-        *,
-        input_sample_rate: int = 24_000,
-        output_sample_rate: int = 16_000,
-        preroll_ms: int = 0,
-        output_chunk_ms: int = 40,
-        max_ahead_ms: int = 120,
-        clock: Callable[[], float] = time.monotonic,
-        logger: logging.Logger | None = None,
-    ) -> None:
-        if input_sample_rate <= 0 or output_sample_rate <= 0:
-            raise ValueError("playback sample rates must be positive")
-        if preroll_ms < 0 or output_chunk_ms <= 0 or max_ahead_ms < output_chunk_ms:
-            raise ValueError("playback queue parameters are invalid")
+    TTS units arrive roughly once per second with jitter, so streaming them
+    straight to the device underruns audibly. An adaptive start-of-utterance
+    preroll (0.25–0.8 s: +0.15 on underrun, ×0.9 on a clean turn) absorbs the
+    jitter, while the device backlog is capped so flushes stay cheap.
+
+    ``interrupt()`` advances the epoch before asking the playback thread to
+    clear the SDK player, so both already-buffered audio and late deltas from
+    the old turn are discarded. There is deliberately no resumable duck:
+    once local VAD qualifies a user interruption, old speech must not return.
+    """
+
+    PREROLL_MIN, PREROLL_MAX = 0.25, 0.8
+    BACKLOG_CAP_S = 1.2
+
+    def __init__(self, media) -> None:
+        super().__init__(name="yrobot-speaker", daemon=True)
         self._media = media
-        self._epoch_supplier = epoch_supplier
-        self._echo = echo_reference
-        self._input_rate = input_sample_rate
-        self._output_rate = output_sample_rate
-        self._resampler = StreamingResampler(
-            input_sample_rate,
-            output_sample_rate,
-        )
-        self._resampler_key: tuple[int, int, str | None] | None = None
-        self._logged_first_pushes: set[tuple[int, int, str | None]] = set()
-        self._stream_generation = 0
-        self._preroll_samples = input_sample_rate * preroll_ms // 1_000
-        self._preroll_seconds = preroll_ms / 1_000
-        self._output_chunk_samples = max(1, output_sample_rate * output_chunk_ms // 1_000)
-        self._max_ahead_seconds = max_ahead_ms / 1_000
-        self._clock = clock
-        self._logger = logger or logging.getLogger(__name__)
+        self._q: queue.Queue[tuple[int, np.ndarray]] = queue.Queue()
+        self._epoch = 0
+        self._flush_to = 0
+        self._resampler = StreamResampler()
+        self._preroll = 0.3
+        self._pending: deque[np.ndarray] = deque()
+        self._buffered_s = 0.0
+        self._pushed_until = 0.0  # monotonic time the device runs dry
+        self._streaming = False  # preroll satisfied, turn is being played
+        self._end_requested = False  # listen boundary seen for this turn
+        self._turn_underrun = False
+        self._command_lock = threading.Lock()
+        self._flush_event = threading.Event()
+        self._flush_requested_at = 0.0
+        self._flushed_epoch = 0
+        self._flush_condition = threading.Condition()
+        self._halt = threading.Event()
+        self._echo_matcher = PlaybackEchoMatcher()
 
-        self._condition = threading.Condition()
-        self._output_lock = threading.Lock()
-        self._activity_lock = threading.Lock()
-        self._queue: deque[PlaybackPacket] = deque()
-        self._first_seen: dict[tuple[int, int], float] = {}
-        self._primed_streams: set[tuple[int, int]] = set()
-        self._fence_epoch = 0
-        self._stopping = False
-        self._started = False
-        self._thread: threading.Thread | None = None
-        self._playing_until = 0.0
-        self._echo_guard_until = 0.0
-        self._echo_tail_seconds = 0.18
-        self._enqueued = 0
-        self._dropped = 0
-        self._stale = 0
-        self._pushed = 0
-        self._clears = 0
-        self._errors = 0
+    # -- called from other threads ----------------------------------------
 
-    def start(self) -> None:
-        with self._condition:
-            if self._started:
-                return
-            if self._stopping:
-                raise RuntimeError("playback engine cannot be restarted")
-            player = getattr(self._media, "audio", None)
-            if player is None or not hasattr(player, "clear_player"):
-                raise RuntimeError("the local media audio backend is unavailable")
-            # A positive SDK limit makes GStreamer's appsrc leaky and silently
-            # drops old speech. Pacing below keeps the device queue short.
-            player.set_max_output_buffers(0)
-            self._started = True
-            self._thread = threading.Thread(target=self._run, name="yrobot-playback", daemon=True)
-            self._thread.start()
+    @property
+    def epoch(self) -> int:
+        with self._command_lock:
+            return self._epoch
 
-    def enqueue(self, packet: PlaybackPacket) -> bool:
-        samples = np.asarray(packet.samples, dtype=np.float32)
-        if samples.ndim != 1 or samples.size == 0:
-            return False
-        samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
-        normalized_samples = np.ascontiguousarray(np.clip(samples, -1.0, 1.0))
-        with self._condition:
-            normalized = PlaybackPacket(
-                epoch=packet.epoch,
-                samples=normalized_samples,
-                response_id=packet.response_id,
-                stream_generation=self._stream_generation,
-                received_at=packet.received_at,
-                enqueued_at=self._clock(),
-            )
-            if self._stopping or not self._is_current(normalized):
-                self._stale += 1
-                return False
-            self._queue.append(normalized)
-            stream_key = (normalized.epoch, normalized.stream_generation)
-            if self._preroll_samples:
-                self._first_seen.setdefault(stream_key, self._clock())
-            self._enqueued += 1
-            self._condition.notify()
-        return True
+    def play(self, epoch: int, pcm_24k: np.ndarray) -> None:
+        with self._command_lock:
+            if epoch == self._epoch:
+                self._q.put((epoch, pcm_24k))
 
-    def mark_response_boundary(self) -> None:
-        """Separate resampler state for audio received after a listen boundary."""
+    def interrupt(self) -> int:
+        """Committed barge-in: advance the epoch and flush everything."""
+        with self._command_lock:
+            self._epoch += 1
+            self._flush_to = self._epoch
+            epoch = self._epoch
+            self._flush_requested_at = time.monotonic()
+            self._flush_event.set()
+            return epoch
 
-        with self._condition:
-            self._stream_generation += 1
-
-    def interrupt(self, epoch: int) -> bool:
-        """Fence first, then serialize a hardware flush against every push."""
-
-        with self._condition:
-            self._fence_epoch = max(self._fence_epoch, epoch)
-            self._dropped += len(self._queue)
-            self._queue.clear()
-            self._first_seen.clear()
-            self._primed_streams.clear()
-            self._logged_first_pushes.clear()
-            self._condition.notify_all()
-        with self._output_lock:
-            with self._activity_lock:
-                was_playing = self._clock() < self._playing_until
-            try:
-                self._player().clear_player()
-            except Exception:
-                self._record_error()
-                self._logger.exception("failed to flush Reachy Mini playback")
-                cleared = False
-            else:
-                with self._condition:
-                    self._clears += 1
-                cleared = True
-            with self._activity_lock:
-                now = self._clock()
-                self._playing_until = now
-                if was_playing:
-                    self._echo_guard_until = max(
-                        self._echo_guard_until,
-                        now + self._echo_tail_seconds,
-                    )
-        return cleared
-
-    def output_active(self) -> bool:
-        with self._activity_lock:
-            return self._clock() < self._playing_until
-
-    def echo_guard_active(self) -> bool:
-        """Include a short room/speaker tail after predicted playback ends."""
-
-        with self._activity_lock:
-            return self._clock() < max(
-                self._playing_until,
-                self._echo_guard_until,
-            )
-
-    def stats(self) -> PlaybackStats:
-        with self._condition:
-            return PlaybackStats(
-                enqueued=self._enqueued,
-                dropped=self._dropped,
-                stale=self._stale,
-                pushed=self._pushed,
-                clears=self._clears,
-                errors=self._errors,
-            )
-
-    def stop(self, *, flush: bool = True, timeout: float = 2.0) -> bool:
-        with self._condition:
-            if self._stopping:
-                thread = self._thread
-            else:
-                self._stopping = True
-                self._dropped += len(self._queue)
-                self._queue.clear()
-                self._condition.notify_all()
-                thread = self._thread
-        if flush and self._started:
-            with self._output_lock:
-                try:
-                    self._player().clear_player()
-                except Exception:
-                    self._record_error()
-                    self._logger.exception("failed to flush playback during shutdown")
-                else:
-                    with self._condition:
-                        self._clears += 1
-                self._echo.clear()
-                with self._activity_lock:
-                    self._playing_until = self._clock()
-        if thread is not None:
-            thread.join(timeout)
-            stopped = not thread.is_alive()
-        else:
-            stopped = True
-        self._echo.clear()
-        with self._activity_lock:
-            now = self._clock()
-            self._playing_until = now
-            self._echo_guard_until = now
-        return stopped
-
-    def _run(self) -> None:
-        while True:
-            packet = self._take_packet()
-            if packet is None:
-                return
-            resample_started = time.perf_counter()
-            if self._input_rate == self._output_rate:
-                output = packet.samples
-            else:
-                resampler_key = (
-                    packet.epoch,
-                    packet.stream_generation,
-                    packet.response_id,
-                )
-                if resampler_key != self._resampler_key:
-                    self._resampler.reset()
-                    self._resampler_key = resampler_key
-                output = self._resampler.process(packet.samples)
-            resample_ms = (time.perf_counter() - resample_started) * 1_000
-            if output.size == 0:
-                continue
-            output = np.ascontiguousarray(output, dtype=np.float32)
-            for start in range(0, output.size, self._output_chunk_samples):
-                chunk = np.ascontiguousarray(
-                    output[start : start + self._output_chunk_samples],
-                    dtype=np.float32,
-                )
-                if not self._wait_for_device_capacity(packet, chunk.size / self._output_rate):
-                    break
-                if not self._push_chunk(packet, chunk, resample_ms):
-                    break
-                resample_ms = 0.0
-
-    def _wait_for_device_capacity(
-        self,
-        packet: PlaybackPacket,
-        chunk_seconds: float,
-    ) -> bool:
-        with self._condition:
-            while True:
-                if self._stopping or not self._is_current(packet):
-                    self._stale += 1
+    def wait_flushed(self, epoch: int, timeout: float | None = None) -> bool:
+        """Wait until the playback thread has cleared through ``epoch``."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._flush_condition:
+            while self._flushed_epoch < epoch:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
                     return False
-                with self._activity_lock:
-                    now = self._clock()
-                    ahead_after_push = max(now, self._playing_until) + chunk_seconds - now
-                delay = ahead_after_push - self._max_ahead_seconds
-                if delay <= 0:
-                    return True
-                self._condition.wait(min(delay, 0.02))
-
-    def _push_chunk(
-        self,
-        packet: PlaybackPacket,
-        output: FloatAudio,
-        resample_ms: float,
-    ) -> bool:
-        push_started = self._clock()
-        with self._output_lock:
-            with self._condition:
-                valid = not self._stopping and self._is_current(packet)
-                if not valid:
-                    self._stale += 1
-            if not valid:
-                return False
-            push_perf_started = time.perf_counter()
-            try:
-                self._media.push_audio_sample(output)
-            except Exception:
-                self._record_error()
-                self._logger.exception("failed to push Reachy Mini audio")
-                return False
-            media_push_ms = (time.perf_counter() - push_perf_started) * 1_000
-            self._echo.append_played(output)
-            with self._activity_lock:
-                now = self._clock()
-                self._playing_until = max(now, self._playing_until) + (
-                    output.size / self._output_rate
-                )
-                self._echo_guard_until = self._playing_until + self._echo_tail_seconds
-            with self._condition:
-                self._pushed += 1
-                push_key = (
-                    packet.epoch,
-                    packet.stream_generation,
-                    packet.response_id,
-                )
-                log_first_push = push_key not in self._logged_first_pushes
-                if log_first_push:
-                    self._logged_first_pushes.add(push_key)
-        if log_first_push and packet.received_at is not None:
-            enqueued_at = packet.enqueued_at or packet.received_at
-            self._logger.info(
-                "Reachy first audio push: response_id=%s raw_to_enqueue_ms=%.1f "
-                "enqueue_to_push_ms=%.1f resample_ms=%.1f media_push_ms=%.1f chunk_ms=%.1f",
-                packet.response_id or "-",
-                max(0.0, (enqueued_at - packet.received_at) * 1_000),
-                max(0.0, (push_started - enqueued_at) * 1_000),
-                resample_ms,
-                media_push_ms,
-                output.size / self._output_rate * 1_000,
-            )
-        return True
-
-    def _take_packet(self) -> PlaybackPacket | None:
-        with self._condition:
-            while True:
-                if self._stopping:
-                    return None
-                while self._queue and not self._is_current(self._queue[0]):
-                    self._queue.popleft()
-                    self._stale += 1
-                if not self._queue:
-                    self._condition.wait()
-                    continue
-                packet = self._queue[0]
-                stream_key = (packet.epoch, packet.stream_generation)
-                if self._preroll_samples and stream_key not in self._primed_streams:
-                    available = sum(
-                        queued.samples.size
-                        for queued in self._queue
-                        if (
-                            queued.epoch == packet.epoch
-                            and queued.stream_generation == packet.stream_generation
-                        )
-                    )
-                    elapsed = self._clock() - self._first_seen[stream_key]
-                    remaining = self._preroll_seconds - elapsed
-                    if available < self._preroll_samples and remaining > 0:
-                        self._condition.wait(min(remaining, 0.01))
-                        continue
-                    self._primed_streams.add(stream_key)
-                return self._queue.popleft()
-
-    def _is_current(self, packet: PlaybackPacket) -> bool:
-        return packet.epoch >= self._fence_epoch and packet.epoch == self._epoch_supplier()
-
-    def _player(self) -> object:
-        player = getattr(self._media, "audio", None)
-        if player is None:
-            raise RuntimeError("the local media audio backend is unavailable")
-        return player
-
-    def _record_error(self) -> None:
-        with self._condition:
-            self._errors += 1
-
-
-class AudioCaptureWorker:
-    """Own the non-blocking microphone pull loop, but never media lifecycle."""
-
-    def __init__(
-        self,
-        media: CapturePort,
-        *,
-        channel: int,
-        detector: NearEndDetector,
-        output_active: Callable[[], bool],
-        echo_guard_active: Callable[[], bool] | None = None,
-        on_unit: Callable[[AudioUnit], None],
-        on_voice: Callable[[VoiceDecision], None] | None = None,
-        on_barge_in: Callable[[VoiceDecision], None] | None = None,
-        sample_rate: int = 16_000,
-        frame_ms: int = 20,
-        unit_ms: int = 1_000,
-        logger: logging.Logger | None = None,
-    ) -> None:
-        self._media = media
-        self._channel = channel
-        self._detector = detector
-        self._output_active = output_active
-        self._echo_guard_active = echo_guard_active or output_active
-        self._on_unit = on_unit
-        self._on_voice = on_voice
-        self._on_barge_in = on_barge_in
-        self._frames = FrameSplitter(sample_rate, frame_ms)
-        self._units = AudioUnitizer(sample_rate, unit_ms)
-        self._logger = logger or logging.getLogger(__name__)
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._run, name="yrobot-capture", daemon=True)
-        self._thread.start()
-
-    def stop(self, timeout: float = 2.0) -> bool:
-        self._stop.set()
-        if self._thread is None:
+                self._flush_condition.wait(remaining)
             return True
-        self._thread.join(timeout)
-        return not self._thread.is_alive()
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
+    def utterance_end(self) -> None:
+        """Mark the turn boundary (a ``listen`` delta) — flush any short
+        reply still waiting for preroll and adapt the preroll for next turn."""
+        self._end_requested = True
+
+    def audible(self, now: float | None = None) -> bool:
+        """A turn is live somewhere between queue and device."""
+        now = time.monotonic() if now is None else now
+        return self._pushed_until - now > 0.02 or self._buffered_s > 0 or not self._q.empty()
+
+    def sounding(self, now: float | None = None) -> bool:
+        """Whether audio is physically scheduled on the SDK player."""
+        now = time.monotonic() if now is None else now
+        return self._pushed_until - now > 0.02
+
+    def playing(self, now: float | None = None) -> bool:
+        """Whether audio is physically scheduled on the SDK player."""
+        now = time.monotonic() if now is None else now
+        return self._pushed_until - now > 0.02
+
+    def echo_match(self, mic_16k: np.ndarray, now: float) -> EchoMatch:
+        """Compare a microphone candidate with recent scheduled playout."""
+        return self._echo_matcher.match(mic_16k, now)
+
+    def close(self) -> None:
+        self._halt.set()
+        self._flush_event.set()
+
+    # -- playback thread ----------------------------------------------------
+
+    def run(self) -> None:
+        flushed_at = 0
+        while not self._halt.is_set():
+            if self._flush_event.is_set():
+                with self._command_lock:
+                    flushed_at = self._flush_to
+                    requested_at = self._flush_requested_at
+                    self._flush_event.clear()
+                self._reset_turn()
+                self._clear_device()
+                if requested_at:
+                    logger.info(
+                        "playback epoch %d cleared locally in %.0f ms",
+                        flushed_at,
+                        (time.monotonic() - requested_at) * 1000,
+                    )
+                with self._flush_condition:
+                    self._flushed_epoch = max(self._flushed_epoch, flushed_at)
+                    self._flush_condition.notify_all()
+                continue
             try:
-                captured = self._media.get_audio_sample()
-            except Exception:
-                self._logger.exception("failed to read Reachy Mini microphone")
-                self._stop.wait(0.02)
-                continue
-            if captured is None:
-                self._stop.wait(0.002)
-                continue
-            try:
-                mono = mono_capture(captured, self._channel)
-            except (TypeError, ValueError):
-                self._logger.exception("discarding malformed microphone samples")
-                continue
+                epoch, pcm = self._q.get(timeout=0.05)
+                if epoch == self._epoch:
+                    self._pending.append(pcm)
+                    self._buffered_s += len(pcm) / 24_000
+            except queue.Empty:
+                if not self._streaming and not self._pending:
+                    # A boundary for a fully-discarded turn must not bypass
+                    # the preroll of the next real turn.
+                    self._end_requested = False
+
+            if not self._streaming and self._pending:
+                if self._buffered_s >= self._preroll or self._end_requested:
+                    self._streaming = True
+            if self._streaming:
+                self._stream_pending()
+                self._check_turn_end()
+
+    def _stream_pending(self) -> None:
+        while self._pending and not self._flush_event.is_set() and not self._halt.is_set():
             now = time.monotonic()
-            # Evaluate barge-in before publishing a unit completed by the same
-            # capture block, so its wire event can already carry force_listen.
-            for frame in self._frames.push(mono):
-                decision = self._detector.process(
-                    frame,
-                    output_active=self._output_active(),
-                    echo_guard_active=self._echo_guard_active(),
-                    timestamp=now,
-                )
-                if self._on_voice is not None:
-                    self._call(self._on_voice, decision, "voice-state callback failed")
-                if decision.barge_in and self._on_barge_in is not None:
-                    self._call(self._on_barge_in, decision, "barge-in callback failed")
-            for unit in self._units.push(mono, captured_at=now):
-                self._call(self._on_unit, unit, "audio unit callback failed")
+            if self._pushed_until - now > self.BACKLOG_CAP_S:
+                return  # revisit on the next loop tick; keep flushes cheap
+            pcm = self._pending.popleft()
+            self._buffered_s = max(self._buffered_s - len(pcm) / 24_000, 0.0)
+            self._push(self._resampler.process(pcm))
 
-    def _call(
-        self,
-        callback: Callable[[object], None],
-        value: object,
-        message: str,
-    ) -> None:
+    def _push(self, out: np.ndarray) -> None:
+        """Push one 16 kHz block, recording its physical echo reference."""
+        now = time.monotonic()
+        self._media.push_audio_sample(out)
+        start = max(self._pushed_until, now)
+        self._echo_matcher.record(start, out)
+        self._pushed_until = start + len(out) / 16_000
+
+    def _check_turn_end(self) -> None:
+        if self._pending:
+            return
+        now = time.monotonic()
+        if self._pushed_until > now:
+            return
+        # Device is dry and nothing is buffered: the turn either finished
+        # cleanly (boundary seen) or genuinely underran mid-sentence.
+        if self._end_requested:
+            if not self._turn_underrun:
+                self._preroll = max(self._preroll * 0.9, self.PREROLL_MIN)
+            self._reset_turn(drain_queue=False)  # a next-turn chunk may already be queued
+        else:
+            if not self._turn_underrun:
+                self._turn_underrun = True
+                self._preroll = min(self._preroll + 0.15, self.PREROLL_MAX)
+                logger.debug("underrun; preroll now %.2f s", self._preroll)
+            self._streaming = False  # re-preroll the remainder of the turn
+
+    def _clear_device(self) -> None:
         try:
-            callback(value)
-        except Exception:
-            self._logger.exception(message)
+            self._media.audio.clear_player()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("clear_player failed: %s", exc)
+
+    def _reset_turn(self, drain_queue: bool = True) -> None:
+        while drain_queue:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+        self._pending.clear()
+        self._buffered_s = 0.0
+        self._pushed_until = 0.0
+        self._streaming = False
+        self._end_requested = False
+        self._turn_underrun = False
+        self._resampler.reset()
