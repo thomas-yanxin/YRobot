@@ -66,6 +66,7 @@ BARGE_MATCH_FRAMES = 10
 BARGE_RECHECK_FRAMES = 5
 BARGE_GAP_FRAMES = 2
 BARGE_ECHO_LOG_PERIOD_S = 2.0
+BARGE_ANALYSIS_S = BARGE_MATCH_FRAMES * FRAME_S
 
 
 def shrink_jpeg(bgr_frame: np.ndarray | None) -> bytes | None:
@@ -184,6 +185,8 @@ class Conversation:
         self._barge_frames: deque[np.ndarray] = deque(maxlen=BARGE_MATCH_FRAMES)
         self._barge_frames_since_match = 0
         self._barge_quiet_frames = 0
+        self._near_end_started_at: float | None = None
+        self._near_end_onset_at = -1e9
         self._last_echo_rejection_log_at = -1e9
 
     def run(self) -> None:
@@ -420,10 +423,10 @@ class Conversation:
         The XVF3800 profile conditions double-talk before WebRTC VAD. During a
         live robot turn, a 200 ms candidate is compared with the exact recent
         speaker PCM over the variable capture latency. Echo-explained voice is
-        ignored without touching playback; unexplained near-end voice advances
-        the epoch, flushes the player and latches force_listen. A continuously
-        echo-like run is rechecked every 100 ms so later double-talk still
-        interrupts promptly.
+        ignored without touching playback. Unexplained near-end evidence must
+        span the configured 500 ms before it advances the epoch, flushes the
+        player and latches force_listen; short head bumps therefore expire
+        harmlessly. Candidates are rechecked every 100 ms.
         """
         out = self._mic.read_frames()
         # A device read may return several frames. Approximate their capture
@@ -437,7 +440,7 @@ class Conversation:
             if robot_turn_live and not self._gate_latched():
                 self._consider_barge(frame, voiced, now)
             else:
-                self._reset_barge_candidate()
+                self._reset_barge_candidate(now, reason="robot turn ended")
             # Once a barge is latched, every voiced frame keeps force sticky.
             # While the robot is silent, ordinary user speech still drives
             # DoA/camera activity without creating an interruption.
@@ -460,7 +463,7 @@ class Conversation:
         if self._detector.streak <= 0:
             self._barge_quiet_frames += 1
             if not self._barge_frames or self._barge_quiet_frames > BARGE_GAP_FRAMES:
-                self._reset_barge_candidate()
+                self._reset_barge_candidate(now, reason="voice ended")
             else:
                 # XVF double-talk suppression can punch a 20–40 ms hole in
                 # quiet real speech. Keep the acoustic window contiguous,
@@ -486,6 +489,7 @@ class Conversation:
             and match.unexplained_db < self._s.barge_unexplained_db
         )
         if echo_explained:
+            self._cancel_near_end_candidate(now, reason="matched playback echo")
             if now - self._last_echo_rejection_log_at >= BARGE_ECHO_LOG_PERIOD_S:
                 self._last_echo_rejection_log_at = now
                 logger.info(
@@ -498,11 +502,48 @@ class Conversation:
                 )
             return
 
-        onset_at = now - (len(self._barge_frames) - 1) * FRAME_S
+        if self._near_end_started_at is None:
+            self._near_end_started_at = now
+            self._near_end_onset_at = now - (len(self._barge_frames) - 1) * FRAME_S
+            logger.info(
+                "barge candidate: unexplained near-end sound; confirming %d ms "
+                "(mic %.1f dB, similarity %.2f, unexplained %.1f dB)",
+                self._s.barge_confirm_ms,
+                self._detector.last_db,
+                match.similarity,
+                match.unexplained_db,
+            )
+
+        evidence_s = BARGE_ANALYSIS_S + max(0.0, now - self._near_end_started_at)
+        if evidence_s + 1e-9 < self._s.barge_confirm_ms / 1000.0:
+            return
+
+        onset_at = self._near_end_onset_at
         self._reset_barge_candidate()
         self._begin_barge(now, onset_at=onset_at, match=match)
 
-    def _reset_barge_candidate(self) -> None:
+    def _cancel_near_end_candidate(self, now: float, *, reason: str) -> None:
+        if self._near_end_started_at is not None:
+            evidence_ms = (BARGE_ANALYSIS_S + max(0.0, now - self._near_end_started_at)) * 1000.0
+            logger.info(
+                "barge candidate ignored before confirmation: %.0f ms evidence (%s)",
+                evidence_ms,
+                reason,
+            )
+        self._near_end_started_at = None
+        self._near_end_onset_at = -1e9
+
+    def _reset_barge_candidate(
+        self,
+        now: float | None = None,
+        *,
+        reason: str = "",
+    ) -> None:
+        if now is not None and reason:
+            self._cancel_near_end_candidate(now, reason=reason)
+        else:
+            self._near_end_started_at = None
+            self._near_end_onset_at = -1e9
         self._barge_frames.clear()
         self._barge_frames_since_match = 0
         self._barge_quiet_frames = 0

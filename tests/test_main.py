@@ -231,11 +231,29 @@ def _install_barge_fakes(
     return speaker
 
 
-def test_unexplained_local_voice_interrupts_playback():
+def _sustained(match: EchoMatch) -> list[EchoMatch]:
+    # First decision covers 200 ms; three 100 ms rechecks reach 500 ms.
+    return [match] * 4
+
+
+def test_short_unexplained_sound_does_not_interrupt_playback():
     conversation = _conversation_without_hardware()
     speaker = _install_barge_fakes(
         conversation,
         EchoMatch(similarity=0.2, unexplained_db=-40.0, lag_ms=400.0),
+    )
+
+    conversation._process_mic()
+
+    assert speaker.interrupted == 0
+    assert not conversation._gate.latched
+
+
+def test_sustained_unexplained_local_voice_interrupts_playback():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        _sustained(EchoMatch(similarity=0.2, unexplained_db=-40.0, lag_ms=400.0)),
     )
 
     conversation._process_mic()
@@ -262,7 +280,7 @@ def test_weak_double_talk_interrupts_despite_far_end_similarity():
     conversation = _conversation_without_hardware()
     speaker = _install_barge_fakes(
         conversation,
-        EchoMatch(similarity=0.88, unexplained_db=-40.0, lag_ms=520.0),
+        _sustained(EchoMatch(similarity=0.88, unexplained_db=-40.0, lag_ms=520.0)),
     )
 
     conversation._process_mic()
@@ -277,23 +295,41 @@ def test_user_entering_continuous_echo_is_detected_on_recheck():
         conversation,
         [
             EchoMatch(similarity=0.95, unexplained_db=-50.0, lag_ms=520.0),
-            EchoMatch(similarity=0.82, unexplained_db=-39.0, lag_ms=500.0),
+            *_sustained(EchoMatch(similarity=0.82, unexplained_db=-39.0, lag_ms=500.0)),
+        ],
+    )
+
+    conversation._process_mic()
+
+    assert speaker.match_index == 5
+    assert speaker.interrupted == 1
+    assert conversation._gate.latched
+
+
+def test_head_bump_is_cancelled_when_next_window_returns_to_echo():
+    conversation = _conversation_without_hardware()
+    speaker = _install_barge_fakes(
+        conversation,
+        [
+            EchoMatch(similarity=0.20, unexplained_db=-26.5, lag_ms=141.0),
+            EchoMatch(similarity=0.94, unexplained_db=-49.0, lag_ms=241.0),
         ],
     )
 
     conversation._process_mic()
 
     assert speaker.match_index == 2
-    assert speaker.interrupted == 1
-    assert conversation._gate.latched
+    assert speaker.interrupted == 0
+    assert not conversation._gate.latched
+    assert conversation._near_end_started_at is None
 
 
 def test_short_xvf_suppression_gap_does_not_lose_real_barge():
     conversation = _conversation_without_hardware()
     speaker = _install_barge_fakes(
         conversation,
-        EchoMatch(similarity=0.3, unexplained_db=-39.0, lag_ms=480.0),
-        vad_pattern=[True] * 5 + [False] + [True] * 5,
+        _sustained(EchoMatch(similarity=0.3, unexplained_db=-39.0, lag_ms=480.0)),
+        vad_pattern=[True] * 5 + [False] + [True] * 24,
     )
 
     conversation._process_mic()

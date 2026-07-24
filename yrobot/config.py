@@ -81,6 +81,9 @@ class Settings:
     # playout and leaves less than this much unexplained near-end energy.
     barge_echo_similarity: float = 0.75
     barge_unexplained_db: float = -42.0
+    # Head bumps are loud but brief. Do not destroy playback until unexplained
+    # near-end evidence spans this long (including the initial 200 ms window).
+    barge_confirm_ms: int = 500
     head_tracking_weight: float = 0.4
 
     def __post_init__(self) -> None:
@@ -92,6 +95,8 @@ class Settings:
             raise ValueError("YROBOT_BARGE_ECHO_SIMILARITY must be between 0 and 1")
         if not -120.0 <= self.barge_unexplained_db <= 0.0:
             raise ValueError("YROBOT_BARGE_UNEXPLAINED_DB must be between -120 and 0")
+        if not 200 <= self.barge_confirm_ms <= 2000:
+            raise ValueError("YROBOT_BARGE_CONFIRM_MS must be between 200 and 2000")
 
     @property
     def realtime_mode(self) -> str:
@@ -133,5 +138,6 @@ class Settings:
             vad_aggressiveness=int(_num("YROBOT_VAD_AGGRESSIVENESS", 2)),
             barge_echo_similarity=_num("YROBOT_BARGE_ECHO_SIMILARITY", 0.75),
             barge_unexplained_db=_num("YROBOT_BARGE_UNEXPLAINED_DB", -42.0),
+            barge_confirm_ms=int(_num("YROBOT_BARGE_CONFIRM_MS", 500)),
             head_tracking_weight=_num("YROBOT_HEAD_TRACKING_WEIGHT", 0.4),
         )
