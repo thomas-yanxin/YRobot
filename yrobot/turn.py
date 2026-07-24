@@ -115,17 +115,21 @@ class DuckVerifier:
     """
 
     SETTLE_S = 0.6
-    WINDOW_S = 1.0  # total, measured from the duck request
-    CONFIRM_FRAMES = 3  # 60 ms of voice after the settle
-    EARLY_RESUME_S = 0.2  # pure post-settle silence: don't wait out the window
+    WINDOW_S = 1.5  # total, measured from the duck request
+    # Evidence frames are already streak-confirmed upstream (60 ms of raw
+    # VAD each). XVF double-talk suppression releases slowly and leaves
+    # real interrupting speech flickering (hardware log 2026-07-24: a
+    # genuine barge produced hits but never three *consecutive* confirmed
+    # frames), so commit on accumulated hits, not on a streak.
+    CONFIRM_HITS = 2
+    EARLY_RESUME_S = 0.25  # pure post-settle silence: don't wait out the window
     COOLDOWN_S = 1.2  # the resumed tail echoes too — block back-to-back ducks
 
     def __init__(self) -> None:
         self.active = False
         self._settle_end = 0.0
         self._deadline = 0.0
-        self._streak = 0
-        self._voice_seen = False
+        self._hits = 0
         self._cooldown_until = 0.0
 
     def ready(self, now: float) -> bool:
@@ -136,22 +140,18 @@ class DuckVerifier:
         self.active = True
         self._settle_end = now + self.SETTLE_S
         self._deadline = now + self.WINDOW_S
-        self._streak = 0
-        self._voice_seen = False
+        self._hits = 0
 
     def frame(self, voiced: bool, now: float) -> str | None:
         """Feed one VAD frame; returns "commit", "resume" or None."""
         if not self.active or now < self._settle_end:
             return None
         if voiced:
-            self._voice_seen = True
-            self._streak += 1
-            if self._streak >= self.CONFIRM_FRAMES:
+            self._hits += 1
+            if self._hits >= self.CONFIRM_HITS:
                 self.active = False
                 return "commit"
-        else:
-            self._streak = 0
-        early = not self._voice_seen and now >= self._settle_end + self.EARLY_RESUME_S
+        early = self._hits == 0 and now >= self._settle_end + self.EARLY_RESUME_S
         if early or now >= self._deadline:
             self.active = False
             self._cooldown_until = now + self.COOLDOWN_S

@@ -103,19 +103,15 @@ def test_echo_guard_blocks_predicted_residual():
     assert EchoGuard().observe(mic_db=-35.0, playout_db=-10.0) is False
 
 
-def test_echo_guard_learns_leakage_from_false_triggers_then_frames():
+def test_echo_guard_learns_leakage_from_false_triggers():
     guard = EchoGuard()
     # An onset transient (ratio -9 dB) pierces the initial prediction…
     assert guard.observe(mic_db=-19.0, playout_db=-10.0) is True
-    # …a few verified false ducks teach it…
-    for _ in range(3):
+    # …a few verified false ducks teach it until the transient is gated…
+    for _ in range(4):
         guard.penalize()
     assert guard.observe(mic_db=-19.0, playout_db=-10.0) is False
-    # …and blocked frames refine the offset toward the true ratio.
-    for _ in range(10):
-        guard.observe(mic_db=-19.0, playout_db=-10.0)
-    assert abs(guard.offset_db - (-9.0)) < 0.1
-    # A user talking over the robot is far louder than any residual.
+    # …while a user talking over the robot still passes.
     assert guard.observe(mic_db=-5.0, playout_db=-10.0) is True
 
 

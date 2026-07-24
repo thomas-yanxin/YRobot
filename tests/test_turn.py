@@ -117,26 +117,25 @@ def test_verifier_waits_out_the_window_after_a_voice_blip():
     assert v.frame(False, DuckVerifier.WINDOW_S) == "resume"
 
 
-def test_verifier_commits_on_sustained_post_settle_voice():
+def test_verifier_commits_on_post_settle_voice():
     v = DuckVerifier()
     v.start(0.0)
     t = DuckVerifier.SETTLE_S + 0.01
     assert v.frame(True, t) is None
-    assert v.frame(True, t + 0.02) is None
-    assert v.frame(True, t + 0.04) == "commit"
+    assert v.frame(True, t + 0.02) == "commit"
     assert not v.active
 
 
-def test_verifier_streak_must_be_consecutive():
+def test_verifier_tolerates_flickering_suppressed_speech():
+    # XVF double-talk suppression makes real speech flicker: hits need not
+    # be consecutive.
     v = DuckVerifier()
     v.start(0.0)
     t = DuckVerifier.SETTLE_S + 0.01
-    v.frame(True, t)
-    v.frame(True, t + 0.02)
-    v.frame(False, t + 0.04)  # gap resets the evidence
-    assert v.frame(True, t + 0.06) is None
-    assert v.frame(True, t + 0.08) is None
-    assert v.frame(True, t + 0.10) == "commit"
+    assert v.frame(True, t) is None
+    for i in range(10):  # suppressor swallows a stretch
+        assert v.frame(False, t + 0.02 + i * 0.02) is None
+    assert v.frame(True, t + 0.24) == "commit"
 
 
 def test_verifier_inactive_returns_none():

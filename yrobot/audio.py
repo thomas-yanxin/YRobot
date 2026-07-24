@@ -133,7 +133,11 @@ class EchoGuard:
     hardware (2026-07-22 logs).
     """
 
-    MARGIN_DB = 3.0
+    # Zero margin: XVF double-talk suppression pushes real interrupting
+    # speech down to within a few dB of the residual prediction (hardware
+    # log 2026-07-24: user at -27 dB vs a -22.9 dB threshold). A false duck
+    # costs a 0.8 s dip; a missed user is deafness — bias accordingly.
+    MARGIN_DB = 0.0
     # Hardware 2026-07-24: the steady-state residual sits well below -20 dB
     # (frame learning kept decaying the offset) and only TTS onset
     # transients spike to ~ -14 dB. Pinning the floor at -14 gated real
@@ -281,6 +285,7 @@ class Speaker(threading.Thread):
         self._end_requested = True
 
     def audible(self, now: float | None = None) -> bool:
+        """A turn is live somewhere between queue and device."""
         now = time.monotonic() if now is None else now
         return (
             self._pushed_until - now > 0.02
@@ -288,6 +293,14 @@ class Speaker(threading.Thread):
             or self.holding
             or not self._q.empty()
         )
+
+    def sounding(self, now: float | None = None) -> bool:
+        """Sound is physically coming out (or held mid-duck) — the only
+        states in which a barge candidate makes sense. During preroll the
+        speaker is silent: there is no echo to guard against, and ducking
+        would only delay the reply."""
+        now = time.monotonic() if now is None else now
+        return self._pushed_until - now > 0.02 or self.holding
 
     def playout_db(self, now: float) -> float:
         """Loudest block scheduled within the envelope lookback window."""

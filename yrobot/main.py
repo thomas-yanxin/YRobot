@@ -153,17 +153,17 @@ class Conversation:
                     "barge candidate was our own echo: resumed (leakage %.1f dB)",
                     self._echo_guard.offset_db,
                 )
-            if not self._verifier.active and self._speaker.audible(now):
+            if not self._verifier.active and self._speaker.sounding(now):
                 mic_db = self._detector.last_db
                 playout = self._speaker.playout_db(now)
                 real_voice = self._echo_guard.observe(mic_db, playout)
                 self._voiced_run = self._voiced_run + 1 if voiced else 0
-                # Fallback: voice sustained for 500 ms at no worse than the
-                # predicted echo level itself always earns a duck — the
-                # verify stage is the arbiter, and hardware double-talk
-                # suppression can leave real speech under the +margin gate.
+                # Fallback: 350 ms of sustained voice within 6 dB of the
+                # predicted echo also earns a duck — the verify stage is
+                # the arbiter, and hardware double-talk suppression leaves
+                # real interrupting speech hovering around the gate.
                 insistent = (
-                    self._voiced_run >= 25 and mic_db >= playout + self._echo_guard.offset_db
+                    self._voiced_run >= 17 and mic_db >= playout + self._echo_guard.offset_db - 6.0
                 )
                 may_duck = self._verifier.ready(now) and not self._speaker.holding
                 if voiced and (real_voice or insistent) and may_duck:
@@ -175,11 +175,17 @@ class Conversation:
                         mic_db,
                         playout,
                     )
-                elif voiced and now - self._last_block_log > 2.0:
+                elif (
+                    voiced
+                    and may_duck
+                    and not (real_voice or insistent)
+                    and now - self._last_block_log > 2.0
+                ):
                     self._last_block_log = now
                     logger.info(
-                        "voice gated as echo: mic %.1f dB < playout %.1f + leak %.1f + 3 dB",
+                        "voice gated as echo: mic %.1f dB < %.1f dB (playout %.1f, leak %.1f)",
                         mic_db,
+                        playout + self._echo_guard.offset_db,
                         playout,
                         self._echo_guard.offset_db,
                     )
