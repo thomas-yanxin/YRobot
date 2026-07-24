@@ -1,4 +1,4 @@
-"""Barge-in turn gate.
+"""Barge-in turn gate and the duck-and-verify second stage.
 
 The gateway's ``force_listen`` is advisory: generation does not reliably stop
 and, once the user goes quiet, the model often *resumes* the interrupted
@@ -97,3 +97,51 @@ class TurnGate:
         self._latched = False
         self._pending_force = False
         self._clean_streak = 0
+
+
+class DuckVerifier:
+    """Second barge-in stage: prove the voice survives the robot's silence.
+
+    A candidate only *ducks* playback. The settle time covers everything
+    between "we asked for silence" and "the microphone can prove it" — the
+    pipeline flush, sink residue, the acoustic path and the capture/XVF
+    path back. The shared GStreamer pipeline reports min_latency ≈ 286 ms
+    (hardware logs), and a 150 ms settle let in-flight echo of the
+    just-muted speech confirm a false barge-in — hence 0.6 s. After the
+    settle, sustained voice commits the destructive flush; a quiet window
+    means the candidate was echo and playback resumes.
+
+    Pure logic over injected timestamps — no I/O, fully unit-testable.
+    """
+
+    SETTLE_S = 0.6
+    WINDOW_S = 1.0  # total, measured from the duck request
+    CONFIRM_FRAMES = 3  # 60 ms of voice after the settle
+
+    def __init__(self) -> None:
+        self.active = False
+        self._settle_end = 0.0
+        self._deadline = 0.0
+        self._streak = 0
+
+    def start(self, now: float) -> None:
+        self.active = True
+        self._settle_end = now + self.SETTLE_S
+        self._deadline = now + self.WINDOW_S
+        self._streak = 0
+
+    def frame(self, voiced: bool, now: float) -> str | None:
+        """Feed one VAD frame; returns "commit", "resume" or None."""
+        if not self.active or now < self._settle_end:
+            return None
+        if voiced:
+            self._streak += 1
+            if self._streak >= self.CONFIRM_FRAMES:
+                self.active = False
+                return "commit"
+        else:
+            self._streak = 0
+        if now >= self._deadline:
+            self.active = False
+            return "resume"
+        return None

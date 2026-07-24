@@ -20,11 +20,11 @@ from dotenv import load_dotenv
 from reachy_mini.apps.app import ReachyMiniApp
 from reachy_mini.reachy_mini import ReachyMini
 
-from yrobot.audio import Microphone, Speaker, VoiceDetector
+from yrobot.audio import EchoGuard, Microphone, Speaker, VoiceDetector
 from yrobot.config import Settings
 from yrobot.motion import IDLE, LISTEN, SPEAK, Choreographer, SoundCompass
 from yrobot.realtime import Delta, RealtimeClient, ThinkFilter
-from yrobot.turn import TurnGate
+from yrobot.turn import DuckVerifier, TurnGate
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,8 @@ class Conversation:
         self._detector = VoiceDetector(settings.vad_aggressiveness)
         self._speaker = Speaker(mini.media)
         self._gate = TurnGate()
+        self._verifier = DuckVerifier()
+        self._echo_guard = EchoGuard()
         self._choreo = Choreographer(mini)
         self._compass = SoundCompass(
             mini.media,
@@ -121,16 +123,42 @@ class Conversation:
                 return
 
     def _process_mic(self) -> list[np.ndarray]:
-        """Read mic frames; run VAD, barge-in and posture per 20 ms frame."""
+        """Read mic frames; run VAD, barge-in and posture per 20 ms frame.
+
+        Barge-in is two-staged: a voiced frame that beats the echo guard's
+        residual prediction only ducks playback; ``DuckVerifier`` then
+        listens with the speaker silent and either commits the destructive
+        flush or resumes the held audio (false trigger → the guard learns).
+        """
         out = self._mic.read_frames()
         now = time.monotonic()
         for frame in out:
             voiced = self._detector.process(frame, now)
             if voiced:
                 self._last_voice_at = now
-            if self._gate.user_frame(voiced, self._speaker.audible(now), now):
-                self._speaker.interrupt()  # user barged in: silence within one tick
-                logger.info("barge-in: playback flushed")
+            verdict = self._verifier.frame(voiced, now)
+            if verdict == "commit":
+                self._gate.user_frame(True, True, now)
+                self._speaker.interrupt()
+                logger.info("barge-in confirmed: turn discarded")
+                now += FRAME_S
+                continue
+            if verdict == "resume":
+                self._echo_guard.penalize()
+                self._speaker.release_hold()
+                logger.info(
+                    "barge candidate was our own echo: resumed (leakage %.1f dB)",
+                    self._echo_guard.offset_db,
+                )
+            if not self._verifier.active and self._speaker.audible(now):
+                real_voice = self._echo_guard.observe(
+                    self._detector.last_db, self._speaker.playout_db(now)
+                )
+                if voiced and real_voice and not self._speaker.holding:
+                    self._speaker.hold()  # silent within one tick, lossless
+                    self._verifier.start(now)
+                    logger.info("barge candidate: playback ducked for verify")
+            self._gate.user_frame(voiced, False, now)
             now += FRAME_S
         now = time.monotonic()
         if self._speaker.audible(now):

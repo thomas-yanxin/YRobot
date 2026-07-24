@@ -1,6 +1,13 @@
-"""Unit tests for the barge-in turn gate — the reliability core."""
+"""Unit tests for the barge-in turn gate and duck verifier — the reliability core."""
 
-from yrobot.turn import CLEAN_LISTENS, FORCE_ACK_S, LATCH_CAP_S, QUIET_S, TurnGate
+from yrobot.turn import (
+    CLEAN_LISTENS,
+    FORCE_ACK_S,
+    LATCH_CAP_S,
+    QUIET_S,
+    DuckVerifier,
+    TurnGate,
+)
 
 
 def barge(gate: TurnGate, t: float) -> bool:
@@ -81,3 +88,44 @@ def test_latch_expires_at_cap():
     barge(gate, 1.0)
     assert gate.model_audio(1.0 + LATCH_CAP_S + 0.1) is True  # cap released it
     assert not gate.latched
+
+
+def test_verifier_ignores_in_flight_echo_during_settle():
+    v = DuckVerifier()
+    v.start(0.0)
+    t = 0.0
+    while t < DuckVerifier.SETTLE_S:  # muted speech still in the air
+        assert v.frame(True, t) is None
+        t += 0.02
+    # echo dies with the speaker silent: quiet until the window closes
+    while t < DuckVerifier.WINDOW_S:
+        assert v.frame(False, t) is None
+        t += 0.02
+    assert v.frame(False, DuckVerifier.WINDOW_S) == "resume"
+    assert not v.active
+
+
+def test_verifier_commits_on_sustained_post_settle_voice():
+    v = DuckVerifier()
+    v.start(0.0)
+    t = DuckVerifier.SETTLE_S + 0.01
+    assert v.frame(True, t) is None
+    assert v.frame(True, t + 0.02) is None
+    assert v.frame(True, t + 0.04) == "commit"
+    assert not v.active
+
+
+def test_verifier_streak_must_be_consecutive():
+    v = DuckVerifier()
+    v.start(0.0)
+    t = DuckVerifier.SETTLE_S + 0.01
+    v.frame(True, t)
+    v.frame(True, t + 0.02)
+    v.frame(False, t + 0.04)  # gap resets the evidence
+    assert v.frame(True, t + 0.06) is None
+    assert v.frame(True, t + 0.08) is None
+    assert v.frame(True, t + 0.10) == "commit"
+
+
+def test_verifier_inactive_returns_none():
+    assert DuckVerifier().frame(True, 5.0) is None

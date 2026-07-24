@@ -1,10 +1,17 @@
-"""Unit tests for capture, VAD gating, resampling and playback pacing."""
+"""Unit tests for capture, VAD gating, echo guard, resampling and playback."""
 
 import time
 
 import numpy as np
 
-from yrobot.audio import FRAME_SAMPLES, Microphone, Speaker, StreamResampler, VoiceDetector
+from yrobot.audio import (
+    FRAME_SAMPLES,
+    EchoGuard,
+    Microphone,
+    Speaker,
+    StreamResampler,
+    VoiceDetector,
+)
 
 
 class FakeVad:
@@ -64,6 +71,38 @@ def test_voice_detector_adapts_noise_floor():
     assert det.process(speech, 10.06) is True
 
 
+def test_echo_guard_passes_when_nothing_played():
+    assert EchoGuard().observe(mic_db=-40.0, playout_db=-120.0) is True
+
+
+def test_echo_guard_blocks_predicted_residual():
+    # leakage ratio -25 dB sits below the -18 dB initial prediction
+    assert EchoGuard().observe(mic_db=-35.0, playout_db=-10.0) is False
+
+
+def test_echo_guard_learns_leakage_from_false_triggers_then_frames():
+    guard = EchoGuard()
+    # A loud residual (ratio -12 dB) pierces the initial prediction…
+    assert guard.observe(mic_db=-22.0, playout_db=-10.0) is True
+    # …the duck-verify stage catches each false trigger and penalizes…
+    for _ in range(4):
+        guard.penalize()
+    assert guard.observe(mic_db=-22.0, playout_db=-10.0) is False
+    # …and blocked frames refine the offset toward the true ratio.
+    for _ in range(10):
+        guard.observe(mic_db=-22.0, playout_db=-10.0)
+    assert abs(guard.offset_db - (-12.0)) < 0.1
+    # A user talking over the robot is far louder than any residual.
+    assert guard.observe(mic_db=-5.0, playout_db=-10.0) is True
+
+
+def test_echo_guard_penalize_bumps_prediction():
+    guard = EchoGuard()
+    before = guard.offset_db
+    guard.penalize()
+    assert guard.offset_db == before + EchoGuard.FALSE_TRIGGER_BUMP_DB
+
+
 def test_resampler_ratio_and_continuity():
     rs = StreamResampler(24_000, 16_000)
     ramp = np.linspace(0.0, 1.0, 24_000, dtype=np.float32)
@@ -93,6 +132,36 @@ def test_speaker_plays_after_boundary_and_flushes_on_interrupt():
         assert media.cleared == 1
         time.sleep(0.2)
         assert len(media.pushed) == 1  # stale audio never reached the device
+    finally:
+        speaker.close()
+        speaker.join(timeout=2)
+
+
+def test_speaker_duck_then_resume_is_lossless():
+    media = FakeMedia()
+    speaker = Speaker(media)
+    speaker.start()
+    try:
+        speaker.play(speaker.epoch, np.ones(24_000, np.float32))  # 1 s turn
+        deadline = time.monotonic() + 2.0
+        while not media.pushed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert media.pushed
+
+        speaker.hold()
+        deadline = time.monotonic() + 2.0
+        while media.cleared == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert media.cleared == 1
+        assert speaker.audible()  # the held turn is still live
+        assert speaker.playout_db(time.monotonic()) > -120.0  # envelope kept
+
+        speaker.release_hold()
+        deadline = time.monotonic() + 2.0
+        while len(media.pushed) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(media.pushed) == 2
+        assert 0 < len(media.pushed[1]) <= 16_000  # the un-played tail only
     finally:
         speaker.close()
         speaker.join(timeout=2)
