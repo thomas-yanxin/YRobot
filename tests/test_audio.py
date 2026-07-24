@@ -84,11 +84,14 @@ def test_voice_detector_frozen_floor_keeps_barge_sensitivity():
     assert voiced is True  # without the freeze the floor would gate this out
 
 
-def test_echo_guard_decay_never_undercuts_hardware_baseline():
+def test_echo_guard_decay_is_slow_and_bounded():
     guard = EchoGuard()
-    for _ in range(2000):  # 40 s of quiet frames during playback
+    for _ in range(500):  # 10 s of quiet playback frames: ~1 dB of decay
         guard.observe(mic_db=-80.0, playout_db=-10.0)
-    assert guard.offset_db == EchoGuard.OFFSET_INIT_DB
+    assert guard.offset_db > EchoGuard.OFFSET_INIT_DB - 1.5
+    for _ in range(10_000):  # minutes of quiet: clamped at the floor
+        guard.observe(mic_db=-80.0, playout_db=-10.0)
+    assert guard.offset_db == EchoGuard.OFFSET_MIN_DB
 
 
 def test_echo_guard_passes_when_nothing_played():
@@ -96,7 +99,7 @@ def test_echo_guard_passes_when_nothing_played():
 
 
 def test_echo_guard_blocks_predicted_residual():
-    # leakage ratio -25 dB sits below the -14 dB initial prediction
+    # leakage ratio -25 dB sits below the -18 dB initial prediction
     assert EchoGuard().observe(mic_db=-35.0, playout_db=-10.0) is False
 
 
@@ -104,8 +107,9 @@ def test_echo_guard_learns_leakage_from_false_triggers_then_frames():
     guard = EchoGuard()
     # An onset transient (ratio -9 dB) pierces the initial prediction…
     assert guard.observe(mic_db=-19.0, playout_db=-10.0) is True
-    # …one verified false duck teaches it in a single step…
-    guard.penalize()
+    # …a few verified false ducks teach it…
+    for _ in range(3):
+        guard.penalize()
     assert guard.observe(mic_db=-19.0, playout_db=-10.0) is False
     # …and blocked frames refine the offset toward the true ratio.
     for _ in range(10):

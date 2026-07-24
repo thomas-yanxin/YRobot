@@ -58,6 +58,8 @@ class Conversation:
         self._session_dead = threading.Event()
         self._last_voice_at = -1e9
         self._last_frame_at = -1e9
+        self._last_block_log = -1e9
+        self._voiced_run = 0
 
     def run(self) -> None:
         self._mini.media.start_recording()
@@ -152,14 +154,37 @@ class Conversation:
                     self._echo_guard.offset_db,
                 )
             if not self._verifier.active and self._speaker.audible(now):
-                real_voice = self._echo_guard.observe(
-                    self._detector.last_db, self._speaker.playout_db(now)
+                mic_db = self._detector.last_db
+                playout = self._speaker.playout_db(now)
+                real_voice = self._echo_guard.observe(mic_db, playout)
+                self._voiced_run = self._voiced_run + 1 if voiced else 0
+                # Fallback: voice sustained for 500 ms at no worse than the
+                # predicted echo level itself always earns a duck — the
+                # verify stage is the arbiter, and hardware double-talk
+                # suppression can leave real speech under the +margin gate.
+                insistent = (
+                    self._voiced_run >= 25 and mic_db >= playout + self._echo_guard.offset_db
                 )
                 may_duck = self._verifier.ready(now) and not self._speaker.holding
-                if voiced and real_voice and may_duck:
+                if voiced and (real_voice or insistent) and may_duck:
                     self._speaker.hold()  # silent within one tick, lossless
                     self._verifier.start(now)
-                    logger.info("barge candidate: playback ducked for verify")
+                    logger.info(
+                        "barge candidate (%s): ducked (mic %.1f dB, playout %.1f dB)",
+                        "level" if real_voice else "sustained",
+                        mic_db,
+                        playout,
+                    )
+                elif voiced and now - self._last_block_log > 2.0:
+                    self._last_block_log = now
+                    logger.info(
+                        "voice gated as echo: mic %.1f dB < playout %.1f + leak %.1f + 3 dB",
+                        mic_db,
+                        playout,
+                        self._echo_guard.offset_db,
+                    )
+            else:
+                self._voiced_run = 0
             self._gate.user_frame(voiced, False, now)
             now += FRAME_S
         now = time.monotonic()

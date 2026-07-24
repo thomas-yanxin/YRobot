@@ -134,17 +134,16 @@ class EchoGuard:
     """
 
     MARGIN_DB = 3.0
-    # Hardware 2026-07-24: onset transients reached a ratio of ≥ -14 dB and
-    # a -18 dB start plus 1 dB bumps let three false ducks through before
-    # converging — start closer and learn in bigger steps. Frame learning
-    # only happens on *blocked* frames, so the bump is the main teacher.
-    # Decay must be glacial and never undercut the hardware baseline: at
-    # 0.01 dB/frame the quiet frames of one monologue eroded the learned
-    # offset by several dB and reopened the door for false ducks.
-    OFFSET_INIT_DB = -14.0
+    # Hardware 2026-07-24: the steady-state residual sits well below -20 dB
+    # (frame learning kept decaying the offset) and only TTS onset
+    # transients spike to ~ -14 dB. Pinning the floor at -14 gated real
+    # users out entirely — false-trigger bumps (+2.5 dB each, decaying at
+    # 0.1 dB/s) are the intended defence against transients, because a
+    # false duck now costs only a 0.8 s dip while a missed user is deafness.
+    OFFSET_INIT_DB = -18.0
     OFFSET_RISE_DB = 0.5
     OFFSET_DECAY_DB = 0.002
-    OFFSET_MIN_DB = -14.0
+    OFFSET_MIN_DB = -30.0
     FALSE_TRIGGER_BUMP_DB = 2.5
 
     def __init__(self) -> None:
