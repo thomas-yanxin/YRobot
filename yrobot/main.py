@@ -31,7 +31,15 @@ logger = logging.getLogger(__name__)
 FRAME_S = 0.02
 ACTIVE_WINDOW_S = 10.0  # camera stays at 1 fps this long after the user spoke
 # kv-cache burn rates measured on the live gateway (tokens/second, per frame).
-KV_PER_S_IDLE, KV_PER_S_ACTIVE, KV_PER_FRAME = 13.0, 85.0, 64.0
+# "Active chat ~85 tok/s" was measured WITH 1 fps vision; frames are counted
+# separately here, so busy audio-only burn is ~28. Estimating 85 rotated
+# sessions every ~85 s and wiped the model's memory mid-conversation
+# (hardware log 2026-07-24).
+KV_PER_S_IDLE, KV_PER_S_BUSY, KV_PER_FRAME = 13.0, 28.0, 64.0
+# The robot is only worth interrupting when it is audibly talking; against
+# near-silence the model's own duplex turn-taking handles user speech.
+BARGE_PLAYOUT_MIN_DB = -40.0
+STRONG_VOICE_MIN_DB = -35.0  # absolute floor for fast settle-window commits
 
 
 class Conversation:
@@ -62,6 +70,7 @@ class Conversation:
         self._last_frame_at = -1e9
         self._last_block_log = -1e9
         self._voiced_run = 0
+        self._frames_paused_until = -1e9
 
     def run(self) -> None:
         self._mini.media.start_recording()
@@ -125,8 +134,14 @@ class Conversation:
             except Exception as exc:  # noqa: BLE001
                 logger.info("uplink ended: %s", exc)
                 return
+            sent_in = time.monotonic() - now
+            if sent_in > 0.3:
+                # Weak network: frames serialize behind audio on the same
+                # websocket and a single JPEG can stall the uplink cadence.
+                self._frames_paused_until = now + 10.0
+                logger.info("slow uplink (%.2f s send): pausing camera frames", sent_in)
             busy = self._speaker.audible(now) or self._detector.active(now)
-            kv_est += (KV_PER_S_ACTIVE if busy else KV_PER_S_IDLE) * self._s.chunk_ms / 1000
+            kv_est += (KV_PER_S_BUSY if busy else KV_PER_S_IDLE) * self._s.chunk_ms / 1000
             kv_est += KV_PER_FRAME if jpeg is not None else 0.0
             if self._should_rotate(now - t0, kv_est, now):
                 logger.info("rotating session (%.0f s, ~%.0f kv tokens)", now - t0, kv_est)
@@ -165,7 +180,11 @@ class Conversation:
                     "barge candidate was not a voice: resumed (leakage %.1f dB)",
                     self._echo_guard.offset_db,
                 )
-            if not self._verifier.active and self._speaker.sounding(now):
+            if (
+                not self._verifier.active
+                and self._speaker.sounding(now)
+                and self._speaker.playout_db(now) > BARGE_PLAYOUT_MIN_DB
+            ):
                 mic_db = self._detector.last_db
                 playout = self._speaker.playout_db(now)
                 real_voice = self._echo_guard.observe(mic_db, playout)
@@ -225,8 +244,13 @@ class Conversation:
 
     def _strong_voice(self, voiced: bool, now: float) -> bool:
         """Voice whose level cannot be the in-flight echo of what we played
-        (the playout envelope keeps pre-duck blocks in view for 1.6 s)."""
-        if not voiced:
+        (the playout envelope keeps pre-duck blocks in view for 1.6 s).
+
+        The absolute floor matters: in a silent room a -44 dB rustle over a
+        near-silent playout counted as "strong" and destroyed the model's
+        reply within 60 ms (hardware log 2026-07-24, 9th run).
+        """
+        if not voiced or self._detector.last_db < STRONG_VOICE_MIN_DB:
             return False
         playout = self._speaker.playout_db(now)
         if playout <= -90.0:
@@ -249,6 +273,8 @@ class Conversation:
         robot monologues forced context rotations mid-conversation.
         """
         if not self._s.send_video or self._speaker.audible(now):
+            return None
+        if now < self._frames_paused_until:
             return None
         active = now - self._last_voice_at < ACTIVE_WINDOW_S
         period = self._s.frame_period_active_s if active else self._s.frame_period_idle_s
